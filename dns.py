@@ -45,7 +45,7 @@
   result 为 "applied"、"unchanged"、"missing" 或 "conflict"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
-  rollback_batch 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+  rollback_batch/rollback 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
@@ -137,6 +137,7 @@ _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RELOAD_TX_KEYS = ["op", "text", "expected"]
 _REPLAY_ROLLBACK_STEP_KEYS = ["op", "target"]
 _REPLAY_ROLLBACK_BATCH_KEYS = ["op", "expected", "steps"]
+_REPLAY_ROLLBACK_TX_KEYS = ["op", "target", "expected"]
 _MAX_MIGRATE_TEXT_LEN = 1048576
 _MAX_ROLLBACK_BATCH_STEPS = 32
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
@@ -2181,7 +2182,9 @@ def _validate_ops(ops):
     rollback_batch 键序 op,expected,steps 且 op 为 "rollback_batch"、
     expected 为非负非 bool int、steps 含 1..32 项，项键序 op,text 的
     "reload"（text 为 1..1048576 码点的 str）或键序 op,target 的
-    "rollback"（target 为非负非 bool int）。
+    "rollback"（target 为非负非 bool int）；rollback 键序
+    op,target,expected 且 op 为 "rollback"，target/expected 均为非负
+    非 bool int。
     ops 非 list 抛 TypeError；项、键序、op 名或字段类型/内容错误均抛
     ReplayError。
     """
@@ -2202,11 +2205,13 @@ def _validate_ops(ops):
             valid_names = ("recursive",)
         elif keys == _REPLAY_ROLLBACK_BATCH_KEYS:
             valid_names = ("rollback_batch",)
+        elif keys == _REPLAY_ROLLBACK_TX_KEYS:
+            valid_names = ("rollback",)
         else:
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
-                " op,query,now,limit, op,query,levels,now,limit"
-                " or op,expected,steps")
+                " op,query,now,limit, op,query,levels,now,limit,"
+                " op,expected,steps or op,target,expected")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] not in valid_names:
@@ -2247,6 +2252,15 @@ def _validate_ops(ops):
             if (not isinstance(expected, int) or isinstance(expected, bool)
                     or expected < 0):
                 raise ReplayError("expected must be a non-negative int")
+        elif kind == "rollback":
+            target = op["target"]
+            if (not isinstance(target, int) or isinstance(target, bool)
+                    or target < 0):
+                raise ReplayError("target must be a non-negative int")
+            expected = op["expected"]
+            if (not isinstance(expected, int) or isinstance(expected, bool)
+                    or expected < 0):
+                raise ReplayError("expected must be a non-negative int")
         elif kind in ("resolve", "recursive"):
             query = op["query"]
             if not isinstance(query, str):
@@ -2282,12 +2296,13 @@ def _validate_ops(ops):
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
-    resolve/recursive/rollback_batch 操作，返回记录的紧凑 JSON。
+    resolve/recursive/rollback_batch/rollback 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
     op 名或字段类型/内容错误（含 recursive 的 levels 层级结构、RR 与
     十六进制形式、migrate/migrate_tx 的 text 码点长度、rollback_batch
-    的 expected/steps 及其 reload/rollback 步）均在创建 Resolver 前抛
+    的 expected/steps 及其 reload/rollback 步、rollback 的
+    target/expected 非负非 bool 整数）均在创建 Resolver 前抛
     ReplayError；zone、plan、timeout 的校验与异常同 Resolver 构造。每项
     记录键序 in,out,stats：in 为操作原文，stats 为该操作后的 stats()
     原文。成功 out 首键 ok 为 true：reload 键序 ok,revision；reload_tx
@@ -2305,7 +2320,12 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     放弃整批（index 为 zero-based 步下标），完成后含 applied 步结果为
     "applied"、否则 "unchanged"（index 为 steps 长度）；version 为提交
     后修订号，未提交取原修订号。放弃整批保留区域、版本、历史、权威与
-    递归缓存、时钟及统计。操作抛出的异常记为 out 键序 ok,error
+    递归缓存、时钟及统计。rollback 键序 ok,version,result,target，
+    执行 rollback_zone_tx(target,expected)：expected 与当前修订号不符
+    为 "conflict" 且不查历史，target 为当前修订号为 "unchanged"，
+    target 未保留为 "missing"，命中回滚为 "applied"；version 为操作后
+    修订号，target 为目标修订号；状态副作用沿用 rollback_zone_tx，
+    后续操作须观察其提交。操作抛出的异常记为 out 键序 ok,error
     （false 与异常类名）并继续后续操作，状态语义沿用各操作（失败不
     改变任何状态）。输出为紧凑 ASCII JSON，顶层键序 version,ops，
     version 为 1，末尾单换行。expected 为 None 时仅记录；为 str 时与
@@ -2371,6 +2391,14 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                     op["expected"], steps)
                 out = {"ok": True, "version": version,
                        "result": result_name, "index": index}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "rollback":
+            try:
+                report = json.loads(
+                    resolver.rollback_zone_tx(op["target"], op["expected"]))
+                out = {"ok": True, "version": report["version"],
+                       "result": report["result"], "target": report["target"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         else:
