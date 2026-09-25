@@ -1,8 +1,11 @@
-"""DNS 问题报文解码（仅标准库、离线）。
+"""DNS 问题报文解码与确定性权威应答编码（仅标准库、离线）。
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
+- RecordError: 记录模型不符合编码要求（ValueError 子类）。
+- EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
+- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 
 命令行：python dns.py decode HEX
 """
@@ -15,6 +18,14 @@ class MessageError(ValueError):
     """DNS 报文无法解码。"""
 
 
+class RecordError(ValueError):
+    """记录模型不符合应答编码要求。"""
+
+
+class EncodeError(ValueError):
+    """应答报文无法在给定限制内编码。"""
+
+
 _MIN_MESSAGE_LEN = 12
 _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
@@ -24,6 +35,18 @@ _LABEL_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 )
 _HEXDIGITS = frozenset("0123456789abcdefABCDEF")
+
+_MODEL_KEYS = ["an", "ns", "ar", "limit"]
+_RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
+_MAX_LABEL_LEN = 63
+_MAX_RDATA_LEN = 65535
+_MAX_TTL = 4294967295
+_MIN_LIMIT = 12
+_MAX_LIMIT = 65535
+_MAX_POINTER_TARGET = 0x3FFF
+_FLAGS_RESPONSE = 0x8400  # QR | AA
+_FLAGS_KEPT = 0x7910  # opcode | RD | CD
+_FLAG_TC = 0x0200
 
 
 def _read_name(data, offset, boundaries):
@@ -118,6 +141,154 @@ def decode_query(data: bytes) -> dict:
     if pos != len(data):
         raise MessageError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}
+
+
+def _normalize_name(name):
+    """按解码规则把 name 规范为小写绝对名，返回标签列表（根为 []）。"""
+    if not isinstance(name, str):
+        raise TypeError("name must be str")
+    if not name.endswith("."):
+        raise RecordError("name not absolute")
+    parts = name[:-1].split(".") if name != "." else []
+    labels = []
+    wire_len = 1  # 根终止符占 1 字节
+    for part in parts:
+        label = part.lower()
+        if not 1 <= len(label) <= _MAX_LABEL_LEN:
+            raise RecordError("bad label length")
+        if any(ch not in _LABEL_CHARS for ch in label):
+            raise RecordError("invalid label character")
+        labels.append(label)
+        wire_len += len(label) + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("name too long")
+    return labels
+
+
+def _check_int(value, field):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(field + " must be int")
+
+
+def _validate_rr(rr):
+    """校验单条 RR，返回 (labels, type, class, ttl, rdata)。"""
+    if not isinstance(rr, dict):
+        raise TypeError("rr must be dict")
+    if list(rr.keys()) != _RR_KEYS:
+        raise RecordError("rr keys must be name,type,class,ttl,rdata")
+    labels = _normalize_name(rr["name"])
+    rrtype = rr["type"]
+    rrclass = rr["class"]
+    ttl = rr["ttl"]
+    rdata = rr["rdata"]
+    _check_int(rrtype, "type")
+    _check_int(rrclass, "class")
+    _check_int(ttl, "ttl")
+    if not isinstance(rdata, bytes):
+        raise TypeError("rdata must be bytes")
+    if not 0 <= rrtype <= 0xFFFF:
+        raise RecordError("type out of range")
+    if not 0 <= rrclass <= 0xFFFF:
+        raise RecordError("class out of range")
+    if not 0 <= ttl <= _MAX_TTL:
+        raise RecordError("ttl out of range")
+    if len(rdata) > _MAX_RDATA_LEN:
+        raise RecordError("rdata too long")
+    return labels, rrtype, rrclass, ttl, rdata
+
+
+def _validate_model(model):
+    """校验应答模型，返回 (an, ns, ar, limit)，RR 已规范化。"""
+    if not isinstance(model, dict):
+        raise TypeError("model must be dict")
+    if list(model.keys()) != _MODEL_KEYS:
+        raise RecordError("model keys must be an,ns,ar,limit")
+    sections = []
+    for key in ("an", "ns", "ar"):
+        rrs = model[key]
+        if not isinstance(rrs, list):
+            raise TypeError(key + " must be list")
+        sections.append([_validate_rr(rr) for rr in rrs])
+    limit = model["limit"]
+    _check_int(limit, "limit")
+    return sections[0], sections[1], sections[2], limit
+
+
+def _write_name(out, labels, offsets):
+    """把域名写入 out；offsets 记录已出现的标签边界（后缀 -> 最小偏移）。"""
+    match = 0
+    target = None
+    for i in range(len(labels)):
+        suffix = tuple(labels[i:])
+        if suffix in offsets:
+            match = len(labels) - i
+            target = offsets[suffix]
+            break
+    stop = len(labels) - match
+    for i, label in enumerate(labels):
+        if i >= stop:
+            break
+        if len(out) <= _MAX_POINTER_TARGET:
+            offsets.setdefault(tuple(labels[i:]), len(out))
+        out.append(len(label))
+        out.extend(label.encode("ascii"))
+    if target is not None:
+        out.extend((0xC000 | target).to_bytes(2, "big"))
+    else:
+        out.append(0)
+
+
+def _encode_message(msg, an, ns, ar, truncated):
+    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+    if truncated:
+        flags |= _FLAG_TC
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    out += flags.to_bytes(2, "big")
+    out += len(msg["questions"]).to_bytes(2, "big")
+    out += len(an).to_bytes(2, "big")
+    out += len(ns).to_bytes(2, "big")
+    out += len(ar).to_bytes(2, "big")
+    offsets = {}
+    for question in msg["questions"]:
+        _write_name(out, _normalize_name(question["name"]), offsets)
+        out += question["type"].to_bytes(2, "big")
+        out += question["class"].to_bytes(2, "big")
+    for section in (an, ns, ar):
+        for labels, rrtype, rrclass, ttl, rdata in section:
+            _write_name(out, labels, offsets)
+            out += rrtype.to_bytes(2, "big")
+            out += rrclass.to_bytes(2, "big")
+            out += ttl.to_bytes(4, "big")
+            out += len(rdata).to_bytes(2, "big")
+            out += rdata
+    return bytes(out)
+
+
+def encode_response(query: bytes, model: dict) -> bytes:
+    """把查询报文与应答模型编码为确定性权威应答报文。"""
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    an, ns, ar, limit = _validate_model(model)
+    msg = decode_query(query)
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    truncated = False
+    while True:
+        out = _encode_message(msg, an, ns, ar, truncated)
+        if len(out) <= limit:
+            return out
+        if ar:
+            ar.pop()
+        elif ns:
+            ns.pop()
+        elif an:
+            an.pop()
+        else:
+            raise EncodeError("header and question exceed limit")
+        truncated = True
 
 
 def main(argv):
