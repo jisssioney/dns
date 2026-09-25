@@ -8,6 +8,7 @@
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
 - CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
 - ConfigError: 配置文本解析或结构非法（ValueError 子类）。
+- ReplayError: 回放操作序列非法或回放记录与期望不符（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
@@ -24,7 +25,10 @@
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
-  reload_zone(text) 原子换区并返回从 0 递增的修订号。
+  reload_zone(text) 原子换区并返回从 0 递增的修订号（stats() 不变，
+  c[0] 于下次解析提交时同步）。
+- replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
+  上依次回放 reload/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -64,6 +68,10 @@ class ConfigError(ValueError):
     """配置文本无法解析或结构不符合版本格式。"""
 
 
+class ReplayError(ValueError):
+    """回放操作序列非法或回放记录与期望不符。"""
+
+
 class UpstreamError(RuntimeError):
     """上游转发未获得可用应答。"""
 
@@ -89,6 +97,8 @@ _RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _CONFIG_KEYS = ["version", "origin", "records"]
 _CONFIG_RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
+_REPLAY_RELOAD_KEYS = ["op", "text"]
+_REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -1227,13 +1237,14 @@ class Resolver:
     以该结束时刻为准。
 
     stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
-    换行）；仅成功返回或上游耗尽时原子更新，参数/计划/编码/时钟异常
-    不更新，耗尽不改缓存与最后时刻。
+    换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
+    同步），参数/计划/编码/时钟异常不更新，耗尽不改缓存与最后时刻。
 
     reload_zone(text)：导入 v0/v1 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
     才提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
-    缓存；任何失败都不改变任何状态。
+    缓存；统计不随换区提交，stats() 逐字节不变，c[0] 于下次解析提交时
+    与新缓存同步；任何失败都回滚，不改变任何状态。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1258,6 +1269,9 @@ class Resolver:
         self._stats_x = 0
         self._stats_u = [0, 0, 0]
         self._stats_l = [0, 0, 0, 0]
+        # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
+        # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
+        self._stats_c0 = 0
         self._revision = 0  # 下次 reload_zone 成功时返回的修订号
 
     def resolve(self, query: bytes, now: int,
@@ -1276,6 +1290,7 @@ class Resolver:
                 self._stats_m += 1
                 if expired:
                     self._stats_x += 1
+            self._sync_stats_c0()
             self._last_end = now
             return response, "authority", now, hit
         try:
@@ -1285,17 +1300,24 @@ class Resolver:
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
                 self._timeout)] += 1
+            self._sync_stats_c0()
             raise
         except UpstreamError:
             self._stats_u[2] += 1
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
                 self._timeout)] += 1
+            self._sync_stats_c0()
             raise
         self._stats_u[0] += 1
         self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._sync_stats_c0()
         self._last_end = end
         return reply, name, end, False
+
+    def _sync_stats_c0(self):
+        """统计提交点：c[0] 与当前权威缓存条目数同步。"""
+        self._stats_c0 = len(self._cache._order)
 
     def _authority_miss_expired(self, question, now):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
@@ -1397,6 +1419,7 @@ class Resolver:
                 self._stats_m += 1
                 if expired:
                     self._stats_x += 1
+            self._sync_stats_c0()
             self._last_end = now
             return response, "authority", now, hit
         # levels 整体校验（含全部 reply）在任何缓存查找之前完成：
@@ -1406,6 +1429,7 @@ class Resolver:
             query, question, now, limit)
         if cached is not None:
             self._stats_h[_RECURSIVE_HIT_KINDS[kind]] += 1
+            self._sync_stats_c0()
             self._last_end = now
             return cached, "cache", now, True
         # 未命中：m 与（到期时）x 暂记，待成功或耗尽时与 u、l 一并原子提交。
@@ -1422,6 +1446,7 @@ class Resolver:
                 # 统计随耗尽提交，缓存与最后时刻不变。
                 self._stats_m += m_inc
                 self._stats_x += x_inc
+                self._sync_stats_c0()
                 if saw_timeout and not saw_other:
                     self._stats_u[1] += 1
                     self._stats_l[_duration_bucket(
@@ -1442,6 +1467,7 @@ class Resolver:
         self._stats_x += x_inc
         self._stats_u[0] += 1
         self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._sync_stats_c0()
         self._last_end = end
         return response, name, end, False
 
@@ -1480,8 +1506,9 @@ class Resolver:
 
         先 import_zone 再以新 zone 构造 PositiveCache，全部成功后才
         提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
-        缓存；任何失败（TypeError、ConfigError、RecordError、ZoneError）
-        都不改变任何状态。
+        缓存；统计不随换区提交，stats() 逐字节不变，c[0] 于下次解析
+        提交时与新缓存同步。任何失败（TypeError、ConfigError、
+        RecordError、ZoneError）都回滚：不改变任何状态。
         """
         zone = import_zone(text)
         cache = PositiveCache(zone)
@@ -1496,7 +1523,9 @@ class Resolver:
         h 为 [权威正负缓存命中, 递归正命中, 递归NXDOMAIN命中, 递归NODATA命中]；
         m 为缓存未中（resolve 域外直转不计）；x 为未中中因 TTL 到期者；
         u 为 [上游成功, UpstreamTimeout, 其余UpstreamError]；
-        c 为 [权威条目数, 递归条目数, 256]（正负均计）；
+        c 为 [权威条目数, 递归条目数, 256]（正负均计）；c[0] 随统计提交
+        （成功返回或上游耗尽）与权威缓存同步，reload_zone 不提交统计，
+        故换区后 c[0] 保持旧值直至下次解析提交；
         l 为需上游的成功或耗尽按模拟总时长分桶
         （0、1..timeout、timeout+1..2*timeout、>2*timeout）；
         r 为 sum(h)/(sum(h)+m) 半偶舍入到 6 位小数（分母 0 写 0.000000）。
@@ -1506,7 +1535,7 @@ class Resolver:
         m = self._stats_m
         x = self._stats_x
         u = list(self._stats_u)
-        c = [len(self._cache._order), len(self._rec_order), _CACHE_CAPACITY]
+        c = [self._stats_c0, len(self._rec_order), _CACHE_CAPACITY]
         elapsed_buckets = list(self._stats_l)
         return (
             '{"h":[' + ",".join(map(str, h)) + "]"
@@ -1517,6 +1546,89 @@ class Resolver:
             + ',"l":[' + ",".join(map(str, elapsed_buckets)) + "]"
             + ',"r":' + _ratio_six(sum(h), sum(h) + m) + "}\n"
         )
+
+
+def _validate_ops(ops):
+    """校验回放操作序列，返回 [(kind, op), ...]（不执行）。
+
+    reload 键序 op,text 且 op 为 "reload"、text 为 str；resolve 键序
+    op,query,now,limit 且 op 为 "resolve"、query 为偶长小写十六进制、
+    now/limit 为 int。类型错抛 TypeError，内容错抛 ReplayError。
+    """
+    if not isinstance(ops, list):
+        raise TypeError("ops must be list")
+    checked = []
+    for op in ops:
+        if not isinstance(op, dict):
+            raise TypeError("op must be dict")
+        keys = list(op.keys())
+        if keys == _REPLAY_RELOAD_KEYS:
+            kind = "reload"
+        elif keys == _REPLAY_RESOLVE_KEYS:
+            kind = "resolve"
+        else:
+            raise ReplayError("op keys must be op,text or op,query,now,limit")
+        if not isinstance(op["op"], str):
+            raise TypeError("op must be str")
+        if op["op"] != kind:
+            raise ReplayError("op name does not match op keys")
+        if kind == "reload":
+            if not isinstance(op["text"], str):
+                raise TypeError("text must be str")
+        else:
+            query = op["query"]
+            if not isinstance(query, str):
+                raise TypeError("query must be str")
+            if (len(query) % 2
+                    or any(c not in _LOWER_HEXDIGITS for c in query)):
+                raise ReplayError(
+                    "query must be even-length lowercase hex")
+            _check_int(op["now"], "now")
+            _check_int(op["limit"], "limit")
+        checked.append((kind, op))
+    return checked
+
+
+def replay(zone: dict, plan: list, ops: list, expected=None,
+           timeout: int = 5) -> str:
+    """在 Resolver 上依次回放 reload/resolve 操作，返回记录的紧凑 JSON。
+
+    ops/expected 类型错抛 TypeError，内容错抛 ReplayError；zone、plan、
+    timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
+    in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
+    为 true：reload 键序 ok,revision；resolve 键序
+    ok,response,source,end,hit，response 为小写十六进制。操作抛出的
+    异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
+    状态语义沿用 Resolver（失败不改变任何状态）。输出为紧凑 ASCII
+    JSON，顶层键序 version,ops，version 为 1，末尾单换行。expected
+    为 None 时仅记录；为 str 时与输出整体比较，不一致抛 ReplayError。
+    """
+    if expected is not None and not isinstance(expected, str):
+        raise TypeError("expected must be str or None")
+    checked = _validate_ops(ops)
+    resolver = Resolver(zone, plan, timeout)
+    items = []
+    for kind, op in checked:
+        if kind == "reload":
+            try:
+                revision = resolver.reload_zone(op["text"])
+                out = {"ok": True, "revision": revision}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        else:
+            try:
+                response, source, end, hit = resolver.resolve(
+                    bytes.fromhex(op["query"]), op["now"], op["limit"])
+                out = {"ok": True, "response": response.hex(),
+                       "source": source, "end": end, "hit": hit}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        items.append({"in": op, "out": out, "stats": resolver.stats()})
+    result = json.dumps({"version": 1, "ops": items},
+                        ensure_ascii=True, separators=(",", ":")) + "\n"
+    if expected is not None and result != expected:
+        raise ReplayError("output does not match expected")
+    return result
 
 
 def main(argv):
