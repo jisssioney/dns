@@ -7,9 +7,12 @@
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
 - CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
+- ConfigError: zone 配置文本无法解析或不符合 v0/v1 配置格式（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
+- import_zone(text: str) -> dict: 导入 v0/v1 紧凑 JSON zone 文本并迁移规范化。
+- export_zone(zone: dict) -> str: 把 zone 规范化后导出为 v1 紧凑 JSON 文本。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
@@ -20,7 +23,9 @@
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
-  stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）。
+  reload_zone(text) 原子热替换 zone（返回自 0 递增的修订号，保留时钟、
+  plan、统计）；stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，
+  末尾换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -56,6 +61,10 @@ class CacheError(ValueError):
     """缓存时钟非单调或缓存语义不满足。"""
 
 
+class ConfigError(ValueError):
+    """zone 配置文本无法解析或不符合 v0/v1 配置格式。"""
+
+
 class UpstreamError(RuntimeError):
     """上游转发未获得可用应答。"""
 
@@ -77,6 +86,10 @@ _HEXDIGITS = frozenset("0123456789abcdefABCDEF")
 _MODEL_KEYS = ["an", "ns", "ar", "limit"]
 _ZONE_KEYS = ["origin", "records"]
 _RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
+_CONFIG_V1_KEYS = ["version", "origin", "records"]
+_CONFIG_V0_KEYS = ["version", "origin", "data"]
+_CONFIG_VERSIONS = {0, 1}
+_LOWER_HEXDIGITS = frozenset("0123456789abcdef")
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -712,6 +725,143 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     return _encode_plan(query, rcode, an, ns, limit)
 
 
+def _reject_duplicate_keys(pairs):
+    """json.loads 的 object_pairs_hook：对象内重复键直接判为配置错误。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError("duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(constant):
+    """json.loads 的 parse_constant：NaN/Infinity 不为配置格式接受。"""
+    raise ConfigError("invalid json constant")
+
+
+def _config_hex_to_bytes(value):
+    """把配置 rdata/data 文本解析为 bytes；须为偶数长纯小写十六进制。"""
+    if not isinstance(value, str):
+        raise ConfigError("rdata must be a hex string")
+    if len(value) % 2 or any(ch not in _LOWER_HEXDIGITS for ch in value):
+        raise ConfigError("rdata must be even-length lowercase hex")
+    return bytes.fromhex(value)  # 偶数长且仅 0-9a-f，必然成功
+
+
+def _config_record_to_rr(item, rdata_key):
+    """把一条 v0/v1 配置记录转为内部 RR dict（rdata 为 bytes）。
+
+    键序与字段类型等配置格式问题抛 ConfigError；取值范围等语义问题留待
+    _validate_zone 抛 RecordError。
+    """
+    if not isinstance(item, dict):
+        raise ConfigError("record must be an object")
+    expected = ["name", "type", "class", "ttl", rdata_key]
+    if list(item.keys()) != expected:
+        raise ConfigError("record keys must be " + ",".join(expected))
+    name = item["name"]
+    rrtype = item["type"]
+    rrclass = item["class"]
+    ttl = item["ttl"]
+    if not isinstance(name, str):
+        raise ConfigError("name must be a string")
+    if not isinstance(rrtype, int) or isinstance(rrtype, bool):
+        raise ConfigError("type must be an integer")
+    if not isinstance(rrclass, int) or isinstance(rrclass, bool):
+        raise ConfigError("class must be an integer")
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        raise ConfigError("ttl must be an integer")
+    return {"name": name, "type": rrtype, "class": rrclass, "ttl": ttl,
+            "rdata": _config_hex_to_bytes(item[rdata_key])}
+
+
+def _config_to_zone(config):
+    """把解析后的 v0/v1 配置对象转为内部 zone dict（rdata 已为 bytes）。
+
+    v1 顶层键序 version,origin,records（version=1）；v0 的 version=0 且
+    顶层与记录的末键均为 data。键序、版本、字段类型、布尔冒充整数与
+    十六进制等配置格式错误抛 ConfigError。
+    """
+    if not isinstance(config, dict):
+        raise ConfigError("top-level value must be an object")
+    if list(config.keys()) == _CONFIG_V1_KEYS:
+        records_key = "records"  # 顶层末键
+        rdata_key = "rdata"  # 记录末键
+    elif list(config.keys()) == _CONFIG_V0_KEYS:
+        records_key = "data"
+        rdata_key = "data"
+    else:
+        raise ConfigError("config keys must be version,origin,records")
+    version = config["version"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ConfigError("version must be an integer")
+    # 版本须受支持，且与末键形态（v0 data / v1 rdata）一致。
+    if version not in _CONFIG_VERSIONS or (version == 1) != (
+            rdata_key == "rdata"):
+        raise ConfigError("unsupported config version")
+    origin = config["origin"]
+    if not isinstance(origin, str):
+        raise ConfigError("origin must be a string")
+    records = config[records_key]
+    if not isinstance(records, list):
+        raise ConfigError("records must be a list")
+    return {
+        "origin": origin,
+        "records": [_config_record_to_rr(item, rdata_key) for item in records],
+    }
+
+
+def import_zone(text: str) -> dict:
+    """导入 v0/v1 紧凑 JSON zone 文本，返回规范化内部 zone。
+
+    返回值键序为 origin,records，记录 rdata 为 bytes，name 已小写化、
+    CNAME rdata 已按绝对名重编码，可直接交给 answer/PositiveCache。
+    v0（version=0、末键 data）在导入时迁移。JSON 解析、重复键、键序、
+    版本、类型、布尔冒充整数或十六进制错误抛 ConfigError；语义错误沿用
+    RecordError、ZoneError；text 非 str 抛 TypeError。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    try:
+        config = json.loads(
+            text, object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant)
+    except ConfigError:
+        raise
+    except json.JSONDecodeError:
+        raise ConfigError("text is not valid json") from None
+    zone = _config_to_zone(config)
+    origin_labels, rrs, _cls = _validate_zone(zone)
+    origin = ".".join(origin_labels) + "." if origin_labels else "."
+    return {"origin": origin, "records": [_rr_to_model(rr) for rr in rrs]}
+
+
+def export_zone(zone: dict) -> str:
+    """把 zone 校验规范化后导出为 v1 紧凑 ASCII JSON 文本（末尾换行）。
+
+    键序 version,origin,records 与 name,type,class,ttl,rdata；version 为
+    整数 1，rdata 为偶数长小写十六进制，整数按十进制；语义错误沿用
+    RecordError、ZoneError，zone 非 dict 抛 TypeError。
+    """
+    if not isinstance(zone, dict):
+        raise TypeError("zone must be dict")
+    origin_labels, rrs, _cls = _validate_zone(zone)
+    origin = ".".join(origin_labels) + "." if origin_labels else "."
+    records = []
+    for labels, rrtype, rrclass, ttl, rdata in rrs:
+        records.append({
+            "name": ".".join(labels) + "." if labels else ".",
+            "type": rrtype,
+            "class": rrclass,
+            "ttl": ttl,
+            "rdata": rdata.hex(),
+        })
+    config = {"version": 1, "origin": origin, "records": records}
+    return json.dumps(config, ensure_ascii=True,
+                      separators=(",", ":")) + "\n"
+
+
 class PositiveCache:
     """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
@@ -1113,6 +1263,10 @@ class Resolver:
     任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后时钟单调性
     以该结束时刻为准。
 
+    reload_zone(text)：按 import_zone 导入并构造全新 PositiveCache 后原子
+    换区并清空权威正/负缓存；时钟、plan、timeout、递归缓存与统计均保留；
+    失败不改变任何状态；成功返回自 0 递增的修订号（0、1、2……）。
+
     stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
     换行）；仅成功返回或上游耗尽时原子更新，参数/计划/编码/时钟异常
     不更新，耗尽不改缓存与最后时刻。
@@ -1129,6 +1283,7 @@ class Resolver:
         self._cache = PositiveCache(zone)
         self._timeout = timeout
         self._last_end = None  # 上次成功 resolve 的结束时刻
+        self._revision = 0  # 下次成功 reload_zone 下发的修订号（自 0 递增）
         # 域外递归结果缓存：与权威正/负缓存独立，共用键与正/负 TTL 规则，
         # 同一容量 256、同一 FIFO 淘汰。
         self._rec_pos = {}  # 正缓存键 -> (插入时刻, 规范化 an)
@@ -1140,6 +1295,23 @@ class Resolver:
         self._stats_x = 0
         self._stats_u = [0, 0, 0]
         self._stats_l = [0, 0, 0, 0]
+
+    def reload_zone(self, text: str) -> int:
+        """导入 text 并原子热替换权威 zone，返回本次修订号（自 0 递增）。
+
+        先在入参上完成 import_zone 并构造全新 PositiveCache，二者全部成功
+        后才提交：换区并清空权威正/负缓存；时钟（上次成功结束时刻）、
+        转发 plan、timeout、递归缓存与统计均保留。失败不改变任何状态
+        （修订号也不递增）。text 非 str 抛 TypeError；配置错误抛
+        ConfigError；语义错误沿用 RecordError、ZoneError。
+        """
+        # 先导入再构造新缓存，任何一步失败都在提交前抛出，状态保持不变。
+        zone = import_zone(text)
+        cache = PositiveCache(zone)  # 全新缓存即“清空缓存”
+        self._cache = cache
+        revision = self._revision  # 修订号自 0 递增：0、1、2……
+        self._revision += 1
+        return revision
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
