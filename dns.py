@@ -2,8 +2,8 @@
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
-- EDNSError: EDNS 报文 AR/OPT 非法、截断、尾随或模型含 OPT
-  （MessageError 子类）。
+- EDNSError: EDNS 查询截断、尾随、名字非法、AN/NS 非空或 AR/OPT
+  非法、模型含 OPT（MessageError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
@@ -11,6 +11,7 @@
 - CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
 - ConfigError: 配置文本解析或结构非法（ValueError 子类）。
 - ReplayError: 回放操作序列非法或回放记录与期望不符（ValueError 子类）。
+- PolicyError: 授权规则数量、键序或字段值非法（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - edns(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码可含
@@ -33,6 +34,8 @@
   c[0] 于下次解析提交时同步）。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+- authorize(query: bytes, client: str, rules: list, default: str = "deny")
+  -> bool: 按 client/名称/类型规则原序匹配授权查询。
 
 命令行：python dns.py decode HEX
 """
@@ -40,6 +43,7 @@
 from bisect import bisect_right
 from collections import deque
 import copy
+import ipaddress
 import json
 import sys
 
@@ -80,6 +84,10 @@ class ReplayError(ValueError):
     """回放操作序列非法或回放记录与期望不符。"""
 
 
+class PolicyError(ValueError):
+    """授权规则数量、键序或字段值非法。"""
+
+
 class UpstreamError(RuntimeError):
     """上游转发未获得可用应答。"""
 
@@ -107,6 +115,9 @@ _CONFIG_RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+_POLICY_RULE_KEYS = ["client", "name", "type", "action"]
+_POLICY_ACTIONS = frozenset(("allow", "deny"))
+_MAX_POLICY_RULES = 256
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -236,9 +247,11 @@ def decode_query(data: bytes) -> dict:
 def _decode_edns_query(data):
     """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do) 或 None)。
 
-    问题段解码契约同 decode_query；AR 限 0 或 1 条，有则须为未压缩根
-    owner、TYPE41、CLASS512..65535、扩展码/版本 0、flags 仅 DO、
-    RDLENGTH0 的 OPT。非法 AR/OPT、截断或尾随抛 EDNSError。
+    问题段解码契约同 decode_query，但查询截断（问题区越界）、非法名字
+    （含压缩问题）、AN/NS 非空、非法 AR/OPT 与尾随字节一律抛
+    EDNSError；报文长度与问题数等其余错误仍抛 MessageError。AR 限 0 或
+    1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、扩展码/
+    版本 0、flags 仅 DO、RDLENGTH0 的 OPT。
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -253,16 +266,20 @@ def _decode_edns_query(data):
     if not 1 <= qdcount <= _MAX_QUESTIONS:
         raise MessageError("bad question count")
     if ancount or nscount:
-        raise MessageError("response sections must be empty")
+        raise EDNSError("response sections must be empty")
     if arcount > 1:
         raise EDNSError("additional section must contain at most one OPT")
     boundaries = set()
     questions = []
     pos = _MIN_MESSAGE_LEN
     for _ in range(qdcount):
-        name, pos = _read_name(data, pos, boundaries)
+        try:
+            name, pos = _read_name(data, pos, boundaries)
+        except MessageError:
+            # 查询截断或名字非法（含压缩问题）：EDNS 路径下统一为 EDNSError。
+            raise EDNSError("invalid question name") from None
         if pos + 4 > len(data):
-            raise MessageError("question truncated")
+            raise EDNSError("question truncated")
         qtype = int.from_bytes(data[pos:pos + 2], "big")
         qclass = int.from_bytes(data[pos + 2:pos + 4], "big")
         pos += 4
@@ -1793,6 +1810,115 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     if expected is not None and result != expected:
         raise ReplayError("output does not match expected")
     return result
+
+
+def _parse_policy_network(value):
+    """把规则 client 解析为 ("*", None) 或 ("net", 网段对象)。
+
+    "*" 匹配任意客户端；否则须为 strict 解析成功且与规范文本逐字一致的
+    IPv4/IPv6 CIDR（主机位不得置位）。非法抛 PolicyError。
+    """
+    if value == "*":
+        return "*", None
+    try:
+        net = ipaddress.ip_network(value, strict=True)
+    except (ValueError, TypeError):
+        raise PolicyError(
+            "client must be * or canonical IPv4/IPv6 CIDR") from None
+    if str(net) != value:
+        raise PolicyError("client must be canonical IPv4/IPv6 CIDR")
+    return "net", net
+
+
+def _validate_policy_rules(rules):
+    """完整校验授权规则，返回按原序排列的规范化列表，不修改入参。
+
+    每项为 (网段类, 网段或 None, 名称, 类型或 None, 是否 allow)：
+    网段类为 "*" 或 "net"；名称为 "*" 或已规范化的小写绝对名。
+    类型错抛 TypeError；规则数、键序或字段值错抛 PolicyError。
+    """
+    if not isinstance(rules, list):
+        raise TypeError("rules must be list")
+    if not 0 <= len(rules) <= _MAX_POLICY_RULES:
+        raise PolicyError("rules must contain 0..256 items")
+    checked = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise TypeError("rule must be dict")
+        if list(rule.keys()) != _POLICY_RULE_KEYS:
+            raise PolicyError("rule keys must be client,name,type,action")
+        client = rule["client"]
+        name = rule["name"]
+        qtype = rule["type"]
+        action = rule["action"]
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(name, str):
+            raise TypeError("name must be str")
+        if qtype is not None:
+            _check_int(qtype, "type")
+        if not isinstance(action, str):
+            raise TypeError("action must be str")
+        net_kind, net = _parse_policy_network(client)
+        if name != "*":
+            try:
+                normalized = _labels_to_name(_normalize_name(name))
+            except RecordError as exc:
+                raise PolicyError(str(exc)) from None
+            if normalized != name:
+                raise PolicyError("name must be a lowercase absolute name")
+        if qtype is not None and not 0 <= qtype <= 0xFFFF:
+            raise PolicyError("type out of range")
+        if action not in _POLICY_ACTIONS:
+            raise PolicyError("action must be allow or deny")
+        checked.append((net_kind, net, name, qtype, action == "allow"))
+    return checked
+
+
+def authorize(query: bytes, client: str, rules: list,
+              default: str = "deny") -> bool:
+    """按规则原序判定 query 是否放行，返回是否 allow。
+
+    query 须为 decode_query 可解码的单问题非应答报文；client 须为字面
+    IP 地址。rules 为 0..256 项，项键序仅 client,name,type,action：
+    client 为 "*" 或规范 IPv4/IPv6 CIDR，name 为 "*" 或小写绝对名，
+    type 为 None 或 0..65535 的非 bool 整数，action/default 为
+    "allow"/"deny"。按原序取首个网段、名称、类型均匹配项，无匹配取
+    default。任一入参或字段类型错抛 TypeError；规则数量、键序或字段
+    值错（含 client 非 IP 地址）抛 PolicyError；query 解码错误沿用
+    decode_query，非单问题或 QR 置位抛 EncodeError。规则全部校验通过
+    后才解码 query 并匹配；不修改任何入参。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    if not isinstance(client, str):
+        raise TypeError("client must be str")
+    if not isinstance(default, str):
+        raise TypeError("default must be str")
+    if default not in _POLICY_ACTIONS:
+        raise PolicyError("default must be allow or deny")
+    # 规则须在任何匹配（含 query 解码）之前整体校验通过。
+    checked = _validate_policy_rules(rules)
+    try:
+        addr = ipaddress.ip_address(client)
+    except (ValueError, TypeError):
+        raise PolicyError("client must be an IP address") from None
+    msg = decode_query(query)
+    if msg["flags"] & _FLAG_QR:
+        raise EncodeError("query has QR set")
+    if len(msg["questions"]) != 1:
+        raise EncodeError("query must contain exactly one question")
+    qname = msg["questions"][0]["name"]
+    qtype = msg["questions"][0]["type"]
+    for net_kind, net, name, rule_type, is_allow in checked:
+        if net_kind == "net" and addr not in net:
+            continue
+        if name != "*" and name != qname:
+            continue
+        if rule_type is not None and rule_type != qtype:
+            continue
+        return is_allow
+    return default == "allow"
 
 
 def main(argv):
