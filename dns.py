@@ -42,7 +42,11 @@
   历史容量 32、超量淘汰最小修订号且号码不复用；
   rollback_zone_tx(target, expected) 带修订号检查的原子回滚事务，返回
   键序 version,result,target 的紧凑 ASCII JSON 报告（末尾换行），
-  result 为 "applied"、"unchanged"、"missing" 或 "conflict"。
+  result 为 "applied"、"unchanged"、"missing" 或 "conflict"；
+  update_zone_tx(changes, serial, expected) 带修订号与 SOA 序列号检查
+  的原子区域更新事务，返回键序 version,result,serial 的紧凑 ASCII
+  JSON 报告（末尾换行），result 为 "applied"、"unchanged"、"stale"
+  或 "conflict"，修订号与 reload_zone 共用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
   rollback/rollback_batch 操作并记录为紧凑 ASCII JSON（末尾单换行）。
@@ -140,6 +144,9 @@ _REPLAY_ROLLBACK_BATCH_KEYS = ["op", "expected", "steps"]
 _REPLAY_ROLLBACK_TX_KEYS = ["op", "target", "expected"]
 _MAX_MIGRATE_TEXT_LEN = 1048576
 _MAX_ROLLBACK_BATCH_STEPS = 32
+_UPDATE_CHANGE_KEYS = ["op", "record"]
+_UPDATE_OPS = frozenset(("add", "delete"))
+_MAX_UPDATE_CHANGES = 256
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
 _REPLAY_LEVEL_KEYS = ["name", "events"]
@@ -537,6 +544,14 @@ def _parse_soa_minimum(rdata):
     rdata 须完整为两个未压缩绝对域名及五个网络序 uint32；
     格式不符返回 None，不抛异常。
     """
+    pos = _parse_soa_uint32_offset(rdata)
+    if pos is None:
+        return None
+    return int.from_bytes(rdata[pos + 16:pos + 20], "big")
+
+
+def _parse_soa_uint32_offset(rdata):
+    """SOA rdata 的两个未压缩绝对名后须恰为五个 uint32；返回其偏移或 None。"""
     pos = 0
     for _ in range(2):
         pos = _read_soa_name(rdata, pos)
@@ -544,7 +559,7 @@ def _parse_soa_minimum(rdata):
             return None
     if len(rdata) - pos != 20:
         return None
-    return int.from_bytes(rdata[pos + 16:pos + 20], "big")
+    return pos
 
 
 def _negative_cache_entry(key, rcode, an, ns, now):
@@ -1620,6 +1635,23 @@ class Resolver:
     区域按新修订号归档，报告 applied；递归缓存、时钟、plan 与统计均
     保留，提交当下 stats() 逐字节不变。非 applied 结果或任何异常均不
     改变任何状态。
+
+    update_zone_tx(changes, serial, expected)：带修订号与 SOA 序列号
+    检查的原子区域更新事务，返回键序 version,result,serial 的紧凑
+    ASCII JSON 报告（末尾换行）。changes 为 1..256 项，项键序
+    op,record，op 为 "add"/"delete"，record 同 zone.records 契约且
+    type 为 6（SOA）抛 ZoneError；serial 为 uint32，expected 非负。
+    类型错（含 bool 整数）抛 TypeError；数量、项键、op 值或整数
+    范围错抛 ConfigError。验参后先比 expected：不等于当前修订号报告
+    conflict 且不验项；再验项；当前 SOA rdata 须完整为两个未压缩
+    绝对名与五个 uint32 且无尾随，否则 ZoneError；serial 对当前
+    序列号模 2^32 的差在 1..2^31-1 才更新，否则报告 stale。隔离
+    执行：add 无同五字段 RR 才尾加，delete 删尽同 RR；记录列表不变
+    报告 unchanged，否则把 SOA 序列号改为 serial，经 PositiveCache
+    完整验证后原子换区（清空权威缓存，保留递归缓存、时钟、plan 与
+    统计），修订号加 1 并按新修订号归档，报告 applied。version 取
+    操作后修订号，serial 原样；非 applied 或任何异常均不改变任何
+    状态。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1990,6 +2022,105 @@ class Resolver:
         self._archive_revision(self._revision, cache)
         return self._rollback_report(self._revision, "applied", target)
 
+    def update_zone_tx(self, changes: list, serial: int,
+                       expected: int) -> str:
+        """带修订号与 SOA 序列号检查的原子区域更新事务。
+
+        changes 为 1..256 项，项键序 op,record，op 为 "add"/"delete"，
+        record 同 zone.records 契约（名称允许通配，CNAME rdata 按 zone
+        规则规范化）且 type 为 6（SOA）抛 ZoneError；serial 为 uint32，
+        expected 非负。类型错（含 bool 整数）抛 TypeError；数量、项键、
+        op 值或整数范围错抛 ConfigError。验参后先比 expected：不等于
+        当前修订号时不验项，报告 conflict（version 为当前修订号）且
+        不改变任何状态。相等时再验项；当前区域 SOA 的 rdata 须完整为
+        两个未压缩绝对名与五个网络序 uint32 且无尾随，否则 ZoneError。
+        serial 对当前 SOA 序列号模 2^32 的差在 1..2^31-1 才更新，否则
+        报告 stale。隔离执行：在记录副本上按序应用，add 无同五字段
+        （名称、类型、类、TTL、rdata）RR 才尾加，delete 删尽同 RR；
+        记录列表不变报告 unchanged（版本、缓存不变），否则把 SOA 序列号
+        改为 serial，以候选区域构造 PositiveCache 完整验证，成功后才
+        原子提交：换区、清空权威缓存、修订号加 1 并按新修订号归档，
+        报告 applied（version 为新修订号）；递归缓存、时钟、plan 与
+        统计均保留，提交当下 stats() 逐字节不变。serial 按入参原样
+        报告；非 applied 结果或任何异常均不改变任何状态。报告为紧凑
+        ASCII JSON（十进制整数、末尾单换行），result 为 "applied"、
+        "unchanged"、"stale" 或 "conflict"。
+        """
+        if not isinstance(changes, list):
+            raise TypeError("changes must be list")
+        if not 1 <= len(changes) <= _MAX_UPDATE_CHANGES:
+            raise ConfigError("changes must contain 1..256 items")
+        if not isinstance(serial, int) or isinstance(serial, bool):
+            raise TypeError("serial must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if not 0 <= serial <= _MAX_TTL:
+            raise ConfigError("serial out of range")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        # 验参完成后才比较 expected；冲突不验项，且不改变任何状态。
+        if expected != self._revision:
+            return self._update_report(self._revision, "conflict", serial)
+        # 再验项：键序 op,record，op 为 add/delete，record 同
+        # zone.records 契约且不得为 SOA；CNAME rdata 按 zone 规则规范化。
+        parsed = []
+        for change in changes:
+            if not isinstance(change, dict):
+                raise TypeError("change must be dict")
+            if list(change.keys()) != _UPDATE_CHANGE_KEYS:
+                raise ConfigError("change keys must be op,record")
+            op = change["op"]
+            if not isinstance(op, str):
+                raise TypeError("op must be str")
+            if op not in _UPDATE_OPS:
+                raise ConfigError("op must be add or delete")
+            labels, rrtype, rrclass, ttl, rdata = _validate_rr(
+                change["record"], allow_wildcard=True)
+            if rrtype == _TYPE_SOA:
+                raise ZoneError("change record must not be SOA")
+            if rrtype == _TYPE_CNAME:
+                rdata = _encode_cname_target(_decode_cname_target(rdata))
+            parsed.append((op, (labels, rrtype, rrclass, ttl, rdata)))
+        # 当前区域 SOA 的 rdata 须完整为两个未压缩绝对名与五个 uint32。
+        origin = self._cache._origin
+        records = self._cache._records
+        soa = [rr for rr in records
+               if rr[0] == origin and rr[1] == _TYPE_SOA][0]
+        soa_offset = _parse_soa_uint32_offset(soa[4])
+        if soa_offset is None:
+            raise ZoneError("soa rdata must be two names and five uint32")
+        current_serial = int.from_bytes(
+            soa[4][soa_offset:soa_offset + 4], "big")
+        # serial 对当前序列号模 2^32 的差须在 1..2^31-1 才更新。
+        if not 1 <= (serial - current_serial) % (1 << 32) <= (1 << 31) - 1:
+            return self._update_report(self._revision, "stale", serial)
+        # 隔离执行：在副本上按序应用，add 无同五字段 RR 才尾加，
+        # delete 删尽同 RR；任何失败都在提交前发生，真实状态不变。
+        updated = list(records)
+        for op, rr in parsed:
+            if op == "add":
+                if rr not in updated:
+                    updated.append(rr)
+            else:
+                updated = [existing for existing in updated if existing != rr]
+        if updated == list(records):
+            # 记录列表不变：不换区、不加修订号、不归档。
+            return self._update_report(self._revision, "unchanged", serial)
+        # 改 SOA 序列号（五个 uint32 之首），其余字段原样保留。
+        new_soa_rdata = (soa[4][:soa_offset] + serial.to_bytes(4, "big")
+                         + soa[4][soa_offset + 4:])
+        bumped = [(rr[0], rr[1], rr[2], rr[3], new_soa_rdata)
+                  if rr[0] == origin and rr[1] == _TYPE_SOA else rr
+                  for rr in updated]
+        candidate = {"origin": _labels_to_name(origin),
+                     "records": [_rr_to_model(rr) for rr in bumped]}
+        # 经 PositiveCache 完整验证，成功后才原子提交，失败无副作用。
+        cache = PositiveCache(candidate)
+        self._cache = cache
+        self._revision += 1
+        self._archive_revision(self._revision, cache)
+        return self._update_report(self._revision, "applied", serial)
+
     def _rollback_batch(self, expected, steps):
         """在隔离状态依序执行 reload/rollback 暂存步，整体原子提交。
 
@@ -2045,6 +2176,13 @@ class Resolver:
         """构造键序 version,result,target 的紧凑 ASCII JSON（末尾换行）。"""
         return json.dumps(
             {"version": version, "result": result, "target": target},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _update_report(version, result, serial):
+        """构造键序 version,result,serial 的紧凑 ASCII JSON（末尾换行）。"""
+        return json.dumps(
+            {"version": version, "result": result, "serial": serial},
             ensure_ascii=True, separators=(",", ":")) + "\n"
 
     def stats(self) -> str:
