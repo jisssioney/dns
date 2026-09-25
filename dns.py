@@ -36,6 +36,8 @@
   上依次回放 reload/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
+- RateLimiter(rules): 确定性固定窗查询/响应限流器，
+  allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)。
 
 命令行：python dns.py decode HEX
 """
@@ -118,6 +120,12 @@ _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
+_RATE_RULE_KEYS = ["client", "name", "type", "window", "query", "response"]
+_RATE_KINDS = ("query", "response")
+_MIN_RATE_WINDOW = 1
+_MAX_RATE_WINDOW = 3600
+_MAX_RATE_QUOTA = 65535
+_RATE_TABLE_CAPACITY = 4096
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -1919,6 +1927,160 @@ def authorize(query: bytes, client: str, rules: list,
             continue
         return is_allow
     return default == "allow"
+
+
+def _validate_rate_rules(rules):
+    """完整校验限流规则，返回按原序排列的规范化列表，不修改入参。
+
+    每项为 (网段类, 网段或 None, 名称, 类型或 None, 窗长, 查询配额,
+    响应配额)；网段与名称格式同授权规则。类型错抛 TypeError；
+    规则数、键序或字段值错抛 PolicyError。
+    """
+    if not isinstance(rules, list):
+        raise TypeError("rules must be list")
+    if not 0 <= len(rules) <= _MAX_POLICY_RULES:
+        raise PolicyError("rules must contain 0..256 items")
+    checked = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise TypeError("rule must be dict")
+        if list(rule.keys()) != _RATE_RULE_KEYS:
+            raise PolicyError(
+                "rule keys must be client,name,type,window,query,response")
+        client = rule["client"]
+        name = rule["name"]
+        qtype = rule["type"]
+        window = rule["window"]
+        query_quota = rule["query"]
+        response_quota = rule["response"]
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(name, str):
+            raise TypeError("name must be str")
+        if qtype is not None:
+            _check_int(qtype, "type")
+        _check_int(window, "window")
+        _check_int(query_quota, "query")
+        _check_int(response_quota, "response")
+        net_kind, net = _parse_policy_network(client)
+        if name != "*":
+            try:
+                normalized = _labels_to_name(_normalize_name(name))
+            except RecordError as exc:
+                raise PolicyError(str(exc)) from None
+            if normalized != name:
+                raise PolicyError("name must be a lowercase absolute name")
+        if qtype is not None and not 0 <= qtype <= 0xFFFF:
+            raise PolicyError("type out of range")
+        if not _MIN_RATE_WINDOW <= window <= _MAX_RATE_WINDOW:
+            raise PolicyError("window out of range")
+        if not 0 <= query_quota <= _MAX_RATE_QUOTA:
+            raise PolicyError("query out of range")
+        if not 0 <= response_quota <= _MAX_RATE_QUOTA:
+            raise PolicyError("response out of range")
+        checked.append((net_kind, net, name, qtype, window,
+                        query_quota, response_quota))
+    return checked
+
+
+class RateLimiter:
+    """确定性固定窗查询/响应限流器。
+
+    rules 为 0..256 项，项键序仅 client,name,type,window,query,response：
+    前三项格式同 authorize 规则（client 为 "*" 或规范 IPv4/IPv6 CIDR，
+    name 为 "*" 或小写绝对名，type 为 None 或 0..65535 非 bool 整数），
+    window 为 1..3600、query/response 配额为 0..65535 的非 bool 整数。
+    allow(query, client, now, kind="query") 按原序取首个网段、名称、
+    类型均匹配项；无匹配返回 (True, -1)。命中按 now // window 划分
+    固定窗，键为 (规则序号, IP, qname, qtype, kind, 窗号)：窗内未达
+    对应配额则计数加一并返回 (True, 剩余配额)，已达配额则不加并返回
+    (False, 0)。每次调用先删除当前已过期窗；计数表满 4096 键时淘汰
+    (窗截止时刻, 创建序) 最小项。now 须为非负且不回退的 int，否则
+    抛 CacheError；kind 仅 "query"/"response"，client 须为字面 IP
+    地址，否则抛 PolicyError。query 沿用 decode_query，非单问题或
+    QR 置位抛 EncodeError。规则在构造时一次性校验；任何失败都不
+    改变计数状态与入参。
+    """
+
+    def __init__(self, rules: list):
+        # 校验即构造全新的不可变元组列表，与外部对入参的后续改动隔离。
+        self._rules = _validate_rate_rules(rules)
+        # 计数键 -> [窗起始, 窗截止, 计数, 创建序]
+        self._counts = {}
+        self._serial = 0  # 创建序：随新窗计数项从 0 递增
+        self._last_now = None  # 上次成功 allow 的时钟值
+
+    def allow(self, query: bytes, client: str, now: int,
+              kind: str = "query") -> tuple[bool, int]:
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(kind, str):
+            raise TypeError("kind must be str")
+        if kind not in _RATE_KINDS:
+            raise PolicyError("kind must be query or response")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # 规则须在任何匹配（含 query 解码）之前整体可用，client 与 query
+        # 的校验顺序同 authorize：先地址、后解码。
+        try:
+            addr = ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        msg = decode_query(query)
+        if msg["flags"] & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if len(msg["questions"]) != 1:
+            raise EncodeError("query must contain exactly one question")
+        qname = msg["questions"][0]["name"]
+        qtype = msg["questions"][0]["type"]
+        matched = None
+        for index, (net_kind, net, name, rule_type, window,
+                    query_quota, response_quota) in enumerate(self._rules):
+            if net_kind == "net" and addr not in net:
+                continue
+            if name != "*" and name != qname:
+                continue
+            if rule_type is not None and rule_type != qtype:
+                continue
+            quota = query_quota if kind == "query" else response_quota
+            matched = (index, window, quota)
+            break
+        if matched is None:
+            self._last_now = now
+            return True, -1
+        # 先删除当前已过期窗（截止时刻 <= now），再处理命中键。
+        for dead in [key for key, value in self._counts.items()
+                     if value[1] <= now]:
+            del self._counts[dead]
+        index, window, quota = matched
+        if quota == 0:
+            # 配额为 0：一律拒绝，不创建计数项也不触发淘汰。
+            self._last_now = now
+            return False, 0
+        bucket = now // window
+        key = (index, str(addr), qname, qtype, kind, bucket)
+        entry = self._counts.get(key)
+        if entry is None:
+            # 计数表满 4096 键时淘汰 (截止, 创建序) 最小项后再插入。
+            if len(self._counts) >= _RATE_TABLE_CAPACITY:
+                oldest = min(self._counts,
+                             key=lambda k: (self._counts[k][1],
+                                            self._counts[k][3]))
+                del self._counts[oldest]
+            self._counts[key] = [bucket * window, (bucket + 1) * window,
+                                 0, self._serial]
+            self._serial += 1
+            entry = self._counts[key]
+        if entry[2] >= quota:
+            self._last_now = now
+            return False, 0
+        entry[2] += 1
+        self._last_now = now
+        return True, quota - entry[2]
 
 
 def main(argv):
