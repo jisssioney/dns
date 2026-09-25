@@ -17,7 +17,9 @@
 - forward(query, plan, now, timeout=5): 按 plan 顺序模拟上游转发，
   成功返回 (应答报文, 上游名, 结束时刻)。
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
-  resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)。
+  resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
+  resolve_recursive(query, levels, now, limit=512) 按 levels 逐层递归转发，
+  域外终态另入递归缓存，返回同样的四元组。
 
 命令行：python dns.py decode HEX
 """
@@ -809,8 +811,12 @@ def _check_non_negative_int(value, field):
         raise ValueError(field + " must be non-negative")
 
 
-def _validate_plan(plan):
-    """校验转发计划，返回规范化后的 [(name, [(delay, reply), ...]), ...]。"""
+def _validate_plan(plan, reply_validator=None):
+    """校验转发计划，返回规范化后的 [(name, [(delay, reply), ...]), ...]。
+
+    reply_validator 为 None 时 reply 必须为 None/bytes（forward 规则）；
+    否则用该校验器校验并规范化 reply（递归层规则）。
+    """
     if not isinstance(plan, list):
         raise TypeError("plan must be list")
     if not 1 <= len(plan) <= _MAX_PLAN_ITEMS:
@@ -836,11 +842,54 @@ def _validate_plan(plan):
                 raise ValueError("event must be (delay, reply)")
             delay, reply = event
             _check_non_negative_int(delay, "delay")
-            if reply is not None and not isinstance(reply, bytes):
+            if reply_validator is not None:
+                reply = reply_validator(reply)
+            elif reply is not None and not isinstance(reply, bytes):
                 raise TypeError("reply must be bytes or None")
             checked.append((delay, reply))
         items.append((name, checked))
     return items
+
+
+def _validate_recursive_reply(reply):
+    """校验递归层事件应答 None 或 (kind, an, ns)，返回规范化形态。
+
+    kind：0 转介（an 空、ns 非空）、1 答案（an 非空、ns 空）、
+    2 NXDOMAIN / 3 NODATA（an 空、ns 恰一条 SOA）。
+    类型错抛 TypeError，结构或组合错抛 ValueError，RR 错抛 RecordError。
+    """
+    if reply is None:
+        return None
+    if not isinstance(reply, tuple):
+        raise TypeError("reply must be tuple or None")
+    if len(reply) != 3:
+        raise ValueError("reply must be (kind, an, ns)")
+    kind, an, ns = reply
+    _check_int(kind, "kind")
+    if not 0 <= kind <= 3:
+        raise ValueError("kind out of range")
+    if not isinstance(an, list) or not isinstance(ns, list):
+        raise TypeError("an and ns must be list")
+    an_rrs = [_validate_rr(rr) for rr in an]
+    ns_rrs = [_validate_rr(rr) for rr in ns]
+    if kind == 0:
+        if an_rrs or not ns_rrs:
+            raise ValueError("referral requires empty an and non-empty ns")
+    elif kind == 1:
+        if not an_rrs or ns_rrs:
+            raise ValueError("answer requires non-empty an and empty ns")
+    elif an_rrs or len(ns_rrs) != 1 or ns_rrs[0][1] != _TYPE_SOA:
+        raise ValueError("nxdomain/nodata requires empty an and one SOA ns")
+    return kind, an_rrs, ns_rrs
+
+
+def _validate_levels(levels):
+    """校验 1..16 个递归层 plan，返回规范化后的层列表。"""
+    if not isinstance(levels, list):
+        raise TypeError("levels must be list")
+    if not 1 <= len(levels) <= _MAX_PLAN_ITEMS:
+        raise ValueError("levels must contain 1..16 plans")
+    return [_validate_plan(level, _validate_recursive_reply) for level in levels]
 
 
 def _reply_question_end(reply, qdcount):
@@ -923,8 +972,8 @@ def forward(query, plan, now, timeout=5):
 class Resolver:
     """权威缓存与上游转发组合的解析器。
 
-    构造即以 PositiveCache(zone) 建缓存；plan、timeout 按 forward 规则
-    校验并深拷贝，校验异常与 forward 一致。
+    构造即以 PositiveCache(zone) 建缓存；timeout、plan 按 forward 规则
+    与优先级先校验（timeout 先于 plan），通过后再深拷贝 plan 隔离。
 
     resolve(query, now, limit=512)：qclass 等于 zone 类且规范化 qname 在
     origin 内时仅查缓存，返回 (应答报文, "authority", now, 是否命中)，
@@ -932,17 +981,49 @@ class Resolver:
     调用 forward，返回 (应答报文, 上游名, 结束时刻, False)，转发结果
     不缓存。任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后
     时钟单调性以该结束时刻为准。
+
+    resolve_recursive(query, levels, now, limit=512)：域内同 resolve；
+    域外先查递归缓存，命中返回 (应答报文, "cache", now, True)，未命中则
+    按 levels 逐层转发，终态编码后按 PositiveCache 的键、正负 TTL 与
+    256 项 FIFO 入递归缓存，返回 (应答报文, 上游名, 结束时刻, False)。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
         self._cache = PositiveCache(zone)
-        # 校验次序同 forward：timeout 先于 plan。
+        # 校验次序同 forward：timeout 先于 plan；先校验通过再深拷贝，
+        # 校验异常及优先级与 forward 完全一致。
         _check_int(timeout, "timeout")
         if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
             raise ValueError("timeout out of range")
+        items = _validate_plan(plan)
         self._timeout = timeout
-        self._plan = _validate_plan(copy.deepcopy(plan))
-        self._last_end = None  # 上次成功 resolve 的结束时刻
+        self._plan = copy.deepcopy(items)
+        # 域外递归终态缓存：键、TTL 与 FIFO 规则同 PositiveCache。
+        self._rec_entries = {}
+        self._rec_neg_entries = {}
+        self._rec_order = deque()
+        self._last_end = None  # 上次成功解析的结束时刻（resolve 共用）
+
+    def _rec_negative_entry(self, key, kind, ns, now):
+        """递归终态可负缓存时返回 (负缓存键, 条目)，否则返回 None。
+
+        kind 2 为 NXDOMAIN（键匹配任意 qtype），kind 3 为 NODATA；
+        ns 已保证恰为一条 SOA，负 TTL 为 min(SOA ttl, 第五个 uint32)。
+        """
+        soa = ns[0]
+        minimum = _parse_soa_minimum(soa[4])
+        if minimum is None:
+            return None
+        neg_ttl = min(soa[3], minimum)
+        if neg_ttl == 0:
+            return None
+        if kind == 2:
+            rcode = _RCODE_NXDOMAIN
+            neg_key = ("nxdomain", key[0], key[2])  # 匹配任意 qtype
+        else:
+            rcode = 0
+            neg_key = ("nodata",) + key
+        return neg_key, (now, rcode, soa, neg_ttl)
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -969,6 +1050,131 @@ class Resolver:
         reply, name, end = forward(query, self._plan, now, self._timeout)
         self._last_end = end
         return reply, name, end, False
+
+    def resolve_recursive(self, query: bytes, levels: list, now: int,
+                          limit: int = 512) -> tuple[bytes, str, int, bool]:
+        """域内走权威缓存；域外按 levels 逐层递归转发并缓存终态。
+
+        每层沿用 forward 的上游顺序、每上游前 2 个事件、时钟累计、
+        timeout 与耗尽异常：kind 0 为转介并进入下一层，末层转介抛
+        UpstreamError；kind 1/2/3 为答案/NXDOMAIN/NODATA 终态。
+        query/now/limit 异常同 resolve；levels 类型错抛 TypeError、
+        结构或组合错抛 ValueError、RR 错抛 RecordError。失败不改状态。
+        """
+        # query、now、limit 的校验同 resolve，单调性以上次成功结束时刻为准。
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        msg = decode_query(query)
+        _check_int(limit, "limit")
+        if (msg["flags"] & 0x8000 or len(msg["questions"]) != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        norm_levels = _validate_levels(levels)
+        question = msg["questions"][0]
+        qlabels = _normalize_name(question["name"])
+        origin = self._cache._origin
+        if (question["class"] == self._cache._zone_class
+                and len(qlabels) >= len(origin)
+                and qlabels[len(qlabels) - len(origin):] == origin):
+            # 域内：沿用 resolve 的权威缓存路径。
+            response, hit = self._cache.resolve(query, now, limit)
+            self._last_end = now
+            return response, "authority", now, hit
+        key = (question["name"], question["type"], question["class"])
+        # 域外：先查递归缓存，顺序为正缓存、NODATA、NXDOMAIN。
+        expired = None  # 到期条目待新应答编码成功后再清理
+        entry = self._rec_entries.get(key)
+        if entry is not None:
+            inserted, an = entry
+            elapsed = now - inserted
+            min_ttl = min(rr[3] for rr in an)
+            if elapsed < min_ttl:
+                aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                        for labels, rrtype, rrclass, ttl, rdata in an]
+                response = _encode_plan(query, 0, aged, [], limit)
+                self._last_end = now
+                return response, "cache", now, True
+            expired = ("pos", key)
+        else:
+            neg_key = ("nodata",) + key
+            neg = self._rec_neg_entries.get(neg_key)
+            if neg is None:
+                neg_key = ("nxdomain", key[0], key[2])
+                neg = self._rec_neg_entries.get(neg_key)
+            if neg is not None:
+                inserted, rcode, soa, neg_ttl = neg
+                elapsed = now - inserted
+                if elapsed < neg_ttl:
+                    aged_soa = (soa[0], soa[1], soa[2],
+                                neg_ttl - elapsed, soa[4])
+                    response = _encode_plan(
+                        query, rcode, [], [aged_soa], limit)
+                    self._last_end = now
+                    return response, "cache", now, True
+                expired = ("neg", neg_key)
+        # 未命中（含到期）：逐层转发，时钟与超时计数每层重置标志、
+        # 但时钟跨层累计。
+        clock = now
+        outcome = None  # (kind, an, ns, 上游名)
+        last = len(norm_levels) - 1
+        for depth, level in enumerate(norm_levels):
+            saw_timeout = False
+            saw_other = False
+            referred = False
+            for name, events in level:
+                for delay, reply in events[:_PLAN_EVENTS_USED]:
+                    if delay > self._timeout:
+                        saw_timeout = True
+                        clock += self._timeout
+                        continue
+                    clock += delay
+                    if reply is None:
+                        saw_other = True
+                        continue
+                    kind, an, ns = reply
+                    if kind == 0:
+                        if depth == last:
+                            raise UpstreamError(
+                                "referral at final recursive level")
+                        referred = True  # 转介：进入下一层
+                    else:
+                        outcome = (kind, an, ns, name)
+                    break
+                if referred or outcome is not None:
+                    break
+            if outcome is not None:
+                break
+            if not referred:
+                # 本层耗尽：异常判定同 forward。
+                if saw_timeout and not saw_other:
+                    raise UpstreamTimeout("all upstream attempts timed out")
+                raise UpstreamError("no usable upstream reply")
+        kind, an, ns, name = outcome
+        rcode = _RCODE_NXDOMAIN if kind == 2 else 0
+        # 先编码成功再动缓存，保证任何失败不改变状态。
+        response = _encode_plan(query, rcode, an, ns, limit)
+        if expired is not None:
+            tag, ekey = expired
+            del (self._rec_entries if tag == "pos"
+                 else self._rec_neg_entries)[ekey]
+            self._rec_order.remove(expired)  # 到期删除后按未命中刷新
+        if kind == 1 and all(rr[3] > 0 for rr in an):
+            self._rec_entries[key] = (clock, an)
+            self._rec_order.append(("pos", key))
+        elif kind in (2, 3):
+            negative = self._rec_negative_entry(key, kind, ns, clock)
+            if negative is not None:
+                neg_key, neg_entry = negative
+                self._rec_neg_entries[neg_key] = neg_entry
+                self._rec_order.append(("neg", neg_key))
+        if len(self._rec_order) > _CACHE_CAPACITY:
+            tag, oldest = self._rec_order.popleft()  # 满时淘汰最早插入者
+            del (self._rec_entries if tag == "pos"
+                 else self._rec_neg_entries)[oldest]
+        self._last_end = clock
+        return response, name, clock, False
 
 
 def main(argv):
