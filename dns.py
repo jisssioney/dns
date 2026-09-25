@@ -6,7 +6,7 @@
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
-- encode_response(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码权威应答报文。
+- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 
 命令行：python dns.py decode HEX
@@ -177,18 +177,48 @@ def _normalize_name(name):
     return labels
 
 
+def _normalize_owner_name(name):
+    """规范 zone 记录 owner，允许最左标签恰为 "*" 的通配名。
+
+    返回标签列表；通配与否可由 labels[0] == "*" 判别。
+    """
+    if not isinstance(name, str):
+        raise TypeError("name must be str")
+    if not name.endswith("."):
+        raise RecordError("name not absolute")
+    parts = name[:-1].split(".") if name != "." else []
+    labels = []
+    wire_len = 1  # 根终止符占 1 字节
+    for index, part in enumerate(parts):
+        label = part.lower()
+        if not 1 <= len(label) <= _MAX_LABEL_LEN:
+            raise RecordError("bad label length")
+        if index == 0 and label == "*":
+            pass  # 唯一合法的通配形态：最左标签为单字符 "*"
+        elif "*" in label or any(ch not in _LABEL_CHARS for ch in label):
+            raise RecordError("invalid label character")
+        labels.append(label)
+        wire_len += len(label) + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("name too long")
+    return labels
+
+
 def _check_int(value, field):
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(field + " must be int")
 
 
-def _validate_rr(rr):
+def _validate_rr(rr, allow_wildcard=False):
     """校验单条 RR，返回 (labels, type, class, ttl, rdata)。"""
     if not isinstance(rr, dict):
         raise TypeError("rr must be dict")
     if list(rr.keys()) != _RR_KEYS:
         raise RecordError("rr keys must be name,type,class,ttl,rdata")
-    labels = _normalize_name(rr["name"])
+    if allow_wildcard:
+        labels = _normalize_owner_name(rr["name"])
+    else:
+        labels = _normalize_name(rr["name"])
     rrtype = rr["type"]
     rrclass = rr["class"]
     ttl = rr["ttl"]
@@ -239,7 +269,7 @@ def _validate_zone(zone):
     records = zone["records"]
     if not isinstance(records, list):
         raise TypeError("records must be list")
-    rrs = [_validate_rr(rr) for rr in records]
+    rrs = [_validate_rr(rr, allow_wildcard=True) for rr in records]
     if not rrs:
         raise ZoneError("zone must contain a SOA record")
     rrclass = rrs[0][2]
@@ -249,7 +279,12 @@ def _validate_zone(zone):
     if len(origin_soa) != 1:
         raise ZoneError("origin must have exactly one SOA record")
     for labels, _rrtype, _cls, _ttl, _rdata in rrs:
-        if (len(labels) < len(origin)
+        if labels and labels[0] == "*":
+            suffix = labels[1:]
+            if (len(suffix) < len(origin)
+                    or suffix[len(suffix) - len(origin):] != origin):
+                raise RecordError("wildcard suffix not within origin")
+        elif (len(labels) < len(origin)
                 or labels[len(labels) - len(origin):] != origin):
             raise ZoneError("owner not within origin")
     return origin, rrs, rrclass
@@ -314,8 +349,8 @@ def _build_message(msg, an, ns, ar, rcode):
     return out, body_base, section_ends, flags
 
 
-def encode_response(query: bytes, model: dict, rcode: int = 0) -> bytes:
-    """把查询报文与应答模型编码为确定性权威应答报文。"""
+def _encode_response(query, model, rcode):
+    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。"""
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
@@ -366,6 +401,11 @@ def encode_response(query: bytes, model: dict, rcode: int = 0) -> bytes:
     return bytes(result)
 
 
+def encode_response(query: bytes, model: dict) -> bytes:
+    """把查询报文与应答模型编码为确定性权威应答报文（RCODE 恒为 0）。"""
+    return _encode_response(query, model, 0)
+
+
 def _rr_to_model(rr):
     """把规范化 RR 元组还原为键序固定的模型 dict。"""
     labels, rrtype, rrclass, ttl, rdata = rr
@@ -375,7 +415,7 @@ def _rr_to_model(rr):
 
 
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
-    """按 zone 对查询报文给出确定性权威应答。"""
+    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配记录）。"""
     msg = decode_query(query)  # MessageError/TypeError 原样传播
     _check_int(limit, "limit")
     questions = msg["questions"]
@@ -390,24 +430,57 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     ns = []
     if question["class"] != zone_class:
         rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
+    elif (len(qlabels) < len(origin)
+            or qlabels[len(qlabels) - len(origin):] != origin):
+        rcode = _RCODE_NXDOMAIN  # 查询名在 origin 之外
+        ns = [rr for rr in records
+              if rr[0] == origin and rr[1] == _TYPE_SOA]
     else:
-        matched = [rr for rr in records
-                   if rr[0] == qlabels and rr[1] == qtype]
-        if matched:
-            rcode = 0  # 名称与 type 精确命中：应答入 an，ns 为空
-            an = matched
+        # 节点集：origin、各记录 owner（含通配 owner）及其间的空非终端。
+        nodes = {tuple(origin)}
+        for labels, _rrtype, _cls, _ttl, _rdata in records:
+            for i in range(len(labels) - len(origin)):
+                nodes.add(tuple(labels[i:]))
+        if tuple(qlabels) in nodes:
+            # 同名节点存在：不回退通配。
+            matched = [rr for rr in records
+                       if rr[0] == qlabels and rr[1] == qtype]
+            if matched:
+                rcode = 0  # 同 TYPE 记录按 records 原序进 an，ns 为空
+                an = matched
+            else:
+                rcode = 0  # NODATA：节点存在（含空非终端）但无该 TYPE
+                ns = [rr for rr in records
+                      if rr[0] == origin and rr[1] == _TYPE_SOA]
         else:
-            rcode = 0 if any(rr[0] == qlabels for rr in records) \
-                else _RCODE_NXDOMAIN  # NODATA / NXDOMAIN
-            ns = [rr for rr in records
-                  if rr[0] == origin and rr[1] == _TYPE_SOA]
+            # 节点不存在：取最长既存后缀，只检查 "*."+该后缀。
+            encloser = None
+            for i in range(1, len(qlabels) - len(origin) + 1):
+                if tuple(qlabels[i:]) in nodes:
+                    encloser = qlabels[i:]
+                    break
+            wildcard = ["*"] + encloser
+            wmatched = [rr for rr in records
+                        if rr[0] == wildcard and rr[1] == qtype]
+            if wmatched:
+                rcode = 0  # 命中通配：owner 换成查询的小写绝对名
+                an = [(qlabels, rr[1], rr[2], rr[3], rr[4])
+                      for rr in wmatched]
+            elif any(rr[0] == wildcard for rr in records):
+                rcode = 0  # 通配节点存在但无该 TYPE：NODATA
+                ns = [rr for rr in records
+                      if rr[0] == origin and rr[1] == _TYPE_SOA]
+            else:
+                rcode = _RCODE_NXDOMAIN
+                ns = [rr for rr in records
+                      if rr[0] == origin and rr[1] == _TYPE_SOA]
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
         "ar": [],
         "limit": limit,
     }
-    return encode_response(query, model, rcode)
+    return _encode_response(query, model, rcode)
 
 
 def main(argv):
