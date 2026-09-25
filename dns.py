@@ -6,14 +6,19 @@
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
+- CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
+- PositiveCache(zone): 容量 256 的正向答案缓存，resolve(query, now, limit=512)
+  返回 (应答报文, 是否命中)。
 
 命令行：python dns.py decode HEX
 """
 
 from bisect import bisect_right
+from collections import deque
+import copy
 import json
 import sys
 
@@ -36,6 +41,10 @@ class EncodeError(ValueError):
 
 class CNAMEError(ValueError):
     """CNAME 链无法确定：有效名称重复或需加入第 17 条 CNAME。"""
+
+
+class CacheError(ValueError):
+    """缓存时钟非单调或缓存语义不满足。"""
 
 
 _MIN_MESSAGE_LEN = 12
@@ -66,6 +75,7 @@ _TYPE_CNAME = 5
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
+_CACHE_CAPACITY = 256
 
 
 def _read_name(data, offset, boundaries):
@@ -554,16 +564,13 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype):
         current = target
 
 
-def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
-    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
-    msg = decode_query(query)  # MessageError/TypeError 原样传播
-    _check_int(limit, "limit")
-    questions = msg["questions"]
-    if (msg["flags"] & 0x8000 or len(questions) != 1
-            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
-        raise EncodeError("query or limit not answerable")
-    origin, records, zone_class = _validate_zone(zone)
-    question = questions[0]
+def _answer_plan(msg, origin, records, zone_class):
+    """answer 的完整（未截断）应答计划，返回 (rcode, an, ns)。
+
+    msg 为已解码且通过可应答性检查的单问题查询；zone 已校验，
+    RR 均为规范化元组。
+    """
+    question = msg["questions"][0]
     qlabels = _normalize_name(question["name"])
     qtype = question["type"]
     an = []
@@ -582,6 +589,11 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             for i in range(len(labels) - len(origin)):
                 nodes.add(tuple(labels[i:]))
         rcode, an, ns = _resolve_chain(records, nodes, origin, qlabels, qtype)
+    return rcode, an, ns
+
+
+def _encode_plan(query, rcode, an, ns, limit):
+    """把完整应答计划编码为权威应答报文。"""
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
@@ -589,6 +601,85 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
         "limit": limit,
     }
     return _encode_response(query, model, rcode)
+
+
+def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
+    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
+    msg = decode_query(query)  # MessageError/TypeError 原样传播
+    _check_int(limit, "limit")
+    questions = msg["questions"]
+    if (msg["flags"] & 0x8000 or len(questions) != 1
+            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+        raise EncodeError("query or limit not answerable")
+    origin, records, zone_class = _validate_zone(zone)
+    rcode, an, ns = _answer_plan(msg, origin, records, zone_class)
+    return _encode_plan(query, rcode, an, ns, limit)
+
+
+class PositiveCache:
+    """容量 256 的正向答案缓存（FIFO 淘汰，命中不重排）。
+
+    键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
+    仅缓存 RCODE=0、ns 空、an 非空且各原始 TTL 均为正的完整有序应答；
+    条目保存插入时刻与原始 RR，输出 TTL 随经过时间递减，到期即删除。
+    任何失败（含编码失败）都不改变条目与时钟状态。
+    """
+
+    def __init__(self, zone: dict):
+        # 深拷贝后按 answer 规则校验：外部对 zone 的后续改动与缓存隔离，
+        # 校验异常与 answer 完全一致。
+        zone = copy.deepcopy(zone)
+        self._origin, self._records, self._zone_class = _validate_zone(zone)
+        self._entries = {}  # key -> (插入时刻, 规范化 an)
+        self._order = deque()  # 插入次序；与 _entries 的键集合始终一致
+        self._last_now = None  # 上次成功 resolve 的时钟值
+
+    def resolve(self, query: bytes, now: int,
+                limit: int = 512) -> tuple[bytes, bool]:
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # query、limit 的异常沿用 answer。
+        msg = decode_query(query)
+        _check_int(limit, "limit")
+        if (msg["flags"] & 0x8000 or len(msg["questions"]) != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        question = msg["questions"][0]
+        key = (question["name"], question["type"], question["class"])
+        expired = False
+        entry = self._entries.get(key)
+        if entry is not None:
+            inserted, an = entry
+            elapsed = now - inserted
+            min_ttl = min(rr[3] for rr in an)
+            if elapsed < min_ttl:
+                aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                        for labels, rrtype, rrclass, ttl, rdata in an]
+                # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
+                # 命中也不改变插入次序。
+                response = _encode_plan(query, 0, aged, [], limit)
+                self._last_now = now
+                return response, True
+            # 到期：先记下，待新应答编码成功后再清理，保证失败不改状态。
+            expired = True
+        # 未命中（含到期）：先按 answer 语义生成未截断的完整有序应答。
+        rcode, an, ns = _answer_plan(
+            msg, self._origin, self._records, self._zone_class)
+        # 先编码成功再落条目，保证编码失败不改变任何状态。
+        response = _encode_plan(query, rcode, an, ns, limit)
+        if expired:
+            del self._entries[key]
+            self._order.remove(key)  # 到期删除后按未命中刷新
+        if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
+            self._entries[key] = (now, an)
+            self._order.append(key)
+            if len(self._order) > _CACHE_CAPACITY:
+                oldest = self._order.popleft()  # 满时淘汰最早插入者
+                del self._entries[oldest]
+        self._last_now = now
+        return response, False
 
 
 def main(argv):
