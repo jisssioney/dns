@@ -37,7 +37,9 @@
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
-  allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)。
+  allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)；
+  stats(reset=False) -> str 返回键序 query,response,expired,evicted,
+  keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数。
 
 命令行：python dns.py decode HEX
 """
@@ -2000,6 +2002,18 @@ class RateLimiter:
     地址，否则抛 PolicyError。query 沿用 decode_query，非单问题或
     QR 置位抛 EncodeError。规则在构造时一次性校验；任何失败都不
     改变计数状态与入参。
+
+    stats(reset=False) 返回固定键序 query,response,expired,evicted,
+    keys 的紧凑 ASCII JSON（末尾一个换行）：query/response 各为键序
+    allow,deny,unmatched 的对象，值为非负十进制整数。统计仅在 allow
+    成功返回后原子提交：匹配规则返回 True/False 分别增加对应 kind 的
+    allow/deny；无匹配仅增加 unmatched；expired/evicted 分别累加本次
+    实际删除的过期键数、容量淘汰键数；keys 为当前计数键数。配额 0 的
+    拒绝不建键，配额耗尽的拒绝保留原键。allow 抛任何既有异常时，计数
+    表、最后时钟与统计均不变。reset 非 bool 抛 TypeError 且无变化；
+    False 重复读取不改状态；True 先返回重置前快照，再清零六个分类计数
+    及 expired、evicted，保留规则、计数键、创建序和最后时钟，因此 keys
+    不清零。相同初态和调用序列须逐字节相同。
     """
 
     def __init__(self, rules: list):
@@ -2009,6 +2023,14 @@ class RateLimiter:
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
         self._last_now = None  # 上次成功 allow 的时钟值
+        # 统计：各 kind 的 allow/deny/unmatched，以及本次重置周期内
+        # 实际删除的过期键数与容量淘汰键数。仅在 allow 成功返回后提交。
+        self._stat = {
+            "query": {"allow": 0, "deny": 0, "unmatched": 0},
+            "response": {"allow": 0, "deny": 0, "unmatched": 0},
+            "expired": 0,
+            "evicted": 0,
+        }
 
     def allow(self, query: bytes, client: str, now: int,
               kind: str = "query") -> tuple[bool, int]:
@@ -2050,20 +2072,28 @@ class RateLimiter:
             matched = (index, window, quota)
             break
         if matched is None:
+            # 统计随成功返回原子提交：无匹配仅增加对应 kind 的 unmatched。
+            self._stat[kind]["unmatched"] += 1
             self._last_now = now
             return True, -1
         # 先删除当前已过期窗（截止时刻 <= now），再处理命中键。
+        # 删除数先记为本次局部计数，待成功返回时与分类计数一并提交。
+        expired = 0
         for dead in [key for key, value in self._counts.items()
                      if value[1] <= now]:
             del self._counts[dead]
+            expired += 1
         index, window, quota = matched
         if quota == 0:
             # 配额为 0：一律拒绝，不创建计数项也不触发淘汰。
+            self._stat[kind]["deny"] += 1
+            self._stat["expired"] += expired
             self._last_now = now
             return False, 0
         bucket = now // window
         key = (index, str(addr), qname, qtype, kind, bucket)
         entry = self._counts.get(key)
+        evicted = 0
         if entry is None:
             # 计数表满 4096 键时淘汰 (截止, 创建序) 最小项后再插入。
             if len(self._counts) >= _RATE_TABLE_CAPACITY:
@@ -2071,16 +2101,61 @@ class RateLimiter:
                              key=lambda k: (self._counts[k][1],
                                             self._counts[k][3]))
                 del self._counts[oldest]
+                evicted += 1
             self._counts[key] = [bucket * window, (bucket + 1) * window,
                                  0, self._serial]
             self._serial += 1
             entry = self._counts[key]
         if entry[2] >= quota:
+            # 配额耗尽的拒绝保留原键，仅提交 deny 与过期/淘汰删除数。
+            self._stat[kind]["deny"] += 1
+            self._stat["expired"] += expired
+            self._stat["evicted"] += evicted
             self._last_now = now
             return False, 0
         entry[2] += 1
+        remaining = quota - entry[2]
+        self._stat[kind]["allow"] += 1
+        self._stat["expired"] += expired
+        self._stat["evicted"] += evicted
         self._last_now = now
-        return True, quota - entry[2]
+        return True, remaining
+
+    def stats(self, reset: bool = False) -> str:
+        """返回统计的固定键序紧凑 ASCII JSON（末尾一个换行）。
+
+        顶层键序 query,response,expired,evicted,keys；query/response 为
+        键序 allow,deny,unmatched 的对象，值为非负十进制整数；expired、
+        evicted 为上次重置后实际删除的过期键数、容量淘汰键数；keys 为
+        当前计数键数。统计仅在 allow 成功返回后原子提交，allow 抛异常
+        不改变统计。reset 非 bool 抛 TypeError 且无变化；False 重复读取
+        不改状态；True 先返回重置前快照，再清零六个分类计数及 expired、
+        evicted，保留规则、计数键、创建序和最后时钟，因此 keys 不清零。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        stat = self._stat
+        text = (
+            '{"query":{"allow":' + str(stat["query"]["allow"])
+            + ',"deny":' + str(stat["query"]["deny"])
+            + ',"unmatched":' + str(stat["query"]["unmatched"]) + "}"
+            + ',"response":{"allow":' + str(stat["response"]["allow"])
+            + ',"deny":' + str(stat["response"]["deny"])
+            + ',"unmatched":' + str(stat["response"]["unmatched"]) + "}"
+            + ',"expired":' + str(stat["expired"])
+            + ',"evicted":' + str(stat["evicted"])
+            + ',"keys":' + str(len(self._counts)) + "}\n"
+        )
+        if reset:
+            # 先返回重置前快照，再清零计数；计数键、创建序、规则、时钟
+            # 均保留。
+            for kind in _RATE_KINDS:
+                stat[kind]["allow"] = 0
+                stat[kind]["deny"] = 0
+                stat[kind]["unmatched"] = 0
+            stat["expired"] = 0
+            stat["evicted"] = 0
+        return text
 
 
 def main(argv):
