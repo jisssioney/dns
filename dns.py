@@ -16,6 +16,8 @@
 - UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
 - forward(query, plan, now, timeout=5): 按 plan 顺序模拟上游转发，
   成功返回 (应答报文, 上游名, 结束时刻)。
+- Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
+  resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)。
 
 命令行：python dns.py decode HEX
 """
@@ -916,6 +918,57 @@ def forward(query, plan, now, timeout=5):
     if saw_timeout and not saw_other:
         raise UpstreamTimeout("all upstream attempts timed out")
     raise UpstreamError("no usable upstream reply")
+
+
+class Resolver:
+    """权威缓存与上游转发组合的解析器。
+
+    构造即以 PositiveCache(zone) 建缓存；plan、timeout 按 forward 规则
+    校验并深拷贝，校验异常与 forward 一致。
+
+    resolve(query, now, limit=512)：qclass 等于 zone 类且规范化 qname 在
+    origin 内时仅查缓存，返回 (应答报文, "authority", now, 是否命中)，
+    正负缓存、TTL 衰减、CNAME 与截断语义同 PositiveCache；否则按 plan
+    调用 forward，返回 (应答报文, 上游名, 结束时刻, False)，转发结果
+    不缓存。任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后
+    时钟单调性以该结束时刻为准。
+    """
+
+    def __init__(self, zone: dict, plan: list, timeout: int = 5):
+        self._cache = PositiveCache(zone)
+        # 校验次序同 forward：timeout 先于 plan。
+        _check_int(timeout, "timeout")
+        if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
+            raise ValueError("timeout out of range")
+        self._timeout = timeout
+        self._plan = _validate_plan(copy.deepcopy(plan))
+        self._last_end = None  # 上次成功 resolve 的结束时刻
+
+    def resolve(self, query: bytes, now: int,
+                limit: int = 512) -> tuple[bytes, str, int, bool]:
+        # query、now、limit 的校验与 PositiveCache.resolve 一致，
+        # 单调性以上次成功结束时刻为准。
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        msg = decode_query(query)
+        _check_int(limit, "limit")
+        if (msg["flags"] & 0x8000 or len(msg["questions"]) != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        question = msg["questions"][0]
+        qlabels = _normalize_name(question["name"])
+        origin = self._cache._origin
+        if (question["class"] == self._cache._zone_class
+                and len(qlabels) >= len(origin)
+                and qlabels[len(qlabels) - len(origin):] == origin):
+            response, hit = self._cache.resolve(query, now, limit)
+            self._last_end = now
+            return response, "authority", now, hit
+        reply, name, end = forward(query, self._plan, now, self._timeout)
+        self._last_end = end
+        return reply, name, end, False
 
 
 def main(argv):
