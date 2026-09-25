@@ -32,7 +32,9 @@
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
   reload_zone(text) 原子换区并返回从 0 递增的修订号（stats() 不变，
-  c[0] 于下次解析提交时同步）。
+  c[0] 于下次解析提交时同步）；reload_zone_tx(text, expected) 带修订号
+  检查的原子换区事务，返回键序 version,result 的紧凑 ASCII JSON
+  （result 为 applied、unchanged 或 conflict，末尾单换行）。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
@@ -1505,6 +1507,14 @@ class Resolver:
     才提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
     缓存；统计不随换区提交，stats() 逐字节不变，c[0] 于下次解析提交时
     与新缓存同步；任何失败都回滚，不改变任何状态。
+
+    reload_zone_tx(text, expected)：带修订号检查的原子换区事务，与
+    reload_zone 共用同一递增修订号。expected 不等于当前修订号时不解析
+    text，报告 conflict；相等时按 reload_zone 规则解析并构造候选缓存，
+    候选导出文本与当前区域相同则报告 unchanged（版本与缓存不变），
+    否则原子换区、修订号加一并报告 applied。返回键序 version,result
+    的紧凑 ASCII JSON（末尾单换行）；冲突、等价与任何异常均不改变
+    状态，applied 时 stats() 逐字节不变。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1776,6 +1786,48 @@ class Resolver:
         revision = self._revision
         self._revision += 1
         return revision
+
+    def reload_zone_tx(self, text: str, expected: int) -> str:
+        """带修订号检查的原子区域热加载事务，返回紧凑 ASCII JSON 报告。
+
+        text 非 str 或 expected 非 int（含 bool）抛 TypeError；expected
+        为负抛 ConfigError。修订号与 reload_zone 共用同一递增状态（初始
+        为 0）。expected 不等于当前修订号时不解析 text，报告 conflict；
+        相等时先 import_zone 并构造候选 PositiveCache，失败沿用
+        ConfigError、RecordError、ZoneError。候选的 export_zone 文本与
+        当前区域相同则报告 unchanged，版本与缓存不变；否则原子换区
+        （清空权威缓存条目）、修订号加一并报告 applied。报告键序
+        version,result，version 为提交后的当前修订号（conflict 与
+        unchanged 时不变），result 为 applied、unchanged 或 conflict，
+        紧凑 ASCII JSON、十进制、末尾单换行。冲突、等价与任何异常都不
+        改变 Resolver 状态；applied 保留时钟、plan、统计与递归缓存，
+        统计不随换区提交，提交当下 stats() 逐字节不变。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        _check_int(expected, "expected")
+        if expected < 0:
+            raise ConfigError("expected must be non-negative")
+        if expected != self._revision:
+            # 修订号冲突：不解析 text，不改变任何状态。
+            return self._reload_tx_report(self._revision, "conflict")
+        zone = import_zone(text)  # ConfigError/RecordError/ZoneError 原样传播
+        cache = PositiveCache(zone)
+        current = {"origin": _labels_to_name(self._cache._origin),
+                   "records": [_rr_to_model(rr)
+                               for rr in self._cache._records]}
+        if export_zone(zone) == export_zone(current):
+            # 候选与当前区域等价：版本与缓存均不变。
+            return self._reload_tx_report(self._revision, "unchanged")
+        # 全部校验通过后才提交：换区并递增修订号，其余状态一律保留。
+        self._cache = cache
+        self._revision += 1
+        return self._reload_tx_report(self._revision, "applied")
+
+    @staticmethod
+    def _reload_tx_report(version, result):
+        """reload_zone_tx 报告：键序 version,result，紧凑 ASCII，末尾换行。"""
+        return '{"version":' + str(version) + ',"result":"' + result + '"}\n'
 
     def stats(self) -> str:
         """返回当前统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）。
