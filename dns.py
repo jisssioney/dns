@@ -39,7 +39,7 @@
   键序 version,result 的紧凑 ASCII JSON 报告（末尾换行），result 为
   "applied"、"unchanged" 或 "conflict"，修订号与 reload_zone 共用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
-  上依次回放 reload/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+  上依次回放 reload/reload_tx/resolve 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
@@ -127,6 +127,7 @@ _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
 _CONFIG_RR_KEYS_V2 = ["name", "type", "ttl", "rdata"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+_REPLAY_TX_KEYS = ["op", "text", "expected"]
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -1928,10 +1929,11 @@ class Resolver:
 def _validate_ops(ops):
     """校验回放操作序列，返回 [(kind, op), ...]（不执行）。
 
-    reload 键序 op,text 且 op 为 "reload"、text 为 str；resolve 键序
-    op,query,now,limit 且 op 为 "resolve"、query 为偶长小写十六进制、
-    now/limit 为 int。ops 非 list 抛 TypeError；项、键序、op 名或
-    字段类型/内容错误均抛 ReplayError。
+    reload 键序 op,text 且 op 为 "reload"、text 为 str；reload_tx 键序
+    op,text,expected 且 op 为 "reload_tx"、text 为 str、expected 为非负
+    非 bool 整数；resolve 键序 op,query,now,limit 且 op 为 "resolve"、
+    query 为偶长小写十六进制、now/limit 为 int。ops 非 list 抛
+    TypeError；项、键序、op 名或字段类型/内容错误均抛 ReplayError。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
@@ -1942,10 +1944,14 @@ def _validate_ops(ops):
         keys = list(op.keys())
         if keys == _REPLAY_RELOAD_KEYS:
             kind = "reload"
+        elif keys == _REPLAY_TX_KEYS:
+            kind = "reload_tx"
         elif keys == _REPLAY_RESOLVE_KEYS:
             kind = "resolve"
         else:
-            raise ReplayError("op keys must be op,text or op,query,now,limit")
+            raise ReplayError(
+                "op keys must be op,text or op,text,expected "
+                "or op,query,now,limit")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] != kind:
@@ -1953,6 +1959,14 @@ def _validate_ops(ops):
         if kind == "reload":
             if not isinstance(op["text"], str):
                 raise ReplayError("text must be str")
+        elif kind == "reload_tx":
+            if not isinstance(op["text"], str):
+                raise ReplayError("text must be str")
+            expected = op["expected"]
+            if (not isinstance(expected, int) or isinstance(expected, bool)
+                    or expected < 0):
+                raise ReplayError(
+                    "expected must be a non-negative int that is not bool")
         else:
             query = op["query"]
             if not isinstance(query, str):
@@ -1971,15 +1985,16 @@ def _validate_ops(ops):
 
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
-    """在 Resolver 上依次回放 reload/resolve 操作，返回记录的紧凑 JSON。
+    """在 Resolver 上依次回放 reload/reload_tx/resolve 操作，返回记录。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
     op 名或字段类型/内容错误均抛 ReplayError；zone、plan、
     timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
     in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
-    为 true：reload 键序 ok,revision；resolve 键序
-    ok,response,source,end,hit，response 为小写十六进制。操作抛出的
-    异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
+    为 true：reload 键序 ok,revision；reload_tx 键序 ok,version,result，
+    version 为整数、result 为 "applied"/"unchanged"/"conflict"；resolve
+    键序 ok,response,source,end,hit，response 为小写十六进制。操作抛出
+    的异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
     状态语义沿用 Resolver（失败不改变任何状态）。输出为紧凑 ASCII
     JSON，顶层键序 version,ops，version 为 1，末尾单换行。expected
     为 None 时仅记录；为 str 时与输出整体比较，不一致抛 ReplayError。
@@ -1994,6 +2009,15 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
             try:
                 revision = resolver.reload_zone(op["text"])
                 out = {"ok": True, "revision": revision}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "reload_tx":
+            try:
+                report = resolver.reload_zone_tx(
+                    op["text"], op["expected"])
+                parsed = json.loads(report)
+                out = {"ok": True, "version": parsed["version"],
+                       "result": parsed["result"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         else:
