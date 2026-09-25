@@ -19,7 +19,8 @@
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
-  递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)。
+  递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
+  stats() 返回只读的键序 h,m,x,u,c,l 紧凑 ASCII JSON 串（末尾换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -914,6 +915,33 @@ def _matching_reply(query, reply):
     return reply[_MIN_MESSAGE_LEN:end] == query[_MIN_MESSAGE_LEN:]
 
 
+def _forward_events(query, items, now, timeout):
+    """forward 的模拟主体：items 已校验。
+
+    成功返回 (reply, name, 结束时刻)；耗尽抛 UpstreamTimeout/UpstreamError，
+    异常附带 _clock 属性记录耗尽时的模拟时钟，供统计分桶。
+    """
+    clock = now
+    saw_timeout = False
+    saw_other = False
+    for name, events in items:
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            if delay > timeout:
+                saw_timeout = True
+                clock += timeout
+                continue
+            clock += delay
+            if reply is not None and _matching_reply(query, reply):
+                return reply, name, clock
+            saw_other = True
+    if saw_timeout and not saw_other:
+        exc = UpstreamTimeout("all upstream attempts timed out")
+    else:
+        exc = UpstreamError("no usable upstream reply")
+    exc._clock = clock
+    raise exc
+
+
 def forward(query, plan, now, timeout=5):
     """按 plan 顺序模拟向上游转发 query。
 
@@ -930,22 +958,7 @@ def forward(query, plan, now, timeout=5):
     if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
         raise ValueError("timeout out of range")
     items = _validate_plan(plan)
-    clock = now
-    saw_timeout = False
-    saw_other = False
-    for name, events in items:
-        for delay, reply in events[:_PLAN_EVENTS_USED]:
-            if delay > timeout:
-                saw_timeout = True
-                clock += timeout
-                continue
-            clock += delay
-            if reply is not None and _matching_reply(query, reply):
-                return reply, name, clock
-            saw_other = True
-    if saw_timeout and not saw_other:
-        raise UpstreamTimeout("all upstream attempts timed out")
-    raise UpstreamError("no usable upstream reply")
+    return _forward_events(query, items, now, timeout)
 
 
 def _check_resolve_inputs(query, now, limit, last_end):
@@ -1077,6 +1090,20 @@ class Resolver:
 
     任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后时钟单调性
     以该结束时刻为准。
+
+    stats() 返回只读统计串：紧凑 ASCII JSON（键序 h,m,x,u,c,l，末尾
+    换行），重复调用逐字节相同且不改变任何状态。
+    h=[权威正负缓存命中, 递归正命中, 递归 NXDOMAIN 命中, 递归 NODATA 命中]；
+    m 计缓存未中（resolve 域内权威未中、resolve_recursive 域内权威或
+    域外递归未中各加 1；resolve 域外直转不计）；x 仅计上述未中中
+    匹配条目因 TTL 到期者（到期令 m、x 各加 1，无条目仅 m 加 1）；
+    u=[上游成功, UpstreamTimeout, 其余 UpstreamError]；
+    c=[权威条目数, 递归条目数, 256]（正负均计）；
+    l 按需上游的两方法成功或耗尽的模拟总时长（结束时刻减开始时刻）
+    分桶：0、1..timeout、timeout+1..2*timeout、>2*timeout；
+    r=sum(h)/(sum(h)+m)，分母 0 写 0.000000，否则半偶舍入为六位。
+    仅成功返回或上游耗尽时原子更新统计；参数/计划/编码/时钟异常不更新，
+    耗尽不改缓存与最后时刻。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1089,13 +1116,60 @@ class Resolver:
         self._plan = copy.deepcopy(plan)  # 再深拷贝，与外部改动隔离
         self._cache = PositiveCache(zone)
         self._timeout = timeout
-        self._plan = plan
         self._last_end = None  # 上次成功 resolve 的结束时刻
         # 域外递归结果缓存：与权威正/负缓存独立，共用键与正/负 TTL 规则，
         # 同一容量 256、同一 FIFO 淘汰。
         self._rec_pos = {}  # 正缓存键 -> (插入时刻, 规范化 an)
         self._rec_neg = {}  # 负缓存键 -> (插入时刻, rcode, 规范化 SOA, 负 TTL)
         self._rec_order = deque()
+        # stats 计数器；仅成功返回或上游耗尽时与缓存/时钟一同原子更新。
+        self._h = [0, 0, 0, 0]  # 权威命中, 递归正命中, 递归 NXDOMAIN, 递归 NODATA
+        self._m = 0  # 缓存未中
+        self._x = 0  # 未中中因 TTL 到期者
+        self._u = [0, 0, 0]  # 上游成功, UpstreamTimeout, 其余 UpstreamError
+        self._l = [0, 0, 0, 0]  # 上游模拟总时长分桶
+
+    def _latency_bucket(self, duration):
+        """按模拟总时长分桶：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
+        if duration <= 0:
+            return 0
+        if duration <= self._timeout:
+            return 1
+        if duration <= 2 * self._timeout:
+            return 2
+        return 3
+
+    def _authoritative_resolve(self, question, query, now, limit):
+        """域内解析：调权威缓存并统计命中/未中/到期。
+
+        返回 (应答报文, 是否命中)；缓存内部编码失败原样传播，不改统计。
+        """
+        key = (question["name"], question["type"], question["class"])
+        expired = self._authoritative_expired(key, now)
+        response, hit = self._cache.resolve(query, now, limit)
+        if hit:
+            self._h[0] += 1
+        else:
+            self._m += 1
+            if expired:
+                self._x += 1
+        return response, hit
+
+    def _authoritative_expired(self, key, now):
+        """权威缓存中该键（正、NODATA、NXDOMAIN 顺序）是否有条目已到期。"""
+        entry = self._cache._entries.get(key)
+        if entry is not None:
+            inserted, an = entry
+            return now - inserted >= min(rr[3] for rr in an)
+        neg_key = ("nodata",) + key
+        neg = self._cache._neg_entries.get(neg_key)
+        if neg is None:
+            neg_key = ("nxdomain", key[0], key[2])
+            neg = self._cache._neg_entries.get(neg_key)
+        if neg is None:
+            return False
+        inserted, _rcode, _soa, neg_ttl = neg
+        return now - inserted >= neg_ttl
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -1105,16 +1179,27 @@ class Resolver:
         question = msg["questions"][0]
         origin = self._cache._origin
         if _name_in_origin(question, origin, self._cache._zone_class):
-            response, hit = self._cache.resolve(query, now, limit)
+            response, hit = self._authoritative_resolve(
+                question, query, now, limit)
             self._last_end = now
             return response, "authority", now, hit
-        reply, name, end = forward(query, self._plan, now, self._timeout)
+        # 域外直转：不计缓存未中；仅成功或耗尽时更新统计与时钟。
+        try:
+            reply, name, end = _forward_events(
+                query, self._plan, now, self._timeout)
+        except UpstreamError as exc:
+            self._u[1 if isinstance(exc, UpstreamTimeout) else 2] += 1
+            self._l[self._latency_bucket(exc._clock - now)] += 1
+            raise
+        self._u[0] += 1
+        self._l[self._latency_bucket(end - now)] += 1
         self._last_end = end
         return reply, name, end, False
 
     def _recursive_cache_lookup(self, query, question, now, limit):
-        """域外递归结果查找，返回 (应答报文或 None, 到期标记或 None)。
+        """域外递归结果查找，返回 (应答报文或 None, 命中类别, 到期标记)。
 
+        命中类别为 "pos"（递归正）、"nxdomain" 或 "nodata"；未命中为 None。
         键、正/负 TTL、查找顺序同 PositiveCache；到期条目标记为
         ("pos"/"neg", 键) 但不立即删除，由调用方在新终态编码成功后清理，
         保证失败不改状态。
@@ -1127,21 +1212,23 @@ class Resolver:
             if elapsed < min(rr[3] for rr in an):
                 aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
                         for labels, rrtype, rrclass, ttl, rdata in an]
-                return _encode_plan(query, 0, aged, [], limit), None
-            return None, ("pos", key)
+                return _encode_plan(query, 0, aged, [], limit), "pos", None
+            return None, None, ("pos", key)
         neg_key = ("nodata",) + key
         neg = self._rec_neg.get(neg_key)
+        kind = "nodata"
         if neg is None:
             neg_key = ("nxdomain", key[0], key[2])
             neg = self._rec_neg.get(neg_key)
+            kind = "nxdomain"
         if neg is None:
-            return None, None
+            return None, None, None
         inserted, rcode, soa, neg_ttl = neg
         elapsed = now - inserted
         if elapsed >= neg_ttl:
-            return None, ("neg", neg_key)
+            return None, None, ("neg", neg_key)
         aged_soa = (soa[0], soa[1], soa[2], neg_ttl - elapsed, soa[4])
-        return _encode_plan(query, rcode, [], [aged_soa], limit), None
+        return _encode_plan(query, rcode, [], [aged_soa], limit), kind, None
 
     def _store_recursive_terminal(self, question, now, rcode, an, ns, expired):
         """终态按 PositiveCache 规则写入递归缓存（容量 256、FIFO）。
@@ -1186,45 +1273,61 @@ class Resolver:
         origin = self._cache._origin
         if _name_in_origin(question, origin, self._cache._zone_class):
             # 域内沿用 resolve：经权威正/负缓存应答，source 为 "authority"。
-            response, hit = self._cache.resolve(query, now, limit)
+            response, hit = self._authoritative_resolve(
+                question, query, now, limit)
             self._last_end = now
             return response, "authority", now, hit
         # levels 整体校验（含全部 reply）在任何缓存查找之前完成：
         # 入参非法不得呈现为命中，也不得改变任何状态。
         plans = _validate_levels(levels)
-        cached, expired = self._recursive_cache_lookup(
+        cached, hit_kind, expired = self._recursive_cache_lookup(
             query, question, now, limit)
         if cached is not None:
+            self._h[{"pos": 1, "nxdomain": 2, "nodata": 3}[hit_kind]] += 1
             self._last_end = now
             return cached, "cache", now, True
-        # 逐层按 forward 时序模拟；终态先编码成功再记 end 与写缓存。
+        # 域外递归未中（无条目或到期均计 m，到期另计 x）；计数挂起，
+        # 待上游耗尽或终态编码成功后原子提交，编码异常不更新。
         clock = now
-        result = None
-        for depth, plan in enumerate(plans):
-            result, clock, saw_timeout, saw_other = self._attempt_recursive_level(
-                plan, clock, depth == len(plans) - 1)
-            if result is None:
-                # 该层所有上游均未给出可用应答：耗尽异常沿用 forward。
-                if saw_timeout and not saw_other:
-                    raise UpstreamTimeout("all upstream attempts timed out")
-                raise UpstreamError("no usable upstream reply")
-            if result[0] == "referral":
-                continue  # 转介：clock 已推进，进入下一层
-            _tag, rcode, an, ns, name, end = result
-            break
+        terminal = None
+        try:
+            for depth, plan in enumerate(plans):
+                result, clock = self._attempt_recursive_level(
+                    plan, clock, depth == len(plans) - 1)
+                if result[0] == "referral":
+                    continue  # 转介：clock 已推进，进入下一层
+                _tag, rcode, an, ns, name, end = result
+                terminal = (rcode, an, ns, name, end)
+                break
+        except UpstreamError as exc:
+            # 耗尽：提交未中与 u/l 后原样抛出；缓存与最后时刻不变。
+            self._m += 1
+            if expired is not None:
+                self._x += 1
+            self._u[1 if isinstance(exc, UpstreamTimeout) else 2] += 1
+            self._l[self._latency_bucket(exc._clock - now)] += 1
+            raise
+        rcode, an, ns, name, end = terminal
+        # 先编码成功再落缓存与统计，保证编码失败不改变任何状态。
         response = _encode_plan(query, rcode, an, ns, limit)
         self._store_recursive_terminal(
             question, end, rcode, an, ns, expired)
+        self._m += 1
+        if expired is not None:
+            self._x += 1
+        self._u[0] += 1
+        self._l[self._latency_bucket(end - now)] += 1
         self._last_end = end
         return response, name, end, False
 
     def _attempt_recursive_level(self, plan, clock, is_last):
-        """模拟单层转发，返回 (result, clock, saw_timeout, saw_other)。
+        """模拟单层转发，返回 (result, clock)。
 
-        result 为 None（整层耗尽）、("referral",) 或
+        result 为 ("referral",) 或
         ("terminal", rcode, an, ns, name, clock)。顺序、前 2 事件、时钟与
         timeout 推进沿用 forward；首个可用转介/终态立即结束本层。
-        末层转介（kind 0）按普通失败计并继续尝试后续事件/上游。
+        末层转介（kind 0）按普通失败计并继续尝试后续事件/上游；整层耗尽时
+        抛带 _clock 的 UpstreamTimeout/UpstreamError（判定同 forward）。
         """
         saw_timeout = False
         saw_other = False
@@ -1243,10 +1346,55 @@ class Resolver:
                     if is_last:
                         saw_other = True
                         continue
-                    return ("referral",), clock, saw_timeout, saw_other
-                return (("terminal", rcode, an, ns, name, clock),
-                        clock, saw_timeout, saw_other)
-        return None, clock, saw_timeout, saw_other
+                    return ("referral",), clock
+                return ("terminal", rcode, an, ns, name, clock), clock
+        if saw_timeout and not saw_other:
+            exc = UpstreamTimeout("all upstream attempts timed out")
+        else:
+            exc = UpstreamError("no usable upstream reply")
+        exc._clock = clock
+        raise exc
+
+    def stats(self) -> str:
+        """返回只读统计串：键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON，末尾换行。
+
+        重复调用逐字节相同且不改变任何状态；比率 r 为半偶舍入的六位
+        JSON 数值，分母为 0（含负零）时写 0.000000。
+        """
+        hits = sum(self._h)
+        authority_count = len(self._cache._order)
+        recursive_count = len(self._rec_order)
+        return (
+            '{"h":[%d,%d,%d,%d],'
+            '"m":%d,"x":%d,'
+            '"u":[%d,%d,%d],'
+            '"c":[%d,%d,%d],'
+            '"l":[%d,%d,%d,%d],'
+            '"r":%s}\n'
+        ) % (
+            self._h[0], self._h[1], self._h[2], self._h[3],
+            self._m, self._x,
+            self._u[0], self._u[1], self._u[2],
+            authority_count, recursive_count, _CACHE_CAPACITY,
+            self._l[0], self._l[1], self._l[2], self._l[3],
+            _hit_ratio_text(hits, self._m),
+        )
+
+
+def _hit_ratio_text(hits, misses):
+    """r=hits/(hits+misses)：精确整数半偶舍入为六位小数 JSON 数值字面量。
+
+    分母 0 写 0.000000；结果恒非负，不存在负零问题。
+    """
+    total = hits + misses
+    if total == 0:
+        return "0.000000"
+    scale = 1000000
+    scaled, rem = divmod(hits * scale, total)
+    twice = 2 * rem
+    if twice > total or (twice == total and scaled % 2 == 1):
+        scaled += 1  # 距上位更近，或恰处半值且下位为奇数
+    return "%d.%06d" % (scaled // scale, scaled % scale)
 
 
 def main(argv):
