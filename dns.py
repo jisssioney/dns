@@ -17,8 +17,9 @@
 - edns(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码可含
   OPT 的查询的 EDNS 应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
-- import_zone(text: str) -> dict: 导入 v0/v1 配置文本为规范化 zone。
+- import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
+- migrate_zone(text: str) -> str: 迁移 v0/v1/v2 配置文本为 v2 配置文本。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
@@ -119,8 +120,10 @@ _MODEL_KEYS = ["an", "ns", "ar", "limit"]
 _ZONE_KEYS = ["origin", "records"]
 _RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _CONFIG_KEYS = ["version", "origin", "records"]
+_CONFIG_KEYS_V2 = ["version", "origin", "class", "records"]
 _CONFIG_RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
+_CONFIG_RR_KEYS_V2 = ["name", "type", "ttl", "rdata"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
@@ -944,15 +947,16 @@ def _config_int(value, field):
         raise ConfigError(field + " must be int")
 
 
-def import_zone(text: str) -> dict:
-    """把 v0/v1 配置文本导入为规范化 zone dict（键序 origin,records）。
+def _parse_config(text):
+    """解析 v0/v1/v2 配置文本为未校验的 zone dict（rdata 已为 bytes）。
 
-    文本须为 JSON 对象，键序 version,origin,records；version 为整数
-    0 或 1。v1 记录键序 name,type,class,ttl,rdata，v0 末键为 "data"，
-    导入时迁移为 rdata；二者 rdata/data 均为偶数长小写十六进制。
-    JSON 解析、重复键、键序、版本、类型、布尔整数与十六进制错误抛
-    ConfigError；zone 语义错误沿用 RecordError、ZoneError。返回 zone
-    的 rdata 为 bytes，名称与 CNAME rdata 已按 zone 规则规范化。
+    文本须为 JSON 对象：v0/v1 顶层键序 version,origin,records，version
+    为整数 0 或 1；v2 顶层键序 version,origin,class,records，version
+    为 2，class 为 0..65535 非 bool 整数。v1 记录键序
+    name,type,class,ttl,rdata，v0 末键为 "data"，v2 记录键序
+    name,type,ttl,rdata 且 class 取顶层值；rdata/data 均为偶数长小写
+    十六进制。JSON 解析、重复键、键序、版本、类型、布尔整数与十六进制
+    错误抛 ConfigError；文本非 str 抛 TypeError。
     """
     if not isinstance(text, str):
         raise TypeError("text must be str")
@@ -962,32 +966,49 @@ def import_zone(text: str) -> dict:
         raise ConfigError("invalid JSON") from None
     if not isinstance(config, dict):
         raise ConfigError("config must be an object")
-    if list(config.keys()) != _CONFIG_KEYS:
-        raise ConfigError("config keys must be version,origin,records")
-    version = config["version"]
-    _config_int(version, "version")
-    if version not in (0, 1):
-        raise ConfigError("unsupported version")
+    keys = list(config.keys())
+    if keys == _CONFIG_KEYS:
+        version = config["version"]
+        _config_int(version, "version")
+        if version not in (0, 1):
+            raise ConfigError("unsupported version")
+        hex_key = "rdata" if version == 1 else "data"
+        rr_keys = _CONFIG_RR_KEYS if version == 1 else _CONFIG_RR_KEYS_V0
+        rr_class = None  # v0/v1：class 逐记录给出
+    elif keys == _CONFIG_KEYS_V2:
+        version = config["version"]
+        _config_int(version, "version")
+        if version != 2:
+            raise ConfigError("unsupported version")
+        rr_class = config["class"]  # v2：class 取顶层值，记录不再带 class
+        _config_int(rr_class, "class")
+        hex_key = "rdata"
+        rr_keys = _CONFIG_RR_KEYS_V2
+    else:
+        raise ConfigError(
+            "config keys must be version,origin,records or "
+            "version,origin,class,records")
     origin = config["origin"]
     if not isinstance(origin, str):
         raise ConfigError("origin must be str")
     records = config["records"]
     if not isinstance(records, list):
         raise ConfigError("records must be list")
-    hex_key = "rdata" if version == 1 else "data"
-    rr_keys = _CONFIG_RR_KEYS if version == 1 else _CONFIG_RR_KEYS_V0
     zone_records = []
     for rr in records:
         if not isinstance(rr, dict):
             raise ConfigError("record must be an object")
         if list(rr.keys()) != rr_keys:
-            raise ConfigError(
-                "record keys must be name,type,class,ttl," + hex_key)
+            raise ConfigError("record keys must be " + ",".join(rr_keys))
         name = rr["name"]
         if not isinstance(name, str):
             raise ConfigError("name must be str")
         _config_int(rr["type"], "type")
-        _config_int(rr["class"], "class")
+        if rr_class is None:
+            _config_int(rr["class"], "class")
+            rrclass = rr["class"]
+        else:
+            rrclass = rr_class
         _config_int(rr["ttl"], "ttl")
         hextext = rr[hex_key]
         if not isinstance(hextext, str):
@@ -997,12 +1018,50 @@ def import_zone(text: str) -> dict:
             raise ConfigError(
                 hex_key + " must be even-length lowercase hex")
         zone_records.append({"name": name, "type": rr["type"],
-                             "class": rr["class"], "ttl": rr["ttl"],
+                             "class": rrclass, "ttl": rr["ttl"],
                              "rdata": bytes.fromhex(hextext)})
-    zone = {"origin": origin, "records": zone_records}
+    return {"origin": origin, "records": zone_records}
+
+
+def import_zone(text: str) -> dict:
+    """把 v0/v1/v2 配置文本导入为规范化 zone dict（键序 origin,records）。
+
+    文本须为 JSON 对象：v0/v1 键序 version,origin,records，version 为
+    整数 0 或 1；v2 键序 version,origin,class,records，version 为 2，
+    class 为 0..65535 非 bool 整数。v1 记录键序 name,type,class,ttl,
+    rdata，v0 末键为 "data"，导入时迁移为 rdata；v2 记录键序
+    name,type,ttl,rdata，class 取顶层值。rdata/data 均为偶数长小写
+    十六进制。JSON 解析、重复键、键序、版本、类型、布尔整数与十六进制
+    错误抛 ConfigError；zone 语义错误沿用 RecordError、ZoneError。
+    返回 zone 的 rdata 为 bytes，名称与 CNAME rdata 已按 zone 规则
+    规范化。
+    """
+    zone = _parse_config(text)
     origin_labels, rrs, _zone_class = _validate_zone(zone)
     return {"origin": _labels_to_name(origin_labels),
             "records": [_rr_to_model(rr) for rr in rrs]}
+
+
+def migrate_zone(text: str) -> str:
+    """把 v0/v1/v2 配置文本迁移为 v2 配置文本（紧凑 ASCII JSON，末尾换行）。
+
+    解析与校验同 import_zone：v0/v1/v2 文本经完整校验、规范化并保持
+    记录原序。输出顶层键序 version,origin,class,records，version 为 2，
+    class 为规范化 zone 的统一 class；记录键序 name,type,ttl,rdata，
+    rdata 为偶数长小写十六进制，数字十进制。文本非 str 抛 TypeError；
+    JSON 解析、重复键、版本、键序、字段类型或十六进制错误抛
+    ConfigError；zone 语义错误沿用 RecordError、ZoneError。等价区域
+    输出逐字节相同，且迁移自身输出结果不变。
+    """
+    zone = _parse_config(text)
+    origin_labels, rrs, zone_class = _validate_zone(zone)
+    records = []
+    for labels, rrtype, _rrclass, ttl, rdata in rrs:
+        records.append({"name": _labels_to_name(labels), "type": rrtype,
+                        "ttl": ttl, "rdata": rdata.hex()})
+    config = {"version": 2, "origin": _labels_to_name(origin_labels),
+              "class": zone_class, "records": records}
+    return json.dumps(config, ensure_ascii=True, separators=(",", ":")) + "\n"
 
 
 def export_zone(zone: dict) -> str:
@@ -1503,7 +1562,7 @@ class Resolver:
     换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
     同步），参数/计划/编码/时钟异常不更新，耗尽不改缓存与最后时刻。
 
-    reload_zone(text)：导入 v0/v1 配置文本并原子换区，返回从 0 递增的
+    reload_zone(text)：导入 v0/v1/v2 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
     才提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
     缓存；统计不随换区提交，stats() 逐字节不变，c[0] 于下次解析提交时
