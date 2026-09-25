@@ -20,7 +20,8 @@
 - import_zone(text: str) -> dict: 导入 v0/v1 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
-  返回 (应答报文, 是否命中)。
+  返回 (应答报文, 是否命中)；stats(reset=False) 返回键序 h,m,x,k 的
+  紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
 - UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
 - forward(query, plan, now, timeout=5): 按 plan 顺序模拟上游转发，
@@ -1038,6 +1039,16 @@ class PositiveCache:
 
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     任何失败（含编码失败）都不改变条目与时钟状态。
+
+    stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
+    h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
+    m 键序 p,nx,nd,o，按成功未命中后新写正缓存、NXDOMAIN、NODATA 或
+    未写条目递增；x 累计成功 resolve 实际删除的到期条目数；k 键序
+    p,nx,nd,total,capacity，依次为当前三类条目数、合计与 256。统计仅在
+    resolve 成功返回时原子提交，任何异常均不改变它们；检测到期后编码
+    失败不计 x，截断不改分类，命中不重排 FIFO。reset 非 bool 抛
+    TypeError 且无变化；False 重复读取逐字节相同；True 先返回旧快照再
+    清零 h、m、x，保留缓存、FIFO、时钟与 k。
     """
 
     def __init__(self, zone: dict):
@@ -1049,6 +1060,13 @@ class PositiveCache:
         self._neg_entries = {}  # 负缓存键 -> (插入时刻, rcode, 规范化 SOA, 负 TTL)
         self._order = deque()  # (类别, 键) 插入次序；与两个字典的键集合始终一致
         self._last_now = None  # 上次成功 resolve 的时钟值
+        # stats 计数，仅在 resolve 成功返回时随缓存一并原子提交：
+        # h 为 [正命中, NXDOMAIN 命中, NODATA 命中]；m 为 [成功未中后
+        # 新写正缓存, 新写 NXDOMAIN, 新写 NODATA, 未写条目]；x 为成功
+        # resolve 实际删除的到期条目数。
+        self._stats_h = [0, 0, 0]
+        self._stats_m = [0, 0, 0, 0]
+        self._stats_x = 0
 
     def _negative_entry(self, key, rcode, an, ns, now):
         """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。"""
@@ -1096,6 +1114,8 @@ class PositiveCache:
                 # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
                 # 命中也不改变插入次序。
                 response = _encode_plan(query, 0, aged, [], limit)
+                # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
+                self._stats_h[0] += 1
                 self._last_now = now
                 return response, True
             # 到期：先记下，待新应答编码成功后再清理，保证失败不改状态。
@@ -1116,14 +1136,19 @@ class PositiveCache:
                     # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
                     # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
                     response = _encode_plan(query, rcode, [], [aged_soa], limit)
+                    # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
+                    # neg_key 首项区分 NXDOMAIN（h[1]）与 NODATA（h[2]）。
+                    self._stats_h[1 if neg_key[0] == "nxdomain" else 2] += 1
                     self._last_now = now
                     return response, True
                 expired = ("neg", neg_key)
         # 未命中（含到期）：先按 answer 语义生成未截断的完整有序应答。
         rcode, an, ns = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
-        # 先编码成功再落条目，保证编码失败不改变任何状态。
+        # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
         response = _encode_plan(query, rcode, an, ns, limit)
+        # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
+        # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
             tag, ekey = expired
             del (self._entries if tag == "pos" else self._neg_entries)[ekey]
@@ -1131,17 +1156,65 @@ class PositiveCache:
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
             self._entries[key] = (now, an)
             self._order.append(("pos", key))
+            m_index = 0  # 新写正缓存
         else:
             negative = self._negative_entry(key, rcode, an, ns, now)
             if negative is not None:
                 neg_key, neg_entry = negative
                 self._neg_entries[neg_key] = neg_entry
                 self._order.append(("neg", neg_key))
+                # 负键首项区分 NXDOMAIN（m[1]）与 NODATA（m[2]）。
+                m_index = 1 if neg_key[0] == "nxdomain" else 2
+            else:
+                m_index = 3  # 未写条目
         if len(self._order) > _CACHE_CAPACITY:
             tag, oldest = self._order.popleft()  # 满时淘汰最早插入者
             del (self._entries if tag == "pos" else self._neg_entries)[oldest]
+        if expired is not None:
+            self._stats_x += 1  # 本次成功 resolve 实际删除的到期条目
+        self._stats_m[m_index] += 1
         self._last_now = now
         return response, False
+
+    def stats(self, reset: bool = False) -> str:
+        """返回固定键序紧凑 ASCII JSON（末尾单换行），可选重置 h、m、x。
+
+        顶层键序 h,m,x,k：h 键序 p,nx,nd（resolve 命中正缓存、NXDOMAIN、
+        NODATA 次数）；m 键序 p,nx,nd,o（成功未命中后新写正缓存、
+        NXDOMAIN、NODATA、未写条目次数）；x 为成功 resolve 实际删除的
+        到期条目累计；k 键序 p,nx,nd,total,capacity，依次为当前正、
+        NXDOMAIN、NODATA 条目数、合计与 256。值均为非负十进制整数。
+        统计仅在 resolve 成功返回时原子提交。reset 非 bool 抛 TypeError
+        且无变化；False 重复读取逐字节相同且不改状态；True 先返回旧
+        快照，再清零 h、m、x，保留缓存、FIFO、时钟与 k。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        p_entries = len(self._entries)
+        nx_entries = sum(1 for neg_key in self._neg_entries
+                         if neg_key[0] == "nxdomain")
+        nd_entries = len(self._neg_entries) - nx_entries
+        text = (
+            '{"h":{"p":' + str(self._stats_h[0])
+            + ',"nx":' + str(self._stats_h[1])
+            + ',"nd":' + str(self._stats_h[2]) + "}"
+            + ',"m":{"p":' + str(self._stats_m[0])
+            + ',"nx":' + str(self._stats_m[1])
+            + ',"nd":' + str(self._stats_m[2])
+            + ',"o":' + str(self._stats_m[3]) + "}"
+            + ',"x":' + str(self._stats_x)
+            + ',"k":{"p":' + str(p_entries)
+            + ',"nx":' + str(nx_entries)
+            + ',"nd":' + str(nd_entries)
+            + ',"total":' + str(len(self._order))
+            + ',"capacity":' + str(_CACHE_CAPACITY) + "}}\n"
+        )
+        if reset:
+            # 先返回旧快照再清零；缓存、FIFO、时钟与 k 均保留。
+            self._stats_h = [0, 0, 0]
+            self._stats_m = [0, 0, 0, 0]
+            self._stats_x = 0
+        return text
 
 
 def _check_non_negative_int(value, field):
