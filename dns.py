@@ -49,6 +49,8 @@
   keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数。
 - replay_rate(rules, ops, expected=None) -> str: 在 RateLimiter 上
   依次回放 allow 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+- replay_cache(zone, ops, expected=None) -> str: 在 PositiveCache 上
+  依次回放 resolve/stats 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -137,6 +139,9 @@ _REPLAY_EVENT_KEYS = ["delay", "reply"]
 _REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
 _REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
 _MAX_REPLAY_RATE_OPS = 4096
+_REPLAY_CACHE_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+_REPLAY_CACHE_STATS_KEYS = ["op", "reset"]
+_MAX_REPLAY_CACHE_OPS = 4096
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -2553,6 +2558,100 @@ def replay_rate(rules: list, ops: list, expected=None) -> str:
         except Exception as exc:
             out = {"ok": False, "error": type(exc).__name__}
         items.append({"in": op, "out": out, "stats": limiter.stats(False)})
+    result = json.dumps({"version": 1, "ops": items},
+                        ensure_ascii=True, separators=(",", ":")) + "\n"
+    if expected is not None and result != expected:
+        raise ReplayError("output does not match expected")
+    return result
+
+
+def _validate_cache_ops(ops):
+    """校验 replay_cache 的操作序列（不执行）。
+
+    ops 限 0..4096 项，项键序仅 op,query,now,limit 的 resolve（op 为
+    "resolve"，query 为偶长小写十六进制，now/limit 为非 bool 整数），
+    或 op,reset 的 stats（op 为 "stats"，reset 为 bool）。ops 非 list
+    抛 TypeError；超量及项、键序、op 名或字段类型/内容非法抛
+    ReplayError。query 报文可解码性、now/limit 取值范围与时钟单调性
+    不在此校验，留待执行时由 PositiveCache 判定。
+    """
+    if not isinstance(ops, list):
+        raise TypeError("ops must be list")
+    if len(ops) > _MAX_REPLAY_CACHE_OPS:
+        raise ReplayError("ops must contain 0..4096 items")
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ReplayError("op must be dict")
+        keys = list(op.keys())
+        if keys == _REPLAY_CACHE_RESOLVE_KEYS:
+            kind = "resolve"
+        elif keys == _REPLAY_CACHE_STATS_KEYS:
+            kind = "stats"
+        else:
+            raise ReplayError(
+                "op keys must be op,query,now,limit or op,reset")
+        if not isinstance(op["op"], str):
+            raise ReplayError("op must be str")
+        if op["op"] != kind:
+            raise ReplayError("op name does not match op keys")
+        if kind == "resolve":
+            query = op["query"]
+            if not isinstance(query, str):
+                raise ReplayError("query must be str")
+            if (len(query) % 2
+                    or any(c not in _LOWER_HEXDIGITS for c in query)):
+                raise ReplayError(
+                    "query must be even-length lowercase hex")
+            if not isinstance(op["now"], int) or isinstance(op["now"], bool):
+                raise ReplayError("now must be int")
+            if not isinstance(op["limit"], int) or isinstance(op["limit"], bool):
+                raise ReplayError("limit must be int")
+        elif not isinstance(op["reset"], bool):
+            raise ReplayError("reset must be bool")
+
+
+def replay_cache(zone: dict, ops: list, expected=None) -> str:
+    """在 PositiveCache 上依次回放 resolve/stats 操作，返回记录的紧凑 JSON。
+
+    ops 非 list 或 expected 非 None/str 抛 TypeError；ops 超 4096 项
+    及项、键序、op 名或字段类型/内容非法（resolve 非 op,query,now,
+    limit、query 非偶长小写十六进制、now/limit 为 bool 或非整数；stats
+    非 op,reset、reset 非 bool）均在构造 PositiveCache 前抛 ReplayError；
+    zone 的校验与异常同 PositiveCache 构造，且在 ops 完整校验通过后才
+    进行。每项记录键序 in,out,stats：in 为操作原文；resolve 成功 out
+    键序 ok,response,hit（ok 为 true，response 为应答报文的小写十六
+    进制，hit 为是否命中），stats 成功 out 键序 ok,snapshot（snapshot
+    为该操作 stats(reset) 的原文，故 reset=true 时为重置前值）；操作
+    抛出的异常记为 out 键序 ok,error（false 与异常类名）并继续后续
+    操作，resolve 失败不改缓存、统计与时钟。stats 字段为操作后以
+    stats(False) 读取的原文；reset=true 时记录的是重置后的统计。
+    输出为紧凑 ASCII JSON，顶层键序 version,ops，version 为 1，末尾
+    单换行；同输入逐字节一致。expected 为 None 时仅记录；为 str 时与
+    输出整体比较，不一致抛 ReplayError。
+    """
+    if expected is not None and not isinstance(expected, str):
+        raise TypeError("expected must be str or None")
+    # 全部操作校验在构造 PositiveCache 前完成。
+    _validate_cache_ops(ops)
+    cache = PositiveCache(zone)
+    items = []
+    for op in ops:
+        if op["op"] == "resolve":
+            try:
+                response, hit = cache.resolve(
+                    bytes.fromhex(op["query"]), op["now"], op["limit"])
+                out = {"ok": True, "response": response.hex(), "hit": hit}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+            items.append({"in": op, "out": out,
+                          "stats": cache.stats(False)})
+        else:
+            # reset=true 时 out 的 snapshot 是重置前快照，随后记录的
+            # stats 字段为重置后 stats(False) 的值。
+            snapshot = cache.stats(op["reset"])
+            out = {"ok": True, "snapshot": snapshot}
+            items.append({"in": op, "out": out,
+                          "stats": cache.stats(False)})
     result = json.dumps({"version": 1, "ops": items},
                         ensure_ascii=True, separators=(",", ":")) + "\n"
     if expected is not None and result != expected:
