@@ -37,7 +37,10 @@
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
-  allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)。
+  allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)；
+  stats(reset=False) 返回限流统计的紧凑 ASCII JSON（顶层键序
+  query,response,expired,evicted,keys，末尾换行），reset=True
+  先返回重置前快照再清零分类计数（计数键保留）。
 
 命令行：python dns.py decode HEX
 """
@@ -2000,6 +2003,18 @@ class RateLimiter:
     地址，否则抛 PolicyError。query 沿用 decode_query，非单问题或
     QR 置位抛 EncodeError。规则在构造时一次性校验；任何失败都不
     改变计数状态与入参。
+
+    stats(reset=False) 返回统计的紧凑 ASCII JSON（固定键序，末尾
+    一个换行）：顶层键序 query,response,expired,evicted,keys，
+    前两项为键序 allow,deny,unmatched 的对象，值为非负十进制
+    整数。统计仅在 allow 成功返回后原子提交：匹配规则后按放行/
+    拒绝分别计对应 kind 的 allow/deny，无匹配仅计 unmatched；
+    expired、evicted 分别累加该次实际删除的过期键数与容量淘汰
+    键数；keys 为当前计数键数。allow 抛任何既有异常时计数表、
+    最后时钟与统计均不变。reset 非 bool 抛 TypeError 且状态不变；
+    reset=False 只读，重复调用逐字节相同；reset=True 先返回重置
+    前快照，再清零六个分类计数及 expired、evicted，保留规则、
+    计数键、创建序与最后时钟（keys 不清零）。
     """
 
     def __init__(self, rules: list):
@@ -2009,6 +2024,13 @@ class RateLimiter:
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
         self._last_now = None  # 上次成功 allow 的时钟值
+        # 统计计数器：按 kind 分 allow/deny/unmatched，另计过期与淘汰删除。
+        self._stats = {
+            "query": {"allow": 0, "deny": 0, "unmatched": 0},
+            "response": {"allow": 0, "deny": 0, "unmatched": 0},
+        }
+        self._stats_expired = 0
+        self._stats_evicted = 0
 
     def allow(self, query: bytes, client: str, now: int,
               kind: str = "query") -> tuple[bool, int]:
@@ -2050,15 +2072,19 @@ class RateLimiter:
             matched = (index, window, quota)
             break
         if matched is None:
+            self._stats[kind]["unmatched"] += 1
             self._last_now = now
             return True, -1
         # 先删除当前已过期窗（截止时刻 <= now），再处理命中键。
-        for dead in [key for key, value in self._counts.items()
-                     if value[1] <= now]:
+        expired = [key for key, value in self._counts.items()
+                   if value[1] <= now]
+        for dead in expired:
             del self._counts[dead]
+        self._stats_expired += len(expired)
         index, window, quota = matched
         if quota == 0:
             # 配额为 0：一律拒绝，不创建计数项也不触发淘汰。
+            self._stats[kind]["deny"] += 1
             self._last_now = now
             return False, 0
         bucket = now // window
@@ -2071,16 +2097,54 @@ class RateLimiter:
                              key=lambda k: (self._counts[k][1],
                                             self._counts[k][3]))
                 del self._counts[oldest]
+                self._stats_evicted += 1
             self._counts[key] = [bucket * window, (bucket + 1) * window,
                                  0, self._serial]
             self._serial += 1
             entry = self._counts[key]
         if entry[2] >= quota:
+            self._stats[kind]["deny"] += 1
             self._last_now = now
             return False, 0
         entry[2] += 1
+        self._stats[kind]["allow"] += 1
         self._last_now = now
         return True, quota - entry[2]
+
+    def stats(self, reset: bool = False) -> str:
+        """返回限流统计的紧凑 ASCII JSON（固定键序，末尾一个换行）。
+
+        顶层键序 query,response,expired,evicted,keys；query/response
+        为键序 allow,deny,unmatched 的对象，值为非负十进制整数；
+        expired、evicted 为累计实际删除的过期键数、容量淘汰键数；
+        keys 为当前计数键数。reset 非 bool 抛 TypeError 且状态不变；
+        reset=False 只读，重复调用逐字节相同；reset=True 先返回
+        重置前快照，再清零六个分类计数及 expired、evicted，保留
+        规则、计数键、创建序与最后时钟（keys 不清零）。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        query = self._stats["query"]
+        response = self._stats["response"]
+        out = (
+            '{"query":{"allow":' + str(query["allow"])
+            + ',"deny":' + str(query["deny"])
+            + ',"unmatched":' + str(query["unmatched"]) + "}"
+            + ',"response":{"allow":' + str(response["allow"])
+            + ',"deny":' + str(response["deny"])
+            + ',"unmatched":' + str(response["unmatched"]) + "}"
+            + ',"expired":' + str(self._stats_expired)
+            + ',"evicted":' + str(self._stats_evicted)
+            + ',"keys":' + str(len(self._counts)) + "}\n"
+        )
+        if reset:
+            for kind_stats in (query, response):
+                kind_stats["allow"] = 0
+                kind_stats["deny"] = 0
+                kind_stats["unmatched"] = 0
+            self._stats_expired = 0
+            self._stats_evicted = 0
+        return out
 
 
 def main(argv):
