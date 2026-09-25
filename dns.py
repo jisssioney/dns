@@ -37,7 +37,13 @@
   c[0] 于下次解析提交时同步）；
   reload_zone_tx(text, expected) 带修订号检查的原子换区事务，返回
   键序 version,result 的紧凑 ASCII JSON 报告（末尾换行），result 为
-  "applied"、"unchanged" 或 "conflict"，修订号与 reload_zone 共用。
+  "applied"、"unchanged" 或 "conflict"，修订号与 reload_zone 共用；
+  rollback_zone_tx(target, expected) 带修订号检查的原子回滚事务，
+  返回键序 version,result,target 的紧凑 ASCII JSON 报告（末尾换行），
+  result 为 "applied"、"unchanged"、"missing" 或 "conflict"。区域
+  修订历史容量 32：构造时规范化初始区域存为修订 0，reload_zone 成功、
+  reload_zone_tx 或 rollback_zone_tx 返回 applied 时按新当前修订号
+  归档区域深拷贝，超量淘汰最小修订号，号码不复用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive 操作
   并记录为紧凑 ASCII JSON（末尾单换行）。
@@ -169,6 +175,7 @@ _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
 _CACHE_CAPACITY = 256
+_HISTORY_CAPACITY = 32
 _MAX_PLAN_ITEMS = 16
 _PLAN_EVENTS_USED = 2
 _MIN_TIMEOUT = 1
@@ -1592,6 +1599,22 @@ class Resolver:
     区域相同报告 unchanged（版本、缓存不变），否则原子换区、清空权威
     缓存、保留递归缓存/时钟/plan/统计（stats() 提交当下不变），修订号
     加 1 报告 applied。修订号初始为 0，与 reload_zone 共用递增状态。
+
+    区域修订历史容量 32：构造时把规范化初始区域存为修订 0；每次
+    reload_zone 成功、reload_zone_tx 或 rollback_zone_tx 返回 applied
+    时按新当前修订号归档区域深拷贝；其余结果与异常不归档。超量时淘汰
+    最小修订号，号码单调递增不复用。
+
+    rollback_zone_tx(target, expected)：带修订号检查的原子回滚事务，
+    返回键序仅 version,result,target 的紧凑 ASCII JSON 报告（末尾
+    换行）。target/expected 非 int（含 bool）抛 TypeError，负值抛
+    ConfigError；两参数校验完成后才比较 expected：不等于当前修订号时
+    不查询 target，报告 conflict；相等且 target 为当前修订号报告
+    unchanged；target 未保留在修订历史中报告 missing。命中时先用快照
+    构造 PositiveCache，成功后原子换区、清空权威缓存、保留递归缓存/
+    时钟/plan/统计（stats() 提交当下逐字节不变），修订号加 1 并把恢复
+    区域归档为新修订，报告 applied。result 为 "applied"、"unchanged"、
+    "missing" 或 "conflict"；非 applied 结果与任何异常都不改变状态。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1620,6 +1643,9 @@ class Resolver:
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
         self._revision = 0  # 下次 reload_zone 成功时返回的修订号
+        # 区域修订历史：修订号 -> 规范化区域深拷贝，容量 32，超量淘汰最小
+        # 修订号，号码单调递增不复用。构造时规范化初始区域存为修订 0。
+        self._history = {0: self._zone_snapshot()}
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -1665,6 +1691,17 @@ class Resolver:
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
         self._stats_c0 = len(self._cache._order)
+
+    def _zone_snapshot(self):
+        """当前权威缓存的规范化区域（键序 origin,records，rdata 为 bytes）。"""
+        return {"origin": _labels_to_name(self._cache._origin),
+                "records": [_rr_to_model(rr) for rr in self._cache._records]}
+
+    def _archive_zone(self, zone):
+        """按当前修订号归档区域深拷贝；超量时淘汰最小修订号（号码不复用）。"""
+        self._history[self._revision] = copy.deepcopy(zone)
+        if len(self._history) > _HISTORY_CAPACITY:
+            del self._history[min(self._history)]
 
     def _authority_miss_expired(self, question, now):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
@@ -1854,14 +1891,16 @@ class Resolver:
         先 import_zone 再以新 zone 构造 PositiveCache，全部成功后才
         提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
         缓存；统计不随换区提交，stats() 逐字节不变，c[0] 于下次解析
-        提交时与新缓存同步。任何失败（TypeError、ConfigError、
-        RecordError、ZoneError）都回滚：不改变任何状态。
+        提交时与新缓存同步；成功后按新当前修订号把区域深拷贝归档进
+        容量 32 的修订历史（超量淘汰最小修订号）。任何失败（TypeError、
+        ConfigError、RecordError、ZoneError）都回滚：不改变任何状态。
         """
         zone = import_zone(text)
         cache = PositiveCache(zone)
         self._cache = cache
         revision = self._revision
         self._revision += 1
+        self._archive_zone(zone)
         return revision
 
     def reload_zone_tx(self, text: str, expected: int) -> str:
@@ -1874,10 +1913,11 @@ class Resolver:
         失败沿用 ConfigError、RecordError、ZoneError 且状态不变。候选
         的 export_zone 文本等于当前区域时报告 unchanged，版本与缓存
         不变；否则校验成功后原子换区（清空权威缓存，保留递归缓存、
-        时钟、plan 与统计），修订号加 1 并报告 applied（version 为
-        新修订号，提交当下 stats() 逐字节不变）。修订号与 reload_zone
-        共用，初始为 0。报告为紧凑 ASCII JSON、十进制数字、末尾单换行，
-        result 为 "applied"、"unchanged" 或 "conflict"。
+        时钟、plan 与统计），修订号加 1、按新当前修订号把区域深拷贝
+        归档进容量 32 的修订历史（超量淘汰最小修订号）并报告 applied
+        （version 为新修订号，提交当下 stats() 逐字节不变）。修订号与
+        reload_zone 共用，初始为 0。报告为紧凑 ASCII JSON、十进制数字、
+        末尾单换行，result 为 "applied"、"unchanged" 或 "conflict"。
         """
         if not isinstance(text, str):
             raise TypeError("text must be str")
@@ -1899,12 +1939,60 @@ class Resolver:
             return self._tx_report(self._revision, "unchanged")
         self._cache = cache
         self._revision += 1
+        self._archive_zone(zone)
         return self._tx_report(self._revision, "applied")
 
     @staticmethod
     def _tx_report(version, result):
         """构造键序 version,result 的紧凑 ASCII JSON 报告（末尾单换行）。"""
         return json.dumps({"version": version, "result": result},
+                          ensure_ascii=True, separators=(",", ":")) + "\n"
+
+    def rollback_zone_tx(self, target: int, expected: int) -> str:
+        """带修订号检查的原子回滚事务，返回键序 version,result,target 的报告。
+
+        target/expected 非 int（含 bool）抛 TypeError，负值抛
+        ConfigError；两参数校验完成后才比较 expected：不等于当前修订号
+        时不查询 target，报告 conflict（version 为当前修订号）；相等且
+        target 为当前修订号报告 unchanged；target 未保留在修订历史中
+        报告 missing。以上结果与任何异常都不改变任何状态。命中时先用
+        快照构造 PositiveCache，成功后原子换区（清空权威缓存，保留递归
+        缓存、时钟、plan 与统计，提交当下 stats() 逐字节不变），修订号
+        加 1 并把恢复区域归档为新修订（容量 32，超量淘汰最小修订号，
+        号码不复用），报告 applied（version 为新修订号）。报告为紧凑
+        ASCII JSON、十进制数字、末尾单换行，result 为 "applied"、
+        "unchanged"、"missing" 或 "conflict"。
+        """
+        if not isinstance(target, int) or isinstance(target, bool):
+            raise TypeError("target must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if target < 0:
+            raise ConfigError("target revision must be non-negative")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if expected != self._revision:
+            # 修订号不匹配：不得查询 target，冲突本身不改变任何状态。
+            return self._rollback_report(self._revision, "conflict", target)
+        if target == self._revision:
+            # 目标即当前修订：不换区、不加修订号（无论该修订是否仍保留）。
+            return self._rollback_report(self._revision, "unchanged", target)
+        snapshot = self._history.get(target)
+        if snapshot is None:
+            # 目标修订已被淘汰或从未存在：不改变任何状态。
+            return self._rollback_report(self._revision, "missing", target)
+        # 先以快照构造 PositiveCache，全部成功后才提交换区与归档。
+        cache = PositiveCache(copy.deepcopy(snapshot))
+        self._cache = cache
+        self._revision += 1
+        self._archive_zone(snapshot)
+        return self._rollback_report(self._revision, "applied", target)
+
+    @staticmethod
+    def _rollback_report(version, result, target):
+        """构造键序 version,result,target 的紧凑 ASCII JSON 报告（末尾单换行）。"""
+        return json.dumps({"version": version, "result": result,
+                           "target": target},
                           ensure_ascii=True, separators=(",", ":")) + "\n"
 
     def stats(self) -> str:
