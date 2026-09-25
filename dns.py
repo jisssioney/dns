@@ -137,6 +137,8 @@ _REPLAY_EVENT_KEYS = ["delay", "reply"]
 _REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
 _REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
 _MAX_REPLAY_RATE_OPS = 4096
+_REPLAY_CACHE_STATS_KEYS = ["op", "reset"]
+_MAX_REPLAY_CACHE_OPS = 4096
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -2553,6 +2555,99 @@ def replay_rate(rules: list, ops: list, expected=None) -> str:
         except Exception as exc:
             out = {"ok": False, "error": type(exc).__name__}
         items.append({"in": op, "out": out, "stats": limiter.stats(False)})
+    result = json.dumps({"version": 1, "ops": items},
+                        ensure_ascii=True, separators=(",", ":")) + "\n"
+    if expected is not None and result != expected:
+        raise ReplayError("output does not match expected")
+    return result
+
+
+def _validate_cache_ops(ops):
+    """校验 replay_cache 的操作序列，返回 [(kind, op), ...]（不执行）。
+
+    ops 限 0..4096 项，项键序仅 op,query,now,limit（kind 为 resolve）
+    或 op,reset（kind 为 stats）：op 分别为 "resolve"、"stats"；resolve
+    的 query 为偶长小写十六进制、now/limit 为非 bool 整数；stats 的
+    reset 为 bool。ops 非 list 抛 TypeError；超量及项、键序、op 名或
+    字段类型/格式非法均抛 ReplayError。query 报文可解码性不在此校验，
+    留待执行时由 resolve 判定。
+    """
+    if not isinstance(ops, list):
+        raise TypeError("ops must be list")
+    if len(ops) > _MAX_REPLAY_CACHE_OPS:
+        raise ReplayError("ops must contain 0..4096 items")
+    checked = []
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ReplayError("op must be dict")
+        keys = list(op.keys())
+        if keys == _REPLAY_RESOLVE_KEYS:
+            kind = "resolve"
+        elif keys == _REPLAY_CACHE_STATS_KEYS:
+            kind = "stats"
+        else:
+            raise ReplayError("op keys must be op,query,now,limit or op,reset")
+        if not isinstance(op["op"], str):
+            raise ReplayError("op must be str")
+        if op["op"] != kind:
+            raise ReplayError("op name does not match op keys")
+        if kind == "resolve":
+            query = op["query"]
+            if not isinstance(query, str):
+                raise ReplayError("query must be str")
+            if (len(query) % 2
+                    or any(c not in _LOWER_HEXDIGITS for c in query)):
+                raise ReplayError("query must be even-length lowercase hex")
+            if not isinstance(op["now"], int) or isinstance(op["now"], bool):
+                raise ReplayError("now must be int")
+            if not isinstance(op["limit"], int) or isinstance(op["limit"], bool):
+                raise ReplayError("limit must be int")
+        else:
+            if not isinstance(op["reset"], bool):
+                raise ReplayError("reset must be bool")
+        checked.append((kind, op))
+    return checked
+
+
+def replay_cache(zone: dict, ops: list, expected=None) -> str:
+    """在 PositiveCache 上依次回放 resolve/stats 操作，返回记录的紧凑 JSON。
+
+    ops 非 list 或 expected 非 None/str 抛 TypeError；ops 超 4096 项
+    及项、键序、op 名或字段类型/格式非法（resolve 的 query 非偶长小写
+    十六进制、now/limit 为 bool 或非整数，stats 的 reset 非 bool）均
+    在构造 PositiveCache 前抛 ReplayError；zone 的校验与异常同
+    PositiveCache 构造，且在 ops 完整校验通过后才进行。每项记录键序
+    in,out,stats：in 为操作原文，stats 为该操作后的 stats(False) 原文。
+    成功 out 首键 ok 为 true：resolve 键序 ok,response,hit，response
+    为小写十六进制；stats 键序 ok,snapshot，snapshot 为 stats(reset)
+    返回原文（含末尾换行，reset 为 true 时是重置前的旧快照，而记录的
+    stats 为重置后的值）。操作抛出的异常记为 out 键序 ok,error（false
+    与异常类名）并继续后续操作，失败原子性沿用 PositiveCache（条目、
+    时钟与统计均不改）。输出为紧凑 ASCII JSON，顶层键序 version,ops，
+    version 为 1，末尾单换行；同输入逐字节一致。expected 为 None 时
+    仅记录；为 str 时与输出整体比较，不一致抛 ReplayError。
+    """
+    if expected is not None and not isinstance(expected, str):
+        raise TypeError("expected must be str or None")
+    # 全部操作校验在构造 PositiveCache 前完成。
+    checked = _validate_cache_ops(ops)
+    cache = PositiveCache(zone)
+    items = []
+    for kind, op in checked:
+        if kind == "resolve":
+            try:
+                response, hit = cache.resolve(
+                    bytes.fromhex(op["query"]), op["now"], op["limit"])
+                out = {"ok": True, "response": response.hex(), "hit": hit}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        else:
+            try:
+                snapshot = cache.stats(op["reset"])
+                out = {"ok": True, "snapshot": snapshot}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        items.append({"in": op, "out": out, "stats": cache.stats(False)})
     result = json.dumps({"version": 1, "ops": items},
                         ensure_ascii=True, separators=(",", ":")) + "\n"
     if expected is not None and result != expected:
