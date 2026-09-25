@@ -39,7 +39,7 @@
   键序 version,result 的紧凑 ASCII JSON 报告（末尾换行），result 为
   "applied"、"unchanged" 或 "conflict"，修订号与 reload_zone 共用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
-  上依次回放 reload/reload_tx/resolve 操作并记录为紧凑 ASCII JSON
+  上依次回放 reload/reload_tx/resolve/recursive 操作并记录为紧凑 ASCII JSON
   （末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
@@ -129,6 +129,10 @@ _CONFIG_RR_KEYS_V2 = ["name", "type", "ttl", "rdata"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RELOAD_TX_KEYS = ["op", "text", "expected"]
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+_REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
+_REPLAY_LEVEL_KEYS = ["name", "events"]
+_REPLAY_EVENT_KEYS = ["delay", "reply"]
+_REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -1927,14 +1931,106 @@ class Resolver:
         )
 
 
+def _validate_replay_levels(levels):
+    """校验 replay recursive 的 levels（JSON 形态）并转换为递归计划元组。
+
+    1–16 层，每层 1–16 个键序 name,events 的对象；name 为非空 str，
+    events 为事件数组；每个事件键序 delay,reply：delay 为非负非 bool
+    整数，reply 为 null 或键序 kind,an,ns 的对象；kind 为 0..3 的非
+    bool 整数，an/ns 为 RR 数组；RR 键序 name,type,class,ttl,rdata，
+    rdata 为偶长小写十六进制，其余沿用现有 RR 契约。任何键序、字段
+    类型/范围、十六进制形式或层级组合错误统一抛 ReplayError。返回
+    resolve_recursive 入参契约的逐层元组计划（reply 为 None 或
+    (kind, an, ns) 原始形态，rdata 为 bytes），其语义校验复用
+    _validate_levels 仅用于提前把关、结果丢弃；执行时 resolve_recursive
+    会在该元组形态上再校验一次（该校验非幂等，故不得回传规范化结果）。
+    """
+    def replay_rr(rr):
+        if not isinstance(rr, dict) or list(rr.keys()) != _RR_KEYS:
+            raise ReplayError("rr keys must be name,type,class,ttl,rdata")
+        rdata = rr["rdata"]
+        if not isinstance(rdata, str):
+            raise ReplayError("rdata must be str")
+        if (len(rdata) % 2
+                or any(c not in _LOWER_HEXDIGITS for c in rdata)):
+            raise ReplayError("rdata must be even-length lowercase hex")
+        # 其余字段（name/type/class/ttl 及范围）由 _validate_levels 按
+        # 现有 RR 契约校验，这里仅把十六进制 rdata 转换为 bytes。
+        return {"name": rr["name"], "type": rr["type"],
+                "class": rr["class"], "ttl": rr["ttl"],
+                "rdata": bytes.fromhex(rdata)}
+
+    def replay_reply(reply):
+        if reply is None:
+            return None
+        if not isinstance(reply, dict) or list(reply.keys()) != _REPLAY_REPLY_KEYS:
+            raise ReplayError("reply keys must be kind,an,ns")
+        kind = reply["kind"]
+        if not isinstance(kind, int) or isinstance(kind, bool):
+            raise ReplayError("kind must be int")
+        an = reply["an"]
+        ns = reply["ns"]
+        if not isinstance(an, list) or not isinstance(ns, list):
+            raise ReplayError("an and ns must be list")
+        # 保持 resolve_recursive 的原始 (kind, an, ns) 三元组契约。
+        return (kind, [replay_rr(rr) for rr in an],
+                [replay_rr(rr) for rr in ns])
+
+    if not isinstance(levels, list):
+        raise ReplayError("levels must be list")
+    if not 1 <= len(levels) <= _MAX_RECURSION_LEVELS:
+        raise ReplayError("levels must contain 1..16 plans")
+    converted = []
+    for level in levels:
+        if not isinstance(level, list):
+            raise ReplayError("plan must be list")
+        if not 1 <= len(level) <= _MAX_PLAN_ITEMS:
+            raise ReplayError("plan must contain 1..16 items")
+        items = []
+        for item in level:
+            if (not isinstance(item, dict)
+                    or list(item.keys()) != _REPLAY_LEVEL_KEYS):
+                raise ReplayError("plan item keys must be name,events")
+            name = item["name"]
+            if not isinstance(name, str) or not name:
+                raise ReplayError("name must be a non-empty str")
+            events = item["events"]
+            if not isinstance(events, list):
+                raise ReplayError("events must be list")
+            checked_events = []
+            for event in events:
+                if (not isinstance(event, dict)
+                        or list(event.keys()) != _REPLAY_EVENT_KEYS):
+                    raise ReplayError("event keys must be delay,reply")
+                delay = event["delay"]
+                if (not isinstance(delay, int) or isinstance(delay, bool)
+                        or delay < 0):
+                    raise ReplayError("delay must be a non-negative int")
+                checked_events.append((delay, replay_reply(event["reply"])))
+            items.append((name, checked_events))
+        converted.append(items)
+    try:
+        # 完整语义校验（kind 范围、kind/an/ns 组合、RR 字段范围等）在此
+        # 收口，确保层级组合错误在创建 Resolver 前即抛 ReplayError；
+        # 规范化结果丢弃，回传原始元组形态供执行时再校验。
+        _validate_levels(converted)
+    except (TypeError, ValueError) as exc:
+        raise ReplayError(str(exc)) from None
+    return converted
+
+
 def _validate_ops(ops):
-    """校验回放操作序列，返回 [(kind, op), ...]（不执行）。
+    """校验回放操作序列，返回 [(kind, op, plans), ...]（不执行）。
 
     reload 键序 op,text 且 op 为 "reload"、text 为 str；reload_tx 键序
     op,text,expected 且 op 为 "reload_tx"、text 为 str、expected 为非负
     非 bool int；resolve 键序 op,query,now,limit 且 op 为 "resolve"、
-    query 为偶长小写十六进制、now/limit 为 int。ops 非 list 抛
-    TypeError；项、键序、op 名或字段类型/内容错误均抛 ReplayError。
+    query 为偶长小写十六进制、now/limit 为非 bool int；recursive 键序
+    op,query,levels,now,limit 且 op 为 "recursive"，query 为偶长小写
+    十六进制，now/limit 为非 bool int，levels 经
+    _validate_replay_levels 校验并转换（非 recursive 项 plans 为 None）。
+    ops 非 list 抛 TypeError；项、键序、op 名或字段类型/内容错误均抛
+    ReplayError。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
@@ -1949,15 +2045,18 @@ def _validate_ops(ops):
             kind = "reload_tx"
         elif keys == _REPLAY_RESOLVE_KEYS:
             kind = "resolve"
+        elif keys == _REPLAY_RECURSIVE_KEYS:
+            kind = "recursive"
         else:
             raise ReplayError(
-                "op keys must be op,text, op,text,expected"
-                " or op,query,now,limit")
+                "op keys must be op,text, op,text,expected,"
+                " op,query,now,limit or op,query,levels,now,limit")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] != kind:
             raise ReplayError("op name does not match op keys")
-        if kind == "resolve":
+        plans = None
+        if kind in ("resolve", "recursive"):
             query = op["query"]
             if not isinstance(query, str):
                 raise ReplayError("query must be str")
@@ -1965,6 +2064,8 @@ def _validate_ops(ops):
                     or any(c not in _LOWER_HEXDIGITS for c in query)):
                 raise ReplayError(
                     "query must be even-length lowercase hex")
+            if kind == "recursive":
+                plans = _validate_replay_levels(op["levels"])
             if not isinstance(op["now"], int) or isinstance(op["now"], bool):
                 raise ReplayError("now must be int")
             if not isinstance(op["limit"], int) or isinstance(op["limit"], bool):
@@ -1978,32 +2079,34 @@ def _validate_ops(ops):
                     raise ReplayError("expected must be int")
                 if expected < 0:
                     raise ReplayError("expected must be non-negative")
-        checked.append((kind, op))
+        checked.append((kind, op, plans))
     return checked
 
 
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
-    """在 Resolver 上依次回放 reload/reload_tx/resolve 操作，返回记录的紧凑 JSON。
+    """在 Resolver 上依次回放 reload/reload_tx/resolve/recursive 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
-    op 名或字段类型/内容错误均抛 ReplayError；zone、plan、
+    op 名或字段类型/内容错误（含 recursive 的 levels 层级结构、RR 与
+    十六进制形式）均在创建 Resolver 前抛 ReplayError；zone、plan、
     timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
     in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
     为 true：reload 键序 ok,revision；reload_tx 键序 ok,version,result，
-    result 为 "applied"/"unchanged"/"conflict"；resolve 键序
-    ok,response,source,end,hit，response 为小写十六进制。操作抛出的
-    异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
+    result 为 "applied"/"unchanged"/"conflict"；resolve 与 recursive
+    键序 ok,response,source,end,hit，response 为小写十六进制。操作抛
+    出的异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
     状态语义沿用 Resolver（失败不改变任何状态）。输出为紧凑 ASCII
     JSON，顶层键序 version,ops，version 为 1，末尾单换行。expected
     为 None 时仅记录；为 str 时与输出整体比较，不一致抛 ReplayError。
     """
     if expected is not None and not isinstance(expected, str):
         raise TypeError("expected must be str or None")
+    # 全部操作（含 recursive 的 levels）校验、转换在创建 Resolver 前完成。
     checked = _validate_ops(ops)
     resolver = Resolver(zone, plan, timeout)
     items = []
-    for kind, op in checked:
+    for kind, op, plans in checked:
         if kind == "reload":
             try:
                 revision = resolver.reload_zone(op["text"])
@@ -2018,10 +2121,19 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                        "result": report["result"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
-        else:
+        elif kind == "resolve":
             try:
                 response, source, end, hit = resolver.resolve(
                     bytes.fromhex(op["query"]), op["now"], op["limit"])
+                out = {"ok": True, "response": response.hex(),
+                       "source": source, "end": end, "hit": hit}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        else:
+            try:
+                response, source, end, hit = resolver.resolve_recursive(
+                    bytes.fromhex(op["query"]), plans,
+                    op["now"], op["limit"])
                 out = {"ok": True, "response": response.hex(),
                        "source": source, "end": end, "hit": hit}
             except Exception as exc:
