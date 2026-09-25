@@ -19,7 +19,8 @@
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
-  递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)。
+  递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
+  stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -100,6 +101,8 @@ _MAX_REPLY_LEN = 65535
 _FLAG_QR = 0x8000
 _MAX_RECURSION_LEVELS = 16
 _RECURSIVE_RCODES = {0: 0, 1: 0, 2: _RCODE_NXDOMAIN, 3: 0}
+# 递归缓存命中类别 -> stats 的 h 下标（正/NXDOMAIN/NODATA）
+_RECURSIVE_HIT_KINDS = {"pos": 1, "nxdomain": 2, "nodata": 3}
 
 
 def _read_name(data, offset, boundaries):
@@ -1054,6 +1057,38 @@ def _validate_levels(levels):
     return plans
 
 
+def _plan_total_elapsed(plan, timeout):
+    """forward 耗尽时的总模拟时长（与 forward 的时钟推进一致）。"""
+    elapsed = 0
+    for _name, events in plan:
+        for delay, _reply in events[:_PLAN_EVENTS_USED]:
+            elapsed += timeout if delay > timeout else delay
+    return elapsed
+
+
+def _duration_bucket(elapsed, timeout):
+    """模拟时长分桶下标：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
+    if elapsed <= 0:
+        return 0
+    if elapsed <= timeout:
+        return 1
+    if elapsed <= 2 * timeout:
+        return 2
+    return 3
+
+
+def _ratio_six(p, q):
+    """p/q 半偶舍入到 6 位小数的 JSON 数值字符串；分母 0 写 0.000000。"""
+    if q == 0:
+        return "0.000000"
+    quotient, remainder = divmod(p * 10**6, q)
+    if 2 * remainder > q:
+        quotient += 1
+    elif 2 * remainder == q and quotient % 2 == 1:
+        quotient += 1
+    return "{}.{:06d}".format(quotient // 10**6, quotient % 10**6)
+
+
 class Resolver:
     """权威缓存与上游转发组合的解析器。
 
@@ -1077,6 +1112,10 @@ class Resolver:
 
     任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后时钟单调性
     以该结束时刻为准。
+
+    stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
+    换行）；仅成功返回或上游耗尽时原子更新，参数/计划/编码/时钟异常
+    不更新，耗尽不改缓存与最后时刻。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1086,16 +1125,21 @@ class Resolver:
         if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
             raise ValueError("timeout out of range")
         plan = _validate_plan(plan)  # 先按 forward 规则在入参上校验
-        self._plan = copy.deepcopy(plan)  # 再深拷贝，与外部改动隔离
+        self._plan = copy.deepcopy(plan)  # 仅保存深拷贝，与外部改动隔离
         self._cache = PositiveCache(zone)
         self._timeout = timeout
-        self._plan = plan
         self._last_end = None  # 上次成功 resolve 的结束时刻
         # 域外递归结果缓存：与权威正/负缓存独立，共用键与正/负 TTL 规则，
         # 同一容量 256、同一 FIFO 淘汰。
         self._rec_pos = {}  # 正缓存键 -> (插入时刻, 规范化 an)
         self._rec_neg = {}  # 负缓存键 -> (插入时刻, rcode, 规范化 SOA, 负 TTL)
         self._rec_order = deque()
+        # 统计计数器：h 命中细分、m 未中、x 到期未中、u 上游结果、l 时长分桶。
+        self._stats_h = [0, 0, 0, 0]
+        self._stats_m = 0
+        self._stats_x = 0
+        self._stats_u = [0, 0, 0]
+        self._stats_l = [0, 0, 0, 0]
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -1105,19 +1149,57 @@ class Resolver:
         question = msg["questions"][0]
         origin = self._cache._origin
         if _name_in_origin(question, origin, self._cache._zone_class):
+            expired = self._authority_miss_expired(question, now)
             response, hit = self._cache.resolve(query, now, limit)
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
             self._last_end = now
             return response, "authority", now, hit
-        reply, name, end = forward(query, self._plan, now, self._timeout)
+        try:
+            reply, name, end = forward(query, self._plan, now, self._timeout)
+        except UpstreamTimeout:
+            self._stats_u[1] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(self._plan, self._timeout),
+                self._timeout)] += 1
+            raise
+        except UpstreamError:
+            self._stats_u[2] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(self._plan, self._timeout),
+                self._timeout)] += 1
+            raise
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
         self._last_end = end
         return reply, name, end, False
 
+    def _authority_miss_expired(self, question, now):
+        """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
+        cache = self._cache
+        key = (question["name"], question["type"], question["class"])
+        entry = cache._entries.get(key)
+        if entry is not None:
+            return now - entry[0] >= min(rr[3] for rr in entry[1])
+        neg_key = ("nodata",) + key
+        neg = cache._neg_entries.get(neg_key)
+        if neg is None:
+            neg_key = ("nxdomain", key[0], key[2])
+            neg = cache._neg_entries.get(neg_key)
+        if neg is None:
+            return False
+        return now - neg[0] >= neg[3]
+
     def _recursive_cache_lookup(self, query, question, now, limit):
-        """域外递归结果查找，返回 (应答报文或 None, 到期标记或 None)。
+        """域外递归结果查找，返回 (应答报文或 None, 到期标记或 None, 命中类别或 None)。
 
         键、正/负 TTL、查找顺序同 PositiveCache；到期条目标记为
         ("pos"/"neg", 键) 但不立即删除，由调用方在新终态编码成功后清理，
-        保证失败不改状态。
+        保证失败不改状态。命中类别为 "pos"、"nxdomain"、"nodata"，供统计细分。
         """
         key = (question["name"], question["type"], question["class"])
         entry = self._rec_pos.get(key)
@@ -1127,21 +1209,23 @@ class Resolver:
             if elapsed < min(rr[3] for rr in an):
                 aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
                         for labels, rrtype, rrclass, ttl, rdata in an]
-                return _encode_plan(query, 0, aged, [], limit), None
-            return None, ("pos", key)
+                return _encode_plan(query, 0, aged, [], limit), None, "pos"
+            return None, ("pos", key), None
         neg_key = ("nodata",) + key
         neg = self._rec_neg.get(neg_key)
+        kind = "nodata"
         if neg is None:
             neg_key = ("nxdomain", key[0], key[2])
             neg = self._rec_neg.get(neg_key)
+            kind = "nxdomain"
         if neg is None:
-            return None, None
+            return None, None, None
         inserted, rcode, soa, neg_ttl = neg
         elapsed = now - inserted
         if elapsed >= neg_ttl:
-            return None, ("neg", neg_key)
+            return None, ("neg", neg_key), None
         aged_soa = (soa[0], soa[1], soa[2], neg_ttl - elapsed, soa[4])
-        return _encode_plan(query, rcode, [], [aged_soa], limit), None
+        return _encode_plan(query, rcode, [], [aged_soa], limit), None, kind
 
     def _store_recursive_terminal(self, question, now, rcode, an, ns, expired):
         """终态按 PositiveCache 规则写入递归缓存（容量 256、FIFO）。
@@ -1186,17 +1270,28 @@ class Resolver:
         origin = self._cache._origin
         if _name_in_origin(question, origin, self._cache._zone_class):
             # 域内沿用 resolve：经权威正/负缓存应答，source 为 "authority"。
+            expired = self._authority_miss_expired(question, now)
             response, hit = self._cache.resolve(query, now, limit)
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
             self._last_end = now
             return response, "authority", now, hit
         # levels 整体校验（含全部 reply）在任何缓存查找之前完成：
         # 入参非法不得呈现为命中，也不得改变任何状态。
         plans = _validate_levels(levels)
-        cached, expired = self._recursive_cache_lookup(
+        cached, expired, kind = self._recursive_cache_lookup(
             query, question, now, limit)
         if cached is not None:
+            self._stats_h[_RECURSIVE_HIT_KINDS[kind]] += 1
             self._last_end = now
             return cached, "cache", now, True
+        # 未命中：m 与（到期时）x 暂记，待成功或耗尽时与 u、l 一并原子提交。
+        m_inc = 1
+        x_inc = 1 if expired is not None else 0
         # 逐层按 forward 时序模拟；终态先编码成功再记 end 与写缓存。
         clock = now
         result = None
@@ -1204,9 +1299,18 @@ class Resolver:
             result, clock, saw_timeout, saw_other = self._attempt_recursive_level(
                 plan, clock, depth == len(plans) - 1)
             if result is None:
-                # 该层所有上游均未给出可用应答：耗尽异常沿用 forward。
+                # 该层所有上游均未给出可用应答：耗尽异常沿用 forward；
+                # 统计随耗尽提交，缓存与最后时刻不变。
+                self._stats_m += m_inc
+                self._stats_x += x_inc
                 if saw_timeout and not saw_other:
+                    self._stats_u[1] += 1
+                    self._stats_l[_duration_bucket(
+                        clock - now, self._timeout)] += 1
                     raise UpstreamTimeout("all upstream attempts timed out")
+                self._stats_u[2] += 1
+                self._stats_l[_duration_bucket(
+                    clock - now, self._timeout)] += 1
                 raise UpstreamError("no usable upstream reply")
             if result[0] == "referral":
                 continue  # 转介：clock 已推进，进入下一层
@@ -1215,6 +1319,10 @@ class Resolver:
         response = _encode_plan(query, rcode, an, ns, limit)
         self._store_recursive_terminal(
             question, end, rcode, an, ns, expired)
+        self._stats_m += m_inc
+        self._stats_x += x_inc
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
         self._last_end = end
         return response, name, end, False
 
@@ -1247,6 +1355,34 @@ class Resolver:
                 return (("terminal", rcode, an, ns, name, clock),
                         clock, saw_timeout, saw_other)
         return None, clock, saw_timeout, saw_other
+
+    def stats(self) -> str:
+        """返回当前统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）。
+
+        h 为 [权威正负缓存命中, 递归正命中, 递归NXDOMAIN命中, 递归NODATA命中]；
+        m 为缓存未中（resolve 域外直转不计）；x 为未中中因 TTL 到期者；
+        u 为 [上游成功, UpstreamTimeout, 其余UpstreamError]；
+        c 为 [权威条目数, 递归条目数, 256]（正负均计）；
+        l 为需上游的成功或耗尽按模拟总时长分桶
+        （0、1..timeout、timeout+1..2*timeout、>2*timeout）；
+        r 为 sum(h)/(sum(h)+m) 半偶舍入到 6 位小数（分母 0 写 0.000000）。
+        只读：不改变任何状态，重复调用逐字节相同。
+        """
+        h = list(self._stats_h)
+        m = self._stats_m
+        x = self._stats_x
+        u = list(self._stats_u)
+        c = [len(self._cache._order), len(self._rec_order), _CACHE_CAPACITY]
+        elapsed_buckets = list(self._stats_l)
+        return (
+            '{"h":[' + ",".join(map(str, h)) + "]"
+            + ',"m":' + str(m)
+            + ',"x":' + str(x)
+            + ',"u":[' + ",".join(map(str, u)) + "]"
+            + ',"c":[' + ",".join(map(str, c)) + "]"
+            + ',"l":[' + ",".join(map(str, elapsed_buckets)) + "]"
+            + ',"r":' + _ratio_six(sum(h), sum(h) + m) + "}\n"
+        )
 
 
 def main(argv):
