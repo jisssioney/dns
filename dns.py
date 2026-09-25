@@ -1,8 +1,11 @@
-"""DNS 问题报文解码（仅标准库、离线）。
+"""DNS 问题报文解码与确定性权威应答编码（仅标准库、离线）。
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
+- RecordError: 应答模型或资源记录不合规（ValueError 子类）。
+- EncodeError: 查询或长度限制使应答无法编码（ValueError 子类）。
+- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 
 命令行：python dns.py decode HEX
 """
@@ -15,6 +18,14 @@ class MessageError(ValueError):
     """DNS 报文无法解码。"""
 
 
+class RecordError(ValueError):
+    """应答模型或资源记录不合规。"""
+
+
+class EncodeError(ValueError):
+    """查询或长度限制使应答无法编码。"""
+
+
 _MIN_MESSAGE_LEN = 12
 _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
@@ -24,6 +35,15 @@ _LABEL_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 )
 _HEXDIGITS = frozenset("0123456789abcdefABCDEF")
+_MAX_LABEL_WIRE_LEN = 63
+_MAX_RDATA_LEN = 65535
+_MAX_TTL = 4294967295
+_FLAG_QR = 0x8000
+_FLAG_TC = 0x0200
+_FLAGS_RESPONSE_BASE = 0x8400
+_FLAGS_PRESERVED = 0x7910
+_MODEL_KEYS = ["an", "ns", "ar", "limit"]
+_RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 
 
 def _read_name(data, offset, boundaries):
@@ -118,6 +138,151 @@ def decode_query(data: bytes) -> dict:
     if pos != len(data):
         raise MessageError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}
+
+
+def _normalize_name(name):
+    """规范为小写绝对名，返回标签列表（根为 []）。"""
+    if not isinstance(name, str):
+        raise TypeError("name must be str")
+    if name == ".":
+        return []
+    if not name.endswith("."):
+        raise RecordError("name not absolute")
+    labels = name[:-1].split(".")
+    wire_len = 1  # 根终止符占 1 字节
+    for label in labels:
+        if not 1 <= len(label) <= _MAX_LABEL_WIRE_LEN:
+            raise RecordError("bad label length")
+        if any(ch not in _LABEL_CHARS for ch in label):
+            raise RecordError("invalid label character")
+        wire_len += len(label) + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("name too long")
+    return [label.lower() for label in labels]
+
+
+def _check_uint(value, field, limit):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(field + " must be int")
+    if not 0 <= value <= limit:
+        raise RecordError(field + " out of range")
+
+
+def _validate_rr(rr):
+    """校验单条资源记录，返回 (labels, type, class, ttl, rdata)。"""
+    if not isinstance(rr, dict):
+        raise TypeError("rr must be dict")
+    if list(rr.keys()) != _RR_KEYS:
+        raise RecordError("bad rr keys")
+    labels = _normalize_name(rr["name"])
+    _check_uint(rr["type"], "type", 65535)
+    _check_uint(rr["class"], "class", 65535)
+    _check_uint(rr["ttl"], "ttl", _MAX_TTL)
+    rdata = rr["rdata"]
+    if not isinstance(rdata, bytes):
+        raise TypeError("rdata must be bytes")
+    if len(rdata) > _MAX_RDATA_LEN:
+        raise RecordError("rdata too long")
+    return labels, rr["type"], rr["class"], rr["ttl"], rdata
+
+
+def _validate_model(model):
+    """校验应答模型，返回 (an, ns, ar, limit)，各段为规范化 RR 元组列表。"""
+    if not isinstance(model, dict):
+        raise TypeError("model must be dict")
+    if list(model.keys()) != _MODEL_KEYS:
+        raise RecordError("bad model keys")
+    sections = []
+    for key in _MODEL_KEYS[:3]:
+        records = model[key]
+        if not isinstance(records, list):
+            raise TypeError(key + " must be list")
+        sections.append([_validate_rr(rr) for rr in records])
+    limit = model["limit"]
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise TypeError("limit must be int")
+    return sections[0], sections[1], sections[2], limit
+
+
+def _encode_name(out, table, labels):
+    """编码域名：登记标签边界，取最长既有后缀，同长取最小偏移。"""
+    if not labels:
+        out.append(0)
+        return
+    names = [tuple(labels[i:]) for i in range(len(labels))]
+    match = None
+    for i in range(len(names)):
+        if names[i] in table:
+            match = i
+            break
+    stop = match if match is not None else len(labels)
+    for i in range(stop):
+        table.setdefault(names[i], len(out))
+        label = labels[i]
+        out.append(len(label))
+        out.extend(label.encode("ascii"))
+    if match is not None:
+        out.extend((0xC000 | table[names[match]]).to_bytes(2, "big"))
+    else:
+        out.append(0)
+
+
+def _build_message(msg_id, flags, questions, sections):
+    """按 an、ns、ar 顺序编码报文；每次调用重建压缩表。"""
+    table = {}
+    out = bytearray()
+    out.extend(msg_id.to_bytes(2, "big"))
+    out.extend(flags.to_bytes(2, "big"))
+    out.extend(len(questions).to_bytes(2, "big"))
+    for records in sections:
+        out.extend(len(records).to_bytes(2, "big"))
+    for labels, qtype, qclass in questions:
+        _encode_name(out, table, labels)
+        out.extend(qtype.to_bytes(2, "big"))
+        out.extend(qclass.to_bytes(2, "big"))
+    for records in sections:
+        for labels, rrtype, rrclass, ttl, rdata in records:
+            _encode_name(out, table, labels)
+            out.extend(rrtype.to_bytes(2, "big"))
+            out.extend(rrclass.to_bytes(2, "big"))
+            out.extend(ttl.to_bytes(4, "big"))
+            out.extend(len(rdata).to_bytes(2, "big"))
+            out.extend(rdata)
+    return bytes(out)
+
+
+def encode_response(query: bytes, model: dict) -> bytes:
+    """将查询报文与应答模型编码为确定性权威应答报文。"""
+    decoded = decode_query(query)
+    an, ns, ar, limit = _validate_model(model)
+    if decoded["flags"] & _FLAG_QR:
+        raise EncodeError("query must not be a response")
+    if not _MIN_MESSAGE_LEN <= limit <= _MAX_RDATA_LEN:
+        raise EncodeError("limit out of range")
+    flags = _FLAGS_RESPONSE_BASE | (decoded["flags"] & _FLAGS_PRESERVED)
+    questions = [
+        (_normalize_name(q["name"]), q["type"], q["class"])
+        for q in decoded["questions"]
+    ]
+    base = _build_message(decoded["id"], flags, questions, ([], [], []))
+    if len(base) > limit:
+        raise EncodeError("header and questions exceed limit")
+    message = _build_message(decoded["id"], flags, questions, (an, ns, ar))
+    if len(message) <= limit:
+        return message
+    an, ns, ar = list(an), list(ns), list(ar)
+    while True:
+        if ar:
+            ar.pop()
+        elif ns:
+            ns.pop()
+        else:
+            an.pop()
+        message = _build_message(
+            decoded["id"], flags | _FLAG_TC, questions, (an, ns, ar)
+        )
+        if len(message) <= limit:
+            return message
 
 
 def main(argv):
