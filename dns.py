@@ -12,6 +12,10 @@
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)。
+- UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
+- UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
+- forward(query, plan, now, timeout=5): 按 plan 顺序模拟上游转发，
+  成功返回 (应答报文, 上游名, 结束时刻)。
 
 命令行：python dns.py decode HEX
 """
@@ -47,6 +51,14 @@ class CacheError(ValueError):
     """缓存时钟非单调或缓存语义不满足。"""
 
 
+class UpstreamError(RuntimeError):
+    """上游转发未获得可用应答。"""
+
+
+class UpstreamTimeout(UpstreamError):
+    """上游转发全部尝试均超时。"""
+
+
 _MIN_MESSAGE_LEN = 12
 _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
@@ -76,6 +88,12 @@ _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
 _CACHE_CAPACITY = 256
+_MAX_PLAN_ITEMS = 16
+_PLAN_EVENTS_USED = 2
+_MIN_TIMEOUT = 1
+_MAX_TIMEOUT = 60
+_MAX_REPLY_LEN = 65535
+_FLAG_QR = 0x8000
 
 
 def _read_name(data, offset, boundaries):
@@ -781,6 +799,123 @@ class PositiveCache:
             del (self._entries if tag == "pos" else self._neg_entries)[oldest]
         self._last_now = now
         return response, False
+
+
+def _check_non_negative_int(value, field):
+    _check_int(value, field)
+    if value < 0:
+        raise ValueError(field + " must be non-negative")
+
+
+def _validate_plan(plan):
+    """校验转发计划，返回规范化后的 [(name, [(delay, reply), ...]), ...]。"""
+    if not isinstance(plan, list):
+        raise TypeError("plan must be list")
+    if not 1 <= len(plan) <= _MAX_PLAN_ITEMS:
+        raise ValueError("plan must contain 1..16 items")
+    items = []
+    for item in plan:
+        if not isinstance(item, tuple):
+            raise TypeError("plan item must be tuple")
+        if len(item) != 2:
+            raise ValueError("plan item must be (name, events)")
+        name, events = item
+        if not isinstance(name, str):
+            raise TypeError("name must be str")
+        if not name:
+            raise ValueError("name must be non-empty")
+        if not isinstance(events, list):
+            raise TypeError("events must be list")
+        checked = []
+        for event in events:
+            if not isinstance(event, tuple):
+                raise TypeError("event must be tuple")
+            if len(event) != 2:
+                raise ValueError("event must be (delay, reply)")
+            delay, reply = event
+            _check_non_negative_int(delay, "delay")
+            if reply is not None and not isinstance(reply, bytes):
+                raise TypeError("reply must be bytes or None")
+            checked.append((delay, reply))
+        items.append((name, checked))
+    return items
+
+
+def _reply_question_end(reply, qdcount):
+    """按 qdcount 从偏移 12 起界定问题段结束位置；无法界定返回 None。"""
+    pos = _MIN_MESSAGE_LEN
+    for _ in range(qdcount):
+        while True:
+            if pos >= len(reply):
+                return None
+            length = reply[pos]
+            kind = length & 0xC0
+            if kind == 0xC0:
+                if pos + 1 >= len(reply):
+                    return None
+                pos += 2
+                break
+            if kind != 0x00:
+                return None
+            pos += 1
+            if length == 0:
+                break
+            if pos + length > len(reply):
+                return None
+            pos += length
+        if pos + 4 > len(reply):
+            return None
+        pos += 4
+    return pos
+
+
+def _matching_reply(query, reply):
+    """reply 是否为 query 的合格上游应答；任何不符均为普通失败。"""
+    if not _MIN_MESSAGE_LEN <= len(reply) <= _MAX_REPLY_LEN:
+        return False
+    if not int.from_bytes(reply[2:4], "big") & _FLAG_QR:
+        return False
+    if reply[0:2] != query[0:2] or reply[4:6] != query[4:6]:
+        return False
+    qdcount = int.from_bytes(query[4:6], "big")
+    end = _reply_question_end(reply, qdcount)
+    if end is None:
+        return False
+    return reply[_MIN_MESSAGE_LEN:end] == query[_MIN_MESSAGE_LEN:]
+
+
+def forward(query, plan, now, timeout=5):
+    """按 plan 顺序模拟向上游转发 query。
+
+    每项上游仅取前 2 个事件；时钟自 now 累计：delay > timeout 记超时并
+    推进 timeout，否则推进 delay 后检查应答（None 或不合格记失败）。
+    成功返回 (reply, name, 结束时刻)；全部超时抛 UpstreamTimeout，
+    其余耗尽情形（含无事件）抛 UpstreamError。
+    """
+    msg = decode_query(query)  # TypeError/MessageError 原样传播
+    if msg["flags"] & _FLAG_QR:
+        raise EncodeError("query has QR set")
+    _check_non_negative_int(now, "now")
+    _check_int(timeout, "timeout")
+    if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
+        raise ValueError("timeout out of range")
+    items = _validate_plan(plan)
+    clock = now
+    saw_timeout = False
+    saw_other = False
+    for name, events in items:
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            if delay > timeout:
+                saw_timeout = True
+                clock += timeout
+                continue
+            clock += delay
+            if reply is not None and _matching_reply(query, reply):
+                return reply, name, clock
+            saw_other = True
+    if saw_timeout and not saw_other:
+        raise UpstreamTimeout("all upstream attempts timed out")
+    raise UpstreamError("no usable upstream reply")
 
 
 def main(argv):
