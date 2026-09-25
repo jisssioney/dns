@@ -24,7 +24,11 @@
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
-  reload_zone(text) 原子换区并返回从 0 递增的修订号。
+  reload_zone(text) 原子换区并返回从 0 递增的修订号（下次解析时提交）。
+- ReplayError: 回放操作或期望输出不符合要求（ValueError 子类）。
+- replay(zone, plan, ops, expected=None, timeout=5) -> str: 新建 Resolver
+  并依次回放 reload/resolve 操作，返回记录每步输入、输出与 stats() 原文
+  的紧凑 ASCII JSON（末尾单换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -62,6 +66,10 @@ class CacheError(ValueError):
 
 class ConfigError(ValueError):
     """配置文本无法解析或结构不符合版本格式。"""
+
+
+class ReplayError(ValueError):
+    """回放操作结构或期望输出不符合要求。"""
 
 
 class UpstreamError(RuntimeError):
@@ -1232,8 +1240,10 @@ class Resolver:
 
     reload_zone(text)：导入 v0/v1 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
-    才提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
-    缓存；任何失败都不改变任何状态。
+    才暂存，待下次 resolve/resolve_recursive 调用开始时提交：替换权威
+    缓存（清空缓存条目，stats 的 c[0] 届时同步）；提交前 stats() 逐字节
+    不变。时钟、plan、统计计数与递归缓存始终保留；任何失败都不改变任何
+    状态（含此前暂存的换区）。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1259,9 +1269,17 @@ class Resolver:
         self._stats_u = [0, 0, 0]
         self._stats_l = [0, 0, 0, 0]
         self._revision = 0  # 下次 reload_zone 成功时返回的修订号
+        self._pending_cache = None  # reload_zone 暂存、下次解析时提交的缓存
+
+    def _commit_pending_cache(self):
+        """提交 reload_zone 暂存的新权威缓存（若有）；在解析调用开始时进行。"""
+        if self._pending_cache is not None:
+            self._cache = self._pending_cache
+            self._pending_cache = None
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, str, int, bool]:
+        self._commit_pending_cache()
         # query、now、limit 的校验与 PositiveCache.resolve 一致，
         # 单调性以上次成功结束时刻为准。
         msg = _check_resolve_inputs(query, now, limit, self._last_end)
@@ -1384,6 +1402,7 @@ class Resolver:
         上游名、hit=False）；递归缓存命中返回 (应答, "cache", now, True)。
         任何失败都不改变缓存与上次成功结束时刻。
         """
+        self._commit_pending_cache()
         msg = _check_resolve_inputs(query, now, limit, self._last_end)
         question = msg["questions"][0]
         origin = self._cache._origin
@@ -1479,13 +1498,14 @@ class Resolver:
         """导入配置文本并原子换区，返回从 0 递增的修订号。
 
         先 import_zone 再以新 zone 构造 PositiveCache，全部成功后才
-        提交：替换权威缓存（清空缓存条目），保留时钟、plan、统计与递归
-        缓存；任何失败（TypeError、ConfigError、RecordError、ZoneError）
-        都不改变任何状态。
+        暂存，待下次 resolve/resolve_recursive 调用开始时提交：替换
+        权威缓存（清空缓存条目，stats 的 c[0] 届时同步）；提交前
+        stats() 逐字节不变。时钟、plan、统计计数与递归缓存始终保留；
+        任何失败（TypeError、ConfigError、RecordError、ZoneError）
+        都不改变任何状态（含此前暂存的换区）。
         """
-        zone = import_zone(text)
-        cache = PositiveCache(zone)
-        self._cache = cache
+        cache = PositiveCache(import_zone(text))
+        self._pending_cache = cache
         revision = self._revision
         self._revision += 1
         return revision
@@ -1517,6 +1537,93 @@ class Resolver:
             + ',"l":[' + ",".join(map(str, elapsed_buckets)) + "]"
             + ',"r":' + _ratio_six(sum(h), sum(h) + m) + "}\n"
         )
+
+
+_REPLAY_RELOAD_KEYS = ["op", "text"]
+_REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+
+
+def _check_replay_int(value, field):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ReplayError(field + " must be int")
+
+
+def _validate_replay_ops(ops):
+    """校验回放操作内容，返回规范化的 ("reload", text) /
+    ("resolve", query, now, limit) 列表；内容不符抛 ReplayError。"""
+    checked = []
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ReplayError("op must be an object")
+        keys = list(op.keys())
+        if keys == _REPLAY_RELOAD_KEYS and op["op"] == "reload":
+            text = op["text"]
+            if not isinstance(text, str):
+                raise ReplayError("text must be str")
+            checked.append(("reload", text))
+        elif keys == _REPLAY_RESOLVE_KEYS and op["op"] == "resolve":
+            query = op["query"]
+            if not isinstance(query, str):
+                raise ReplayError("query must be str")
+            if (len(query) % 2
+                    or any(c not in _LOWER_HEXDIGITS for c in query)):
+                raise ReplayError(
+                    "query must be even-length lowercase hex")
+            _check_replay_int(op["now"], "now")
+            _check_replay_int(op["limit"], "limit")
+            checked.append(("resolve", query, op["now"], op["limit"]))
+        else:
+            raise ReplayError(
+                "op keys must be op,text or op,query,now,limit")
+    return checked
+
+
+def replay(zone: dict, plan: list, ops: list, expected=None,
+           timeout: int = 5) -> str:
+    """新建 Resolver 并依次回放 reload/resolve 操作，返回记录 JSON。
+
+    输出为紧凑 ASCII JSON，末尾单换行：顶层键序 version,ops，version
+    为 1；每项键序 in,out,stats，in 为操作原文，stats 为该步之后
+    stats() 的原文。成功 out 首键 "ok" 为 true：reload 键序
+    ok,revision；resolve 键序 ok,response,source,end,hit，response 为
+    小写十六进制。操作抛异常时 out 键序 ok,error，值为 false 与异常
+    类名，随后继续回放，状态语义沿用 Resolver。expected 为 None 时仅
+    记录；为 str 时与结果逐字节比较，不匹配抛 ReplayError。ops 须为
+    操作列表、expected 须为 None 或 str，类型错抛 TypeError；操作内容
+    错抛 ReplayError；zone、plan、timeout 的校验同 Resolver。
+    """
+    if not isinstance(ops, list):
+        raise TypeError("ops must be list")
+    if expected is not None and not isinstance(expected, str):
+        raise TypeError("expected must be None or str")
+    checked = _validate_replay_ops(ops)
+    resolver = Resolver(zone, plan, timeout)
+    items = []
+    for action in checked:
+        if action[0] == "reload":
+            in_op = {"op": "reload", "text": action[1]}
+            try:
+                revision = resolver.reload_zone(action[1])
+                out = {"ok": True, "revision": revision}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        else:
+            _, query, now, limit = action
+            in_op = {"op": "resolve", "query": query,
+                     "now": now, "limit": limit}
+            try:
+                response, source, end, hit = resolver.resolve(
+                    bytes.fromhex(query), now, limit)
+                out = {"ok": True, "response": response.hex(),
+                       "source": source, "end": end, "hit": hit}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        items.append({"in": in_op, "out": out, "stats": resolver.stats()})
+    result = json.dumps({"version": 1, "ops": items},
+                        ensure_ascii=True, separators=(",", ":")) + "\n"
+    if expected is not None and result != expected:
+        raise ReplayError("replay output does not match expected")
+    return result
 
 
 def main(argv):
