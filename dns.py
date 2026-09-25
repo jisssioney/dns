@@ -2,20 +2,27 @@
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
+- ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
-- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
+- encode_response(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码权威应答报文。
+- answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 
 命令行：python dns.py decode HEX
 """
 
+from bisect import bisect_right
 import json
 import sys
 
 
 class MessageError(ValueError):
     """DNS 报文无法解码。"""
+
+
+class ZoneError(ValueError):
+    """zone 模型非法。"""
 
 
 class RecordError(ValueError):
@@ -37,6 +44,7 @@ _LABEL_CHARS = frozenset(
 _HEXDIGITS = frozenset("0123456789abcdefABCDEF")
 
 _MODEL_KEYS = ["an", "ns", "ar", "limit"]
+_ZONE_KEYS = ["origin", "records"]
 _RR_KEYS = ["name", "type", "class", "ttl", "rdata"]
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
@@ -44,9 +52,13 @@ _MAX_TTL = 4294967295
 _MIN_LIMIT = 12
 _MAX_LIMIT = 65535
 _MAX_POINTER_TARGET = 0x3FFF
+_MAX_SECTION_RECORDS = 65535
 _FLAGS_RESPONSE = 0x8400  # QR | AA
 _FLAGS_KEPT = 0x7910  # opcode | RD | CD
 _FLAG_TC = 0x0200
+_TYPE_SOA = 6
+_RCODE_REFUSED = 5
+_RCODE_NXDOMAIN = 3
 
 
 def _read_name(data, offset, boundaries):
@@ -214,6 +226,35 @@ def _validate_model(model):
     return sections[0], sections[1], sections[2], limit
 
 
+def _validate_zone(zone):
+    """校验 zone，返回 (origin 标签列表, 规范化 RR 列表, 统一 class)。"""
+    if not isinstance(zone, dict):
+        raise TypeError("zone must be dict")
+    if list(zone.keys()) != _ZONE_KEYS:
+        raise ZoneError("zone keys must be origin,records")
+    try:
+        origin = _normalize_name(zone["origin"])
+    except RecordError as exc:
+        raise ZoneError(str(exc)) from None
+    records = zone["records"]
+    if not isinstance(records, list):
+        raise TypeError("records must be list")
+    rrs = [_validate_rr(rr) for rr in records]
+    if not rrs:
+        raise ZoneError("zone must contain a SOA record")
+    rrclass = rrs[0][2]
+    if any(rr[2] != rrclass for rr in rrs):
+        raise ZoneError("record class not uniform")
+    origin_soa = [rr for rr in rrs if rr[0] == origin and rr[1] == _TYPE_SOA]
+    if len(origin_soa) != 1:
+        raise ZoneError("origin must have exactly one SOA record")
+    for labels, _rrtype, _cls, _ttl, _rdata in rrs:
+        if (len(labels) < len(origin)
+                or labels[len(labels) - len(origin):] != origin):
+            raise ZoneError("owner not within origin")
+    return origin, rrs, rrclass
+
+
 def _write_name(out, labels, offsets):
     """把域名写入 out；offsets 记录已出现的标签边界（后缀 -> 最小偏移）。"""
     match = 0
@@ -238,10 +279,13 @@ def _write_name(out, labels, offsets):
         out.append(0)
 
 
-def _encode_message(msg, an, ns, ar, truncated):
-    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
-    if truncated:
-        flags |= _FLAG_TC
+def _build_message(msg, an, ns, ar, rcode):
+    """一次性编码完整报文，返回 (out, body_base, 各区段 RR 结束偏移, flags)。
+
+    尾删只保留报文前缀：压缩指针只指向更早写入的名字，保留的前缀
+    自身即合法报文，故按结束偏移切片即可，无需反复重新编码。
+    """
+    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT) | rcode
     out = bytearray()
     out += msg["id"].to_bytes(2, "big")
     out += flags.to_bytes(2, "big")
@@ -254,7 +298,10 @@ def _encode_message(msg, an, ns, ar, truncated):
         _write_name(out, _normalize_name(question["name"]), offsets)
         out += question["type"].to_bytes(2, "big")
         out += question["class"].to_bytes(2, "big")
+    body_base = len(out)
+    section_ends = []
     for section in (an, ns, ar):
+        ends = []
         for labels, rrtype, rrclass, ttl, rdata in section:
             _write_name(out, labels, offsets)
             out += rrtype.to_bytes(2, "big")
@@ -262,13 +309,18 @@ def _encode_message(msg, an, ns, ar, truncated):
             out += ttl.to_bytes(4, "big")
             out += len(rdata).to_bytes(2, "big")
             out += rdata
-    return bytes(out)
+            ends.append(len(out))
+        section_ends.append(ends)
+    return out, body_base, section_ends, flags
 
 
-def encode_response(query: bytes, model: dict) -> bytes:
+def encode_response(query: bytes, model: dict, rcode: int = 0) -> bytes:
     """把查询报文与应答模型编码为确定性权威应答报文。"""
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
+    _check_int(rcode, "rcode")
+    if not 0 <= rcode <= 0xF:
+        raise EncodeError("rcode out of range")
     an, ns, ar, limit = _validate_model(model)
     msg = decode_query(query)
     if msg["flags"] & 0x8000:
@@ -276,19 +328,86 @@ def encode_response(query: bytes, model: dict) -> bytes:
     if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
         raise EncodeError("limit out of range")
     truncated = False
-    while True:
-        out = _encode_message(msg, an, ns, ar, truncated)
-        if len(out) <= limit:
-            return out
-        if ar:
-            ar.pop()
-        elif ns:
-            ns.pop()
-        elif an:
-            an.pop()
-        else:
-            raise EncodeError("header and question exceed limit")
+    # 区段计数为 16 位：超过 65535 条时按 ar、ns、an 尾删整条并置 TC，
+    # 不得让计数溢出。
+    for section in (ar, ns, an):
+        if len(section) > _MAX_SECTION_RECORDS:
+            del section[_MAX_SECTION_RECORDS:]
+            truncated = True
+    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
+        msg, an, ns, ar, rcode)
+    na, nn, nr = len(an), len(ns), len(ar)
+    total_end = ar_ends[-1] if ar_ends else (
+        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
+    if total_end > limit:
+        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
         truncated = True
+        nr = bisect_right(ar_ends, limit)
+        if nr == 0:
+            nn = bisect_right(ns_ends, limit)
+            if nn == 0:
+                na = bisect_right(an_ends, limit)
+                if na == 0 and body_base > limit:
+                    raise EncodeError("header and question exceed limit")
+    if nr:
+        end = ar_ends[nr - 1]
+    elif nn:
+        end = ns_ends[nn - 1]
+    elif na:
+        end = an_ends[na - 1]
+    else:
+        end = body_base
+    result = bytearray(out[:end])
+    result[6:8] = na.to_bytes(2, "big")
+    result[8:10] = nn.to_bytes(2, "big")
+    result[10:12] = nr.to_bytes(2, "big")
+    if truncated:
+        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
+    return bytes(result)
+
+
+def _rr_to_model(rr):
+    """把规范化 RR 元组还原为键序固定的模型 dict。"""
+    labels, rrtype, rrclass, ttl, rdata = rr
+    name = ".".join(labels) + "." if labels else "."
+    return {"name": name, "type": rrtype, "class": rrclass,
+            "ttl": ttl, "rdata": rdata}
+
+
+def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
+    """按 zone 对查询报文给出确定性权威应答。"""
+    msg = decode_query(query)  # MessageError/TypeError 原样传播
+    _check_int(limit, "limit")
+    questions = msg["questions"]
+    if (msg["flags"] & 0x8000 or len(questions) != 1
+            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+        raise EncodeError("query or limit not answerable")
+    origin, records, zone_class = _validate_zone(zone)
+    question = questions[0]
+    qlabels = _normalize_name(question["name"])
+    qtype = question["type"]
+    an = []
+    ns = []
+    if question["class"] != zone_class:
+        rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
+    else:
+        matched = [rr for rr in records
+                   if rr[0] == qlabels and rr[1] == qtype]
+        if matched:
+            rcode = 0  # 名称与 type 精确命中：应答入 an，ns 为空
+            an = matched
+        else:
+            rcode = 0 if any(rr[0] == qlabels for rr in records) \
+                else _RCODE_NXDOMAIN  # NODATA / NXDOMAIN
+            ns = [rr for rr in records
+                  if rr[0] == origin and rr[1] == _TYPE_SOA]
+    model = {
+        "an": [_rr_to_model(rr) for rr in an],
+        "ns": [_rr_to_model(rr) for rr in ns],
+        "ar": [],
+        "limit": limit,
+    }
+    return encode_response(query, model, rcode)
 
 
 def main(argv):
