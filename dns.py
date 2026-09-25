@@ -47,6 +47,8 @@
   allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)；
   stats(reset=False) -> str 返回键序 query,response,expired,evicted,
   keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数。
+- replay_rate(rules, ops, expected=None) -> str: 在 RateLimiter 上
+  依次回放 allow 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 
 命令行：python dns.py decode HEX
 """
@@ -133,6 +135,8 @@ _REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
 _REPLAY_LEVEL_KEYS = ["name", "events"]
 _REPLAY_EVENT_KEYS = ["delay", "reply"]
 _REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
+_REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
+_MAX_REPLAY_RATE_OPS = 4096
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -2480,6 +2484,80 @@ class RateLimiter:
             stat["expired"] = 0
             stat["evicted"] = 0
         return text
+
+
+def _validate_rate_ops(ops):
+    """校验 replay_rate 的操作序列（不执行）。
+
+    ops 限 0..4096 项，项键序仅 op,query,client,now,kind：op 为
+    "allow"，query 为偶长小写十六进制，client/kind 为 str，now 为非
+    bool 整数。ops 非 list 抛 TypeError；超量及项、键序、值类型或
+    格式非法抛 ReplayError。kind 取值、client 是否为 IP 地址与 query
+    报文可解码性不在此校验，留待执行时由 allow 判定。
+    """
+    if not isinstance(ops, list):
+        raise TypeError("ops must be list")
+    if len(ops) > _MAX_REPLAY_RATE_OPS:
+        raise ReplayError("ops must contain 0..4096 items")
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ReplayError("op must be dict")
+        if list(op.keys()) != _REPLAY_RATE_OP_KEYS:
+            raise ReplayError("op keys must be op,query,client,now,kind")
+        if not isinstance(op["op"], str):
+            raise ReplayError("op must be str")
+        if op["op"] != "allow":
+            raise ReplayError("op must be allow")
+        query = op["query"]
+        if not isinstance(query, str):
+            raise ReplayError("query must be str")
+        if (len(query) % 2
+                or any(c not in _LOWER_HEXDIGITS for c in query)):
+            raise ReplayError("query must be even-length lowercase hex")
+        if not isinstance(op["client"], str):
+            raise ReplayError("client must be str")
+        if not isinstance(op["now"], int) or isinstance(op["now"], bool):
+            raise ReplayError("now must be int")
+        if not isinstance(op["kind"], str):
+            raise ReplayError("kind must be str")
+
+
+def replay_rate(rules: list, ops: list, expected=None) -> str:
+    """在 RateLimiter 上依次回放 allow 操作，返回记录的紧凑 JSON。
+
+    ops 非 list 或 expected 非 None/str 抛 TypeError；ops 超 4096 项
+    及项、键序、值类型或格式非法（op 非 "allow"、query 非偶长小写
+    十六进制、client/kind 非 str、now 为 bool 或非整数）均在构造
+    RateLimiter 前抛 ReplayError；rules 的校验与异常同 RateLimiter
+    构造，且在 ops 完整校验通过后才进行。每项记录键序 in,out,stats：
+    in 为操作原文，stats 为该操作后的 stats(False) 原文。成功 out
+    键序 ok,allow,remaining（ok 为 true，后两项为 allow 的返回值）；
+    allow 抛出的异常记为 out 键序 ok,error（false 与异常类名）并继续
+    后续操作，allow 的失败原子性不变（计数、时钟与统计均不改）。输出
+    为紧凑 ASCII JSON，顶层键序 version,ops，version 为 1，末尾单
+    换行；同输入逐字节一致。expected 为 None 时仅记录；为 str 时与
+    输出整体比较，不一致抛 ReplayError。
+    """
+    if expected is not None and not isinstance(expected, str):
+        raise TypeError("expected must be str or None")
+    # 全部操作校验在构造 RateLimiter 前完成。
+    _validate_rate_ops(ops)
+    limiter = RateLimiter(rules)
+    items = []
+    for op in ops:
+        try:
+            allowed, remaining = limiter.allow(
+                bytes.fromhex(op["query"]), op["client"], op["now"],
+                op["kind"])
+            out = {"ok": True, "allow": allowed, "remaining": remaining}
+        except Exception as exc:
+            out = {"ok": False, "error": type(exc).__name__}
+        items.append({"in": op, "out": out, "stats": limiter.stats(False)})
+    result = json.dumps({"version": 1, "ops": items},
+                        ensure_ascii=True, separators=(",", ":")) + "\n"
+    if expected is not None and result != expected:
+        raise ReplayError("output does not match expected")
+    return result
 
 
 def main(argv):
