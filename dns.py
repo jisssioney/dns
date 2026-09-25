@@ -2,6 +2,8 @@
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
+- EDNSError: EDNS 报文 AR/OPT 非法、截断、尾随或模型含 OPT
+  （MessageError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
@@ -11,6 +13,8 @@
 - ReplayError: 回放操作序列非法或回放记录与期望不符（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
+- edns(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码可含
+  OPT 的查询的 EDNS 应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -42,6 +46,10 @@ import sys
 
 class MessageError(ValueError):
     """DNS 报文无法解码。"""
+
+
+class EDNSError(MessageError):
+    """EDNS 报文无法解码：AR/OPT 非法、截断、尾随或模型含 OPT。"""
 
 
 class ZoneError(ValueError):
@@ -111,6 +119,10 @@ _FLAGS_KEPT = 0x7910  # opcode | RD | CD
 _FLAG_TC = 0x0200
 _TYPE_SOA = 6
 _TYPE_CNAME = 5
+_TYPE_OPT = 41
+_MIN_OPT_CLASS = 512
+_FLAG_DO = 0x8000
+_MAX_EDNS_RCODE = 0xFFF
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
@@ -219,6 +231,70 @@ def decode_query(data: bytes) -> dict:
     if pos != len(data):
         raise MessageError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}
+
+
+def _decode_edns_query(data):
+    """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do) 或 None)。
+
+    问题段解码契约同 decode_query；AR 限 0 或 1 条，有则须为未压缩根
+    owner、TYPE41、CLASS512..65535、扩展码/版本 0、flags 仅 DO、
+    RDLENGTH0 的 OPT。非法 AR/OPT、截断或尾随抛 EDNSError。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not _MIN_MESSAGE_LEN <= len(data) <= _MAX_MESSAGE_LEN:
+        raise MessageError("bad message length")
+    msg_id = int.from_bytes(data[0:2], "big")
+    flags = int.from_bytes(data[2:4], "big")
+    qdcount = int.from_bytes(data[4:6], "big")
+    ancount = int.from_bytes(data[6:8], "big")
+    nscount = int.from_bytes(data[8:10], "big")
+    arcount = int.from_bytes(data[10:12], "big")
+    if not 1 <= qdcount <= _MAX_QUESTIONS:
+        raise MessageError("bad question count")
+    if ancount or nscount:
+        raise MessageError("response sections must be empty")
+    if arcount > 1:
+        raise EDNSError("additional section must contain at most one OPT")
+    boundaries = set()
+    questions = []
+    pos = _MIN_MESSAGE_LEN
+    for _ in range(qdcount):
+        name, pos = _read_name(data, pos, boundaries)
+        if pos + 4 > len(data):
+            raise MessageError("question truncated")
+        qtype = int.from_bytes(data[pos:pos + 2], "big")
+        qclass = int.from_bytes(data[pos + 2:pos + 4], "big")
+        pos += 4
+        questions.append({"name": name, "type": qtype, "class": qclass})
+    opt = None
+    if arcount:
+        if pos >= len(data):
+            raise EDNSError("opt record truncated")
+        if data[pos] != 0:
+            raise EDNSError("opt owner must be uncompressed root")
+        pos += 1
+        if pos + 10 > len(data):
+            raise EDNSError("opt record truncated")
+        rrtype = int.from_bytes(data[pos:pos + 2], "big")
+        rrclass = int.from_bytes(data[pos + 2:pos + 4], "big")
+        ttl = int.from_bytes(data[pos + 4:pos + 8], "big")
+        rdlength = int.from_bytes(data[pos + 8:pos + 10], "big")
+        pos += 10
+        if rrtype != _TYPE_OPT:
+            raise EDNSError("additional record must be OPT")
+        if rrclass < _MIN_OPT_CLASS:
+            raise EDNSError("opt class out of range")
+        if ttl >> 24 or (ttl >> 16) & 0xFF:
+            raise EDNSError("opt extended rcode and version must be 0")
+        if ttl & 0xFFFF & ~_FLAG_DO:
+            raise EDNSError("opt flags must be DO only")
+        if rdlength:
+            raise EDNSError("opt rdlength must be 0")
+        opt = (rrclass, bool(ttl & _FLAG_DO))
+    if pos != len(data):
+        raise EDNSError("trailing bytes")
+    return {"id": msg_id, "flags": flags, "questions": questions}, opt
 
 
 def _normalize_name(name):
@@ -596,6 +672,90 @@ def _encode_response(query, model, rcode):
 def encode_response(query: bytes, model: dict) -> bytes:
     """把查询报文与应答模型编码为确定性权威应答报文（RCODE 恒为 0）。"""
     return _encode_response(query, model, 0)
+
+
+def edns(query: bytes, model: dict, rcode: int = 0) -> bytes:
+    """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
+
+    query/model 的解码与编码契约同 decode_query/encode_response；查询
+    AR 限 0 或 1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、
+    扩展码/版本 0、flags 仅 DO、RDLENGTH0 的 OPT。非法 AR/OPT、截断、
+    尾随或 model 含 OPT 抛 EDNSError。rcode 须非 bool 整数（类型错
+    TypeError）：有 OPT 限 0..4095、无 OPT 限 0..15，越界 EncodeError。
+    无 OPT 时上限 min(model.limit, 512) 且不回 OPT；有 OPT 时上限
+    min(model.limit, CLASS)，应答 ar 末项为同 CLASS 根 OPT，
+    TTL=(rcode>>4)<<24|DO，头部低 4 位为 rcode&15。编码其余同
+    encode_response：超限按 ar、ns、an 尾删并置 TC，OPT 不删；
+    问题与 OPT 超限抛 EncodeError。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    _check_int(rcode, "rcode")
+    an, ns, ar, limit = _validate_model(model)
+    msg, opt = _decode_edns_query(query)
+    for section in (an, ns, ar):
+        if any(rr[1] == _TYPE_OPT for rr in section):
+            raise EDNSError("model must not contain OPT records")
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    opt_wire = b""
+    if opt is None:
+        if not 0 <= rcode <= 0xF:
+            raise EncodeError("rcode out of range")
+        limit = min(limit, _MAX_MESSAGE_LEN)
+    else:
+        if not 0 <= rcode <= _MAX_EDNS_RCODE:
+            raise EncodeError("rcode out of range")
+        opt_class, do = opt
+        limit = min(limit, opt_class)
+        ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
+        opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+                    + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
+                    + b"\x00\x00")
+    truncated = False
+    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
+    max_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
+    if len(ar) > max_ar:
+        del ar[max_ar:]
+        truncated = True
+    for section in (ns, an):
+        if len(section) > _MAX_SECTION_RECORDS:
+            del section[_MAX_SECTION_RECORDS:]
+            truncated = True
+    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
+        msg, an, ns, ar, rcode & 0xF)
+    body_limit = limit - len(opt_wire)  # 为 OPT 预留，OPT 不参与尾删
+    na, nn, nr = len(an), len(ns), len(ar)
+    total_end = ar_ends[-1] if ar_ends else (
+        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
+    if total_end > body_limit:
+        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
+        truncated = True
+        nr = bisect_right(ar_ends, body_limit)
+        if nr == 0:
+            nn = bisect_right(ns_ends, body_limit)
+            if nn == 0:
+                na = bisect_right(an_ends, body_limit)
+                if na == 0 and body_base > body_limit:
+                    raise EncodeError("header and question exceed limit")
+    if nr:
+        end = ar_ends[nr - 1]
+    elif nn:
+        end = ns_ends[nn - 1]
+    elif na:
+        end = an_ends[na - 1]
+    else:
+        end = body_base
+    result = bytearray(out[:end])
+    result += opt_wire
+    result[6:8] = na.to_bytes(2, "big")
+    result[8:10] = nn.to_bytes(2, "big")
+    result[10:12] = (nr + (1 if opt_wire else 0)).to_bytes(2, "big")
+    if truncated:
+        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
+    return bytes(result)
 
 
 def _labels_to_name(labels):
@@ -1553,14 +1713,15 @@ def _validate_ops(ops):
 
     reload 键序 op,text 且 op 为 "reload"、text 为 str；resolve 键序
     op,query,now,limit 且 op 为 "resolve"、query 为偶长小写十六进制、
-    now/limit 为 int。类型错抛 TypeError，内容错抛 ReplayError。
+    now/limit 为 int。ops 非 list 抛 TypeError；项、键序、op 名或
+    字段类型/内容错误均抛 ReplayError。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
     checked = []
     for op in ops:
         if not isinstance(op, dict):
-            raise TypeError("op must be dict")
+            raise ReplayError("op must be dict")
         keys = list(op.keys())
         if keys == _REPLAY_RELOAD_KEYS:
             kind = "reload"
@@ -1569,22 +1730,24 @@ def _validate_ops(ops):
         else:
             raise ReplayError("op keys must be op,text or op,query,now,limit")
         if not isinstance(op["op"], str):
-            raise TypeError("op must be str")
+            raise ReplayError("op must be str")
         if op["op"] != kind:
             raise ReplayError("op name does not match op keys")
         if kind == "reload":
             if not isinstance(op["text"], str):
-                raise TypeError("text must be str")
+                raise ReplayError("text must be str")
         else:
             query = op["query"]
             if not isinstance(query, str):
-                raise TypeError("query must be str")
+                raise ReplayError("query must be str")
             if (len(query) % 2
                     or any(c not in _LOWER_HEXDIGITS for c in query)):
                 raise ReplayError(
                     "query must be even-length lowercase hex")
-            _check_int(op["now"], "now")
-            _check_int(op["limit"], "limit")
+            if not isinstance(op["now"], int) or isinstance(op["now"], bool):
+                raise ReplayError("now must be int")
+            if not isinstance(op["limit"], int) or isinstance(op["limit"], bool):
+                raise ReplayError("limit must be int")
         checked.append((kind, op))
     return checked
 
@@ -1593,7 +1756,8 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/resolve 操作，返回记录的紧凑 JSON。
 
-    ops/expected 类型错抛 TypeError，内容错抛 ReplayError；zone、plan、
+    ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
+    op 名或字段类型/内容错误均抛 ReplayError；zone、plan、
     timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
     in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
     为 true：reload 键序 ok,revision；resolve 键序
