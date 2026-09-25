@@ -10,7 +10,7 @@
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
-- PositiveCache(zone): 容量 256 的正向答案缓存，resolve(query, now, limit=512)
+- PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)。
 
 命令行：python dns.py decode HEX
@@ -317,6 +317,51 @@ def _encode_cname_target(labels):
     return bytes(out)
 
 
+def _read_soa_name(rdata, pos):
+    """按 CNAME 目标规范解码 rdata pos 处的未压缩绝对名，返回下一偏移。
+
+    任何格式问题都返回 None，不抛异常。
+    """
+    wire_len = 1  # 根终止符占 1 字节
+    while True:
+        if pos >= len(rdata):
+            return None
+        length = rdata[pos]
+        if length == 0:
+            return pos + 1
+        if length > _MAX_LABEL_LEN:  # 含压缩指针形态
+            return None
+        pos += 1
+        if pos + length > len(rdata):
+            return None
+        try:
+            label = rdata[pos:pos + length].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if any(ch not in _LABEL_CHARS for ch in label):
+            return None
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            return None
+        pos += length
+
+
+def _parse_soa_minimum(rdata):
+    """解析 SOA rdata 的 minimum 字段（第五个网络序 uint32）。
+
+    rdata 须完整为两个未压缩绝对域名及五个网络序 uint32；
+    格式不符返回 None，不抛异常。
+    """
+    pos = 0
+    for _ in range(2):
+        pos = _read_soa_name(rdata, pos)
+        if pos is None:
+            return None
+    if len(rdata) - pos != 20:
+        return None
+    return int.from_bytes(rdata[pos + 16:pos + 20], "big")
+
+
 def _validate_zone(zone):
     """校验 zone，返回 (origin 标签列表, 规范化 RR 列表, 统一 class)。"""
     if not isinstance(zone, dict):
@@ -617,11 +662,20 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
 
 
 class PositiveCache:
-    """容量 256 的正向答案缓存（FIFO 淘汰，命中不重排）。
+    """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
-    键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
+    正缓存键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
     仅缓存 RCODE=0、ns 空、an 非空且各原始 TTL 均为正的完整有序应答；
     条目保存插入时刻与原始 RR，输出 TTL 随经过时间递减，到期即删除。
+
+    负缓存仅收完整计划所得且 an 为空的 NXDOMAIN（RCODE=3，键为小写绝对
+    (qname, qclass)，匹配任意 qtype）与 NODATA（RCODE=0，键为
+    (qname, qtype, qclass)），且 ns 恰为 origin 唯一 SOA；SOA rdata 须
+    完整为两个未压缩绝对域名及五个网络序 uint32，负 TTL 为
+    min(SOA ttl, 第五个 uint32)，格式错或负 TTL 为 0 则不缓存。
+    负命中时 RCODE 不变，an/ar 为空，ns 仅该 SOA 且 ttl 随经过时间递减。
+
+    查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     任何失败（含编码失败）都不改变条目与时钟状态。
     """
 
@@ -630,9 +684,30 @@ class PositiveCache:
         # 校验异常与 answer 完全一致。
         zone = copy.deepcopy(zone)
         self._origin, self._records, self._zone_class = _validate_zone(zone)
-        self._entries = {}  # key -> (插入时刻, 规范化 an)
-        self._order = deque()  # 插入次序；与 _entries 的键集合始终一致
+        self._entries = {}  # 正缓存键 -> (插入时刻, 规范化 an)
+        self._neg_entries = {}  # 负缓存键 -> (插入时刻, rcode, 规范化 SOA, 负 TTL)
+        self._order = deque()  # (类别, 键) 插入次序；与两个字典的键集合始终一致
         self._last_now = None  # 上次成功 resolve 的时钟值
+
+    def _negative_entry(self, key, rcode, an, ns, now):
+        """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。"""
+        if an or rcode not in (0, _RCODE_NXDOMAIN):
+            return None
+        if (len(ns) != 1 or ns[0][0] != self._origin
+                or ns[0][1] != _TYPE_SOA):
+            return None
+        soa = ns[0]
+        minimum = _parse_soa_minimum(soa[4])
+        if minimum is None:
+            return None
+        neg_ttl = min(soa[3], minimum)
+        if neg_ttl == 0:
+            return None
+        if rcode == _RCODE_NXDOMAIN:
+            neg_key = ("nxdomain", key[0], key[2])  # 匹配任意 qtype
+        else:
+            neg_key = ("nodata",) + key
+        return neg_key, (now, rcode, soa, neg_ttl)
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, bool]:
@@ -648,7 +723,7 @@ class PositiveCache:
             raise EncodeError("query or limit not answerable")
         question = msg["questions"][0]
         key = (question["name"], question["type"], question["class"])
-        expired = False
+        expired = None  # 到期条目在 _order 中的标记键，待编码成功后清理
         entry = self._entries.get(key)
         if entry is not None:
             inserted, an = entry
@@ -663,21 +738,47 @@ class PositiveCache:
                 self._last_now = now
                 return response, True
             # 到期：先记下，待新应答编码成功后再清理，保证失败不改状态。
-            expired = True
+            expired = ("pos", key)
+        else:
+            # 正缓存未中：NODATA 先于 NXDOMAIN 查找。
+            neg_key = ("nodata",) + key
+            neg = self._neg_entries.get(neg_key)
+            if neg is None:
+                neg_key = ("nxdomain", key[0], key[2])
+                neg = self._neg_entries.get(neg_key)
+            if neg is not None:
+                inserted, rcode, soa, neg_ttl = neg
+                elapsed = now - inserted
+                if elapsed < neg_ttl:
+                    aged_soa = (soa[0], soa[1], soa[2],
+                                neg_ttl - elapsed, soa[4])
+                    # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
+                    # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
+                    response = _encode_plan(query, rcode, [], [aged_soa], limit)
+                    self._last_now = now
+                    return response, True
+                expired = ("neg", neg_key)
         # 未命中（含到期）：先按 answer 语义生成未截断的完整有序应答。
         rcode, an, ns = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
         # 先编码成功再落条目，保证编码失败不改变任何状态。
         response = _encode_plan(query, rcode, an, ns, limit)
-        if expired:
-            del self._entries[key]
-            self._order.remove(key)  # 到期删除后按未命中刷新
+        if expired is not None:
+            tag, ekey = expired
+            del (self._entries if tag == "pos" else self._neg_entries)[ekey]
+            self._order.remove(expired)  # 到期删除后按未命中刷新
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
             self._entries[key] = (now, an)
-            self._order.append(key)
-            if len(self._order) > _CACHE_CAPACITY:
-                oldest = self._order.popleft()  # 满时淘汰最早插入者
-                del self._entries[oldest]
+            self._order.append(("pos", key))
+        else:
+            negative = self._negative_entry(key, rcode, an, ns, now)
+            if negative is not None:
+                neg_key, neg_entry = negative
+                self._neg_entries[neg_key] = neg_entry
+                self._order.append(("neg", neg_key))
+        if len(self._order) > _CACHE_CAPACITY:
+            tag, oldest = self._order.popleft()  # 满时淘汰最早插入者
+            del (self._entries if tag == "pos" else self._neg_entries)[oldest]
         self._last_now = now
         return response, False
 
