@@ -7,11 +7,15 @@
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
 - CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
+- UpstreamError: 转发未取得可用应答（RuntimeError 子类）。
+- UpstreamTimeout: 所有上游事件均超时（UpstreamError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)。
+- forward(query, plan, now, timeout=5): 按确定性计划依次模拟上游，
+  成功返回 (应答报文, 上游名, 结束时刻)。
 
 命令行：python dns.py decode HEX
 """
@@ -47,6 +51,14 @@ class CacheError(ValueError):
     """缓存时钟非单调或缓存语义不满足。"""
 
 
+class UpstreamError(RuntimeError):
+    """转发耗尽所有上游仍未取得可用应答。"""
+
+
+class UpstreamTimeout(UpstreamError):
+    """所有上游事件均为超时。"""
+
+
 _MIN_MESSAGE_LEN = 12
 _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
@@ -76,6 +88,14 @@ _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
 _CACHE_CAPACITY = 256
+_MIN_FORWARD_SERVERS = 1
+_MAX_FORWARD_SERVERS = 16
+_MAX_FORWARD_EVENTS = 2
+_DEFAULT_FORWARD_TIMEOUT = 5
+_MIN_FORWARD_TIMEOUT = 1
+_MAX_FORWARD_TIMEOUT = 60
+_MIN_FORWARD_REPLY_LEN = 12
+_MAX_FORWARD_REPLY_LEN = 65535
 
 
 def _read_name(data, offset, boundaries):
@@ -781,6 +801,112 @@ class PositiveCache:
             del (self._entries if tag == "pos" else self._neg_entries)[oldest]
         self._last_now = now
         return response, False
+
+
+def _reply_question_end(reply, qdcount):
+    """自偏移 12 按 qdcount 定界应答问题段，返回问题段结束偏移。
+
+    定界失败（截断、名字非法等）返回 None，不抛异常。
+    """
+    boundaries = set()
+    pos = _MIN_MESSAGE_LEN
+    try:
+        for _ in range(qdcount):
+            _name, pos = _read_name(reply, pos, boundaries)
+            if pos + 4 > len(reply):
+                return None
+            pos += 4
+    except MessageError:
+        return None
+    return pos
+
+
+def forward(query: bytes, plan: list, now: int, timeout: int = 5
+            ) -> tuple[bytes, str, int]:
+    """按确定性计划依次模拟上游转发，返回 (应答报文, 上游名, 结束时刻)。
+
+    plan 为 1–16 项 list，每项为 (name, events)：name 为非空 str，
+    events 为 list，元素为 (delay, reply)；每项仅取前 2 个 event。
+    自 now 起按事件顺序累计时刻：delay>timeout 记超时并推进 timeout，
+    否则推进 delay；reply 为 None 或不满足应答要求（长度 12..65535、
+    QR=1、ID 与 QDCOUNT 同 query、问题段原始字节等于 query[12:]）记
+    普通失败。首个合格应答立即返回 (reply, name, now+累计时刻)。
+    全部耗尽且所有事件均超时抛 UpstreamTimeout，否则（含无 event）
+    抛 UpstreamError。
+    """
+    msg = decode_query(query)  # MessageError/TypeError 原样传播
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not isinstance(plan, list):
+        raise TypeError("plan must be list")
+    if not _MIN_FORWARD_SERVERS <= len(plan) <= _MAX_FORWARD_SERVERS:
+        raise ValueError("plan length out of range")
+    for item in plan:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("plan item must be (name, events) tuple")
+        name, events = item
+        if not isinstance(name, str):
+            raise TypeError("name must be str")
+        if not name:
+            raise ValueError("name must be non-empty")
+        if not isinstance(events, list):
+            raise TypeError("events must be list")
+        for event in events:
+            if not isinstance(event, tuple) or len(event) != 2:
+                raise TypeError("event must be (delay, reply) tuple")
+            delay, reply = event
+            if not isinstance(delay, int) or isinstance(delay, bool):
+                raise TypeError("delay must be int")
+            if delay < 0:
+                raise ValueError("delay must be non-negative")
+            if reply is not None and not isinstance(reply, bytes):
+                raise TypeError("reply must be bytes or None")
+    if not isinstance(now, int) or isinstance(now, bool):
+        raise TypeError("now must be int")
+    if now < 0:
+        raise ValueError("now must be non-negative")
+    if not isinstance(timeout, int) or isinstance(timeout, bool):
+        raise TypeError("timeout must be int")
+    if not _MIN_FORWARD_TIMEOUT <= timeout <= _MAX_FORWARD_TIMEOUT:
+        raise ValueError("timeout out of range")
+    qid = msg["id"]
+    qdcount = len(msg["questions"])
+    question_section = query[_MIN_MESSAGE_LEN:]
+    elapsed = 0
+    saw_event = False
+    all_timeout = True
+    for name, events in plan:
+        for delay, reply in events[:_MAX_FORWARD_EVENTS]:
+            saw_event = True
+            if delay > timeout:
+                elapsed += timeout
+                continue
+            elapsed += delay
+            if reply is None:
+                all_timeout = False
+                continue
+            if not (_MIN_FORWARD_REPLY_LEN <= len(reply)
+                    <= _MAX_FORWARD_REPLY_LEN):
+                all_timeout = False
+                continue
+            reply_flags = int.from_bytes(reply[2:4], "big")
+            if not reply_flags & 0x8000:
+                all_timeout = False
+                continue
+            if int.from_bytes(reply[0:2], "big") != qid:
+                all_timeout = False
+                continue
+            if int.from_bytes(reply[4:6], "big") != qdcount:
+                all_timeout = False
+                continue
+            end = _reply_question_end(reply, qdcount)
+            if end is None or reply[_MIN_MESSAGE_LEN:end] != question_section:
+                all_timeout = False
+                continue
+            return reply, name, now + elapsed
+    if saw_event and all_timeout:
+        raise UpstreamTimeout("all upstream events timed out")
+    raise UpstreamError("no usable upstream reply")
 
 
 def main(argv):
