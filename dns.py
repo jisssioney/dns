@@ -39,8 +39,8 @@
   键序 version,result 的紧凑 ASCII JSON 报告（末尾换行），result 为
   "applied"、"unchanged" 或 "conflict"，修订号与 reload_zone 共用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
-  上依次回放 reload/reload_tx/resolve/recursive 操作并记录为紧凑 ASCII JSON
-  （末尾单换行）。
+  上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive 操作并
+  记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
@@ -130,6 +130,8 @@ _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
 _CONFIG_RR_KEYS_V2 = ["name", "type", "ttl", "rdata"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RELOAD_TX_KEYS = ["op", "text", "expected"]
+# migrate/migrate_tx 与 reload/reload_tx 键序相同，由 op 名区分。
+_MAX_MIGRATE_TEXT_LEN = 1048576
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
 _REPLAY_LEVEL_KEYS = ["name", "events"]
@@ -1591,6 +1593,12 @@ class Resolver:
     区域相同报告 unchanged（版本、缓存不变），否则原子换区、清空权威
     缓存、保留递归缓存/时钟/plan/统计（stats() 提交当下不变），修订号
     加 1 报告 applied。修订号初始为 0，与 reload_zone 共用递增状态。
+
+    migrate_zone_tx(text, expected)：带修订号检查的配置迁移事务，语义与
+    状态沿用 reload_zone_tx，返回键序 version,result,text 的报告。冲突
+    时不解析 text，text 为 null；相等时经 migrate_zone 校验规范化为 v2，
+    与当前区域等价报告 unchanged，否则原子换区报告 applied，两种结果
+    text 均为规范 v2 文本，版本与缓存语义沿用 reload_zone_tx。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -1906,6 +1914,55 @@ class Resolver:
         return json.dumps({"version": version, "result": result},
                           ensure_ascii=True, separators=(",", ":")) + "\n"
 
+    def migrate_zone_tx(self, text: str, expected: int) -> str:
+        """带修订号检查的配置迁移事务，返回键序 version,result,text 的报告。
+
+        参数校验沿用 reload_zone_tx：text 非 str 或 expected 非 int（含
+        bool）抛 TypeError，expected<0 抛 ConfigError。expected 不等于
+        当前修订号时不解析 text，text 记 null，报告
+        {"version": 当前修订号, "result": "conflict", "text": null} 且
+        状态不变。相等时先经 migrate_zone 完成解析、校验与 v2 规范化，
+        失败沿用 ConfigError、RecordError、ZoneError 且状态不变。规范 v2
+        文本与当前区域的 v2 文本相同时报告 unchanged（版本、缓存不变），
+        否则 import_zone 该文本并构造候选 PositiveCache，成功后原子换区
+        （清空权威缓存，递归缓存、时钟、plan 与统计沿用 reload_zone_tx），
+        修订号加 1 报告 applied。报告为紧凑 ASCII JSON、末尾单换行。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if expected != self._revision:
+            # 修订号不匹配：不得解析 text，冲突本身不改变任何状态。
+            return self._migrate_tx_report(self._revision, "conflict", None)
+        migrated = migrate_zone(text)
+        current = self._current_v2_text()
+        if migrated == current:
+            # 候选迁移结果与当前区域等价：不换区、不加修订号。
+            return self._migrate_tx_report(self._revision, "unchanged",
+                                           migrated)
+        zone = import_zone(migrated)
+        cache = PositiveCache(zone)
+        self._cache = cache
+        self._revision += 1
+        return self._migrate_tx_report(self._revision, "applied", migrated)
+
+    def _current_v2_text(self):
+        """当前区域的规范 v2 文本（紧凑 ASCII JSON，末尾单换行）。"""
+        config = _zone_to_v2(self._cache._origin, self._cache._records,
+                             self._cache._zone_class)
+        return json.dumps(config, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+
+    @staticmethod
+    def _migrate_tx_report(version, result, text):
+        """构造键序 version,result,text 的紧凑 ASCII JSON 报告。"""
+        return json.dumps(
+            {"version": version, "result": result, "text": text},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+
     def stats(self) -> str:
         """返回当前统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）。
 
@@ -2028,9 +2085,12 @@ def _validate_replay_levels(levels):
 def _validate_ops(ops):
     """校验回放操作序列，返回 [(kind, op, plans), ...]（不执行）。
 
-    reload 键序 op,text 且 op 为 "reload"、text 为 str；reload_tx 键序
-    op,text,expected 且 op 为 "reload_tx"、text 为 str、expected 为非负
-    非 bool int；resolve 键序 op,query,now,limit 且 op 为 "resolve"、
+    reload 键序 op,text 且 op 为 "reload"、text 为 str；migrate 同键序
+    op,text 且 op 为 "migrate"、text 为长度 1..1048576 码点的 str；
+    reload_tx 键序 op,text,expected 且 op 为 "reload_tx"、text 为 str、
+    expected 为非负非 bool int；migrate_tx 同键序 op,text,expected 且
+    op 为 "migrate_tx"、text 长度 1..1048576 码点、expected 为非负非
+    bool int；resolve 键序 op,query,now,limit 且 op 为 "resolve"、
     query 为偶长小写十六进制、now/limit 为非 bool int；recursive 键序
     op,query,levels,now,limit 且 op 为 "recursive"，query 为偶长小写
     十六进制，now/limit 为非 bool int，levels 经
@@ -2045,22 +2105,24 @@ def _validate_ops(ops):
         if not isinstance(op, dict):
             raise ReplayError("op must be dict")
         keys = list(op.keys())
+        # migrate/migrate_tx 与 reload/reload_tx 共用键序，由 op 名区分。
         if keys == _REPLAY_RELOAD_KEYS:
-            kind = "reload"
+            candidates = ("reload", "migrate")
         elif keys == _REPLAY_RELOAD_TX_KEYS:
-            kind = "reload_tx"
+            candidates = ("reload_tx", "migrate_tx")
         elif keys == _REPLAY_RESOLVE_KEYS:
-            kind = "resolve"
+            candidates = ("resolve",)
         elif keys == _REPLAY_RECURSIVE_KEYS:
-            kind = "recursive"
+            candidates = ("recursive",)
         else:
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
                 " op,query,now,limit or op,query,levels,now,limit")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
-        if op["op"] != kind:
+        if op["op"] not in candidates:
             raise ReplayError("op name does not match op keys")
+        kind = op["op"]
         plans = None
         if kind in ("resolve", "recursive"):
             query = op["query"]
@@ -2079,7 +2141,10 @@ def _validate_ops(ops):
         else:
             if not isinstance(op["text"], str):
                 raise ReplayError("text must be str")
-            if kind == "reload_tx":
+            if (kind in ("migrate", "migrate_tx")
+                    and not 1 <= len(op["text"]) <= _MAX_MIGRATE_TEXT_LEN):
+                raise ReplayError("text must contain 1..1048576 codepoints")
+            if kind in ("reload_tx", "migrate_tx"):
                 expected = op["expected"]
                 if not isinstance(expected, int) or isinstance(expected, bool):
                     raise ReplayError("expected must be int")
@@ -2091,15 +2156,19 @@ def _validate_ops(ops):
 
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
-    """在 Resolver 上依次回放 reload/reload_tx/resolve/recursive 操作，返回记录的紧凑 JSON。
+    """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/
+    recursive 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
     op 名或字段类型/内容错误（含 recursive 的 levels 层级结构、RR 与
-    十六进制形式）均在创建 Resolver 前抛 ReplayError；zone、plan、
-    timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
-    in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
-    为 true：reload 键序 ok,revision；reload_tx 键序 ok,version,result，
-    result 为 "applied"/"unchanged"/"conflict"；resolve 与 recursive
+    十六进制形式、migrate text 长度）均在创建 Resolver 前抛 ReplayError；
+    zone、plan、timeout 的校验与异常同 Resolver 构造。每项记录键序
+    in,out,stats：in 为操作原文，stats 为该操作后的 stats() 原文。成功
+    out 首键 ok 为 true：reload 键序 ok,revision；reload_tx 键序
+    ok,version,result，result 为 "applied"/"unchanged"/"conflict"；
+    migrate 键序 ok,text，text 为规范 v2 文本（不改状态）；migrate_tx
+    键序 ok,version,result,text，result 为 "applied"/"unchanged" 时 text
+    为规范 v2 文本，"conflict" 时 text 为 null；resolve 与 recursive
     键序 ok,response,source,end,hit，response 为小写十六进制。操作抛
     出的异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
     状态语义沿用 Resolver（失败不改变任何状态）。输出为紧凑 ASCII
@@ -2125,6 +2194,19 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                     resolver.reload_zone_tx(op["text"], op["expected"]))
                 out = {"ok": True, "version": report["version"],
                        "result": report["result"]}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "migrate":
+            try:
+                out = {"ok": True, "text": migrate_zone(op["text"])}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "migrate_tx":
+            try:
+                report = json.loads(
+                    resolver.migrate_zone_tx(op["text"], op["expected"]))
+                out = {"ok": True, "version": report["version"],
+                       "result": report["result"], "text": report["text"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         elif kind == "resolve":
