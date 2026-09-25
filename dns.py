@@ -6,14 +6,18 @@
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
+- CacheError: 缓存时钟非法（now 为负或早于上次成功值，ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
+- PositiveCache(zone: dict): 容量 256 的正缓存，
+  resolve(query: bytes, now: int, limit: int = 512) -> (bytes, bool)。
 
 命令行：python dns.py decode HEX
 """
 
 from bisect import bisect_right
+import copy
 import json
 import sys
 
@@ -36,6 +40,10 @@ class EncodeError(ValueError):
 
 class CNAMEError(ValueError):
     """CNAME 链无法确定：有效名称重复或需加入第 17 条 CNAME。"""
+
+
+class CacheError(ValueError):
+    """缓存时钟非法：now 为负或早于上次成功解析的时刻。"""
 
 
 _MIN_MESSAGE_LEN = 12
@@ -66,6 +74,7 @@ _TYPE_CNAME = 5
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
+_CACHE_CAPACITY = 256
 
 
 def _read_name(data, offset, boundaries):
@@ -554,6 +563,30 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype):
         current = target
 
 
+def _zone_nodes(records, origin):
+    """节点集：origin、各记录 owner（含通配 owner）及其间的空非终端。"""
+    nodes = {tuple(origin)}
+    for labels, _rrtype, _cls, _ttl, _rdata in records:
+        for i in range(len(labels) - len(origin)):
+            nodes.add(tuple(labels[i:]))
+    return nodes
+
+
+def _resolve_question(records, nodes, origin, zone_class, question):
+    """按 zone 对单个问题求 (rcode, an, ns)，an/ns 为规范化 RR 元组列表。"""
+    qlabels = _normalize_name(question["name"])
+    qtype = question["type"]
+    if question["class"] != zone_class:
+        return _RCODE_REFUSED, [], []  # 问题 class 与 zone 不同：三段为空
+    if (len(qlabels) < len(origin)
+            or qlabels[len(qlabels) - len(origin):] != origin):
+        # 查询名在 origin 之外
+        ns = [rr for rr in records
+              if rr[0] == origin and rr[1] == _TYPE_SOA]
+        return _RCODE_NXDOMAIN, [], ns
+    return _resolve_chain(records, nodes, origin, qlabels, qtype)
+
+
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
     msg = decode_query(query)  # MessageError/TypeError 原样传播
@@ -563,25 +596,9 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
         raise EncodeError("query or limit not answerable")
     origin, records, zone_class = _validate_zone(zone)
-    question = questions[0]
-    qlabels = _normalize_name(question["name"])
-    qtype = question["type"]
-    an = []
-    ns = []
-    if question["class"] != zone_class:
-        rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
-    elif (len(qlabels) < len(origin)
-            or qlabels[len(qlabels) - len(origin):] != origin):
-        rcode = _RCODE_NXDOMAIN  # 查询名在 origin 之外
-        ns = [rr for rr in records
-              if rr[0] == origin and rr[1] == _TYPE_SOA]
-    else:
-        # 节点集：origin、各记录 owner（含通配 owner）及其间的空非终端。
-        nodes = {tuple(origin)}
-        for labels, _rrtype, _cls, _ttl, _rdata in records:
-            for i in range(len(labels) - len(origin)):
-                nodes.add(tuple(labels[i:]))
-        rcode, an, ns = _resolve_chain(records, nodes, origin, qlabels, qtype)
+    rcode, an, ns = _resolve_question(
+        records, _zone_nodes(records, origin), origin, zone_class,
+        questions[0])
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
@@ -589,6 +606,73 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
         "limit": limit,
     }
     return _encode_response(query, model, rcode)
+
+
+class PositiveCache:
+    """容量 256 的正缓存：仅缓存 RCODE=0、ns 为空、an 非空且 TTL 均正的应答。
+
+    键为 (小写绝对 qname, qtype, qclass) 三元组，不含 ID、flags、limit。
+    命中时按经过时间递减各 RR 的 TTL 并以本次 query、limit 重编码；
+    到期删除后按未命中刷新；满时淘汰最早插入者，命中不重排。
+    时钟由调用方显式驱动：同状态、输入、now 的应答逐字节一致。
+    """
+
+    def __init__(self, zone: dict):
+        self._zone = copy.deepcopy(zone)  # 校验异常与 answer 一致
+        origin, records, zone_class = _validate_zone(self._zone)
+        self._origin = origin
+        self._records = records
+        self._zone_class = zone_class
+        self._nodes = _zone_nodes(records, origin)
+        self._entries = {}  # key -> (inserted, rrs)，dict 保持插入序
+        self._last_now = None
+
+    def resolve(self, query: bytes, now: int, limit: int = 512):
+        """解析查询，返回 (应答报文, 是否命中缓存)；失败不改变条目与时间状态。"""
+        msg = decode_query(query)  # query、limit 的异常沿用 answer
+        _check_int(limit, "limit")
+        questions = msg["questions"]
+        if (msg["flags"] & 0x8000 or len(questions) != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        _check_int(now, "now")
+        if now < 0:
+            raise CacheError("now must be non-negative")
+        if self._last_now is not None and now < self._last_now:
+            raise CacheError("now earlier than last successful resolve")
+        question = questions[0]
+        key = (question["name"], question["type"], question["class"])
+        entry = self._entries.get(key)
+        if entry is not None:
+            inserted, rrs = entry
+            elapsed = now - inserted
+            if elapsed < min(rr[3] for rr in rrs):
+                an = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                      for labels, rrtype, rrclass, ttl, rdata in rrs]
+                response = _encode_response(query, {
+                    "an": [_rr_to_model(rr) for rr in an],
+                    "ns": [],
+                    "ar": [],
+                    "limit": limit,
+                }, 0)
+                self._last_now = now
+                return response, True
+            del self._entries[key]  # 到期删除后按未命中刷新
+        rcode, an, ns = _resolve_question(
+            self._records, self._nodes, self._origin, self._zone_class,
+            question)
+        if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
+            if len(self._entries) >= _CACHE_CAPACITY:
+                del self._entries[next(iter(self._entries))]
+            self._entries[key] = (now, list(an))
+        response = _encode_response(query, {
+            "an": [_rr_to_model(rr) for rr in an],
+            "ns": [_rr_to_model(rr) for rr in ns],
+            "ar": [],
+            "limit": limit,
+        }, rcode)
+        self._last_now = now
+        return response, False
 
 
 def main(argv):
