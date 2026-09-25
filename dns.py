@@ -5,6 +5,7 @@
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
+- CNAMEError: CNAME 链成环或超过跳数上限（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
@@ -33,6 +34,10 @@ class EncodeError(ValueError):
     """应答报文无法在给定限制内编码。"""
 
 
+class CNAMEError(ValueError):
+    """CNAME 链成环或超过跳数上限。"""
+
+
 _MIN_MESSAGE_LEN = 12
 _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
@@ -57,6 +62,8 @@ _FLAGS_RESPONSE = 0x8400  # QR | AA
 _FLAGS_KEPT = 0x7910  # opcode | RD | CD
 _FLAG_TC = 0x0200
 _TYPE_SOA = 6
+_TYPE_CNAME = 5
+_MAX_CNAME_HOPS = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
 
@@ -204,6 +211,62 @@ def _normalize_owner_name(name):
     return labels
 
 
+def _parse_uncompressed_name(rdata):
+    """把未压缩绝对名线格式的 rdata 解析为 ASCII 小写标签列表。
+
+    要求：标签长 1–63，以 0 结尾，总长 ≤255，禁止压缩指针、
+    保留标签类型、尾随内容及非 _LABEL_CHARS 字符；根名（仅 0 字节）非法。
+    """
+    labels = []
+    pos = 0
+    wire_len = 0
+    while True:
+        if pos >= len(rdata):
+            raise RecordError("cname rdata truncated")
+        length = rdata[pos]
+        kind = length & 0xC0
+        if kind == 0xC0:
+            raise RecordError("cname rdata must not use compression")
+        if kind != 0x00:
+            raise RecordError("cname rdata reserved label type")
+        pos += 1
+        wire_len += 1
+        if length == 0:
+            break
+        if not 1 <= length <= _MAX_LABEL_LEN:
+            raise RecordError("cname rdata bad label length")
+        if pos + length > len(rdata):
+            raise RecordError("cname rdata label truncated")
+        label_bytes = rdata[pos:pos + length]
+        try:
+            label = label_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            raise RecordError("cname rdata label not ascii") from None
+        if any(ch not in _LABEL_CHARS for ch in label):
+            raise RecordError("cname rdata invalid label character")
+        labels.append(label.lower())
+        pos += length
+        wire_len += length
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("cname rdata name too long")
+    if pos != len(rdata):
+        raise RecordError("cname rdata trailing bytes")
+    if not labels:
+        raise RecordError("cname rdata empty target")
+    return labels
+
+
+def _encode_uncompressed_name(labels):
+    """把标签列表编码为未压缩绝对名线格式。"""
+    out = bytearray()
+    for label in labels:
+        encoded = label.encode("ascii")
+        out.append(len(encoded))
+        out += encoded
+    out.append(0)
+    return bytes(out)
+
+
 def _check_int(value, field):
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(field + " must be int")
@@ -270,6 +333,14 @@ def _validate_zone(zone):
     if not isinstance(records, list):
         raise TypeError("records must be list")
     rrs = [_validate_rr(rr, allow_wildcard=True) for rr in records]
+    # CNAME rdata 必须为未压缩绝对名线格式；目标规范为 ASCII 小写并重编码。
+    normalized = []
+    for labels, rrtype, rrclass, ttl, rdata in rrs:
+        if rrtype == _TYPE_CNAME:
+            target = _parse_uncompressed_name(rdata)
+            rdata = _encode_uncompressed_name(target)
+        normalized.append((labels, rrtype, rrclass, ttl, rdata))
+    rrs = normalized
     if not rrs:
         raise ZoneError("zone must contain a SOA record")
     rrclass = rrs[0][2]
@@ -278,6 +349,14 @@ def _validate_zone(zone):
     origin_soa = [rr for rr in rrs if rr[0] == origin and rr[1] == _TYPE_SOA]
     if len(origin_soa) != 1:
         raise ZoneError("origin must have exactly one SOA record")
+    # 同一 owner 至多一条 CNAME，且不得与任何其他类型并存。
+    owner_types = {}
+    for labels, rrtype, _cls, _ttl, _rdata in rrs:
+        owner_types.setdefault(tuple(labels), []).append(rrtype)
+    for types in owner_types.values():
+        if _TYPE_CNAME in types and (
+                types.count(_TYPE_CNAME) > 1 or len(types) > 1):
+            raise ZoneError("CNAME owner must have a single CNAME record")
     for labels, _rrtype, _cls, _ttl, _rdata in rrs:
         if labels and labels[0] == "*":
             suffix = labels[1:]
@@ -414,8 +493,66 @@ def _rr_to_model(rr):
             "ttl": ttl, "rdata": rdata}
 
 
+def _build_nodes(origin, records):
+    """节点集：origin、各记录 owner（含通配 owner）及其间的空非终端。"""
+    nodes = {tuple(origin)}
+    for labels, _rrtype, _cls, _ttl, _rdata in records:
+        for i in range(len(labels) - len(origin)):
+            nodes.add(tuple(labels[i:]))
+    return nodes
+
+
+def _lookup_name(name, qtype, origin, records, nodes, cname_targets):
+    """对单个名字做一次匹配（调用方保证 name 在 origin 内）。
+
+    精确节点优先；空非终端阻断通配；节点不存在才匹配最接近祖先通配。
+    qtype≠5 时 CNAME 优先于同 qtype 记录（zone 校验已保证二者不并存）。
+    返回 (kind, payload, target)：
+    - ("cname", owner 合成为 name 的 RR, 目标标签列表)
+    - ("data", 同 qtype 的 RR 列表（通配 owner 已合成）, None)
+    - ("nodata", None, None)：节点（或通配节点）存在但无该 TYPE
+    - ("nxdomain", None, None)：节点与祖先通配均不存在
+    """
+    key = tuple(name)
+    if key in nodes:
+        if qtype != _TYPE_CNAME and key in cname_targets:
+            rr = next(rr for rr in records
+                      if tuple(rr[0]) == key and rr[1] == _TYPE_CNAME)
+            return ("cname", rr, cname_targets[key])
+        matched = [rr for rr in records
+                   if tuple(rr[0]) == key and rr[1] == qtype]
+        return ("data", matched, None) if matched else ("nodata", None, None)
+    # 节点不存在：取最长既存后缀（至少为 origin），只检查 "*."+该后缀。
+    encloser = None
+    for i in range(1, len(name) - len(origin) + 1):
+        if tuple(name[i:]) in nodes:
+            encloser = name[i:]
+            break
+    wildcard = tuple(["*"] + encloser)
+    wrecords = [rr for rr in records if tuple(rr[0]) == wildcard]
+    if not wrecords:
+        return ("nxdomain", None, None)
+    if qtype != _TYPE_CNAME:
+        wcname = [rr for rr in wrecords if rr[1] == _TYPE_CNAME]
+        if wcname:
+            rr = wcname[0]
+            synthesized = (tuple(name), _TYPE_CNAME, rr[2], rr[3], rr[4])
+            return ("cname", synthesized, cname_targets[wildcard])
+    wmatched = [rr for rr in wrecords if rr[1] == qtype]
+    if wmatched:
+        synthesized = [(tuple(name), rr[1], rr[2], rr[3], rr[4])
+                       for rr in wmatched]
+        return ("data", synthesized, None)
+    return ("nodata", None, None)
+
+
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
-    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配记录）。"""
+    """按 zone 对查询报文给出确定性权威应答。
+
+    支持最左 "*" 通配记录与确定性 CNAME 链：CNAME 按跳序进 an，
+    有效名称重复或需加入第 17 条 CNAME 时抛 CNAMEError；
+    qtype=5 时只返回首个匹配，不追踪链。
+    """
     msg = decode_query(query)  # MessageError/TypeError 原样传播
     _check_int(limit, "limit")
     questions = msg["questions"]
@@ -428,52 +565,67 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     qtype = question["type"]
     an = []
     ns = []
+    origin_key = tuple(origin)
+    soa_rr = next(rr for rr in records
+                  if tuple(rr[0]) == origin_key and rr[1] == _TYPE_SOA)
+
+    def in_origin(name):
+        return (len(name) >= len(origin)
+                and tuple(name[len(name) - len(origin):]) == origin_key)
+
     if question["class"] != zone_class:
         rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
-    elif (len(qlabels) < len(origin)
-            or qlabels[len(qlabels) - len(origin):] != origin):
+    elif not in_origin(qlabels):
         rcode = _RCODE_NXDOMAIN  # 查询名在 origin 之外
-        ns = [rr for rr in records
-              if rr[0] == origin and rr[1] == _TYPE_SOA]
+        ns = [soa_rr]
     else:
-        # 节点集：origin、各记录 owner（含通配 owner）及其间的空非终端。
-        nodes = {tuple(origin)}
-        for labels, _rrtype, _cls, _ttl, _rdata in records:
-            for i in range(len(labels) - len(origin)):
-                nodes.add(tuple(labels[i:]))
-        if tuple(qlabels) in nodes:
-            # 同名节点存在：不回退通配。
-            matched = [rr for rr in records
-                       if rr[0] == qlabels and rr[1] == qtype]
-            if matched:
-                rcode = 0  # 同 TYPE 记录按 records 原序进 an，ns 为空
-                an = matched
-            else:
-                rcode = 0  # NODATA：节点存在（含空非终端）但无该 TYPE
-                ns = [rr for rr in records
-                      if rr[0] == origin and rr[1] == _TYPE_SOA]
-        else:
-            # 节点不存在：取最长既存后缀，只检查 "*."+该后缀。
-            encloser = None
-            for i in range(1, len(qlabels) - len(origin) + 1):
-                if tuple(qlabels[i:]) in nodes:
-                    encloser = qlabels[i:]
-                    break
-            wildcard = ["*"] + encloser
-            wmatched = [rr for rr in records
-                        if rr[0] == wildcard and rr[1] == qtype]
-            if wmatched:
-                rcode = 0  # 命中通配：owner 换成查询的小写绝对名
-                an = [(qlabels, rr[1], rr[2], rr[3], rr[4])
-                      for rr in wmatched]
-            elif any(rr[0] == wildcard for rr in records):
-                rcode = 0  # 通配节点存在但无该 TYPE：NODATA
-                ns = [rr for rr in records
-                      if rr[0] == origin and rr[1] == _TYPE_SOA]
+        nodes = _build_nodes(origin, records)
+        cname_targets = {tuple(rr[0]): _parse_uncompressed_name(rr[4])
+                         for rr in records if rr[1] == _TYPE_CNAME}
+        # qtype=5：只返回首个匹配（精确优先，否则最接近祖先通配），不追踪。
+        if qtype == _TYPE_CNAME:
+            kind, payload, _target = _lookup_name(
+                qlabels, qtype, origin, records, nodes, cname_targets)
+            if kind == "data":
+                rcode = 0
+                an = payload
+            elif kind == "nodata":
+                rcode = 0  # 节点存在但无 CNAME：NODATA
+                ns = [soa_rr]
             else:
                 rcode = _RCODE_NXDOMAIN
-                ns = [rr for rr in records
-                      if rr[0] == origin and rr[1] == _TYPE_SOA]
+                ns = [soa_rr]
+        else:
+            # 确定性 CNAME 链：逐跳匹配，CNAME 先入 an 再查目标。
+            an = []
+            seen = set()
+            current = qlabels
+            rcode = None
+            while True:
+                if tuple(current) in seen:
+                    raise CNAMEError("cname chain loop")
+                if not in_origin(current):
+                    rcode = 0  # 目标在 origin 外：返回积累链，ns 空
+                    break
+                seen.add(tuple(current))
+                kind, payload, target = _lookup_name(
+                    current, qtype, origin, records, nodes, cname_targets)
+                if kind == "cname":
+                    if len(an) >= _MAX_CNAME_HOPS:
+                        raise CNAMEError("cname chain too long")
+                    an.append(payload)
+                    current = target
+                    continue
+                if kind == "data":
+                    rcode = 0  # 同 qtype 记录按 records 原序排在链尾
+                    an.extend(payload)
+                elif kind == "nodata":
+                    rcode = 0  # 域内节点存在但无目标类型：ns 仅含 origin SOA
+                    ns = [soa_rr]
+                else:
+                    rcode = _RCODE_NXDOMAIN  # 域内不存在：ns 仅含 origin SOA
+                    ns = [soa_rr]
+                break
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
