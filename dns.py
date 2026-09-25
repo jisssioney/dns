@@ -2,11 +2,12 @@
 
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
-- EDNSError: EDNS 报文 AR/OPT 非法、截断、尾随或模型含 OPT
-  （MessageError 子类）。
+- EDNSError: EDNS 查询截断、尾随、非法名字、非空 AN/NS 或非法
+  AR/OPT、模型含 OPT（MessageError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
+- PolicyError: 授权规则数量、键序或字段值非法（ValueError 子类）。
 - CNAMEError: CNAME 链出现名称重复或超过 16 跳（ValueError 子类）。
 - CacheError: 缓存时钟非单调等缓存语义错误（ValueError 子类）。
 - ConfigError: 配置文本解析或结构非法（ValueError 子类）。
@@ -15,6 +16,8 @@
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - edns(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码可含
   OPT 的查询的 EDNS 应答报文。
+- authorize(query: bytes, client: str, rules: list, default: str = "deny")
+  -> bool: 按有序规则对单问题查询做客户端网段/名称/类型匹配并裁决。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -40,6 +43,7 @@
 from bisect import bisect_right
 from collections import deque
 import copy
+import ipaddress
 import json
 import sys
 
@@ -78,6 +82,10 @@ class ConfigError(ValueError):
 
 class ReplayError(ValueError):
     """回放操作序列非法或回放记录与期望不符。"""
+
+
+class PolicyError(ValueError):
+    """授权规则数量、键序或字段值非法。"""
 
 
 class UpstreamError(RuntimeError):
@@ -137,6 +145,9 @@ _MAX_RECURSION_LEVELS = 16
 _RECURSIVE_RCODES = {0: 0, 1: 0, 2: _RCODE_NXDOMAIN, 3: 0}
 # 递归缓存命中类别 -> stats 的 h 下标（正/NXDOMAIN/NODATA）
 _RECURSIVE_HIT_KINDS = {"pos": 1, "nxdomain": 2, "nodata": 3}
+_POLICY_RULE_KEYS = ["client", "name", "type", "action"]
+_POLICY_ACTIONS = ("allow", "deny")
+_MAX_POLICY_RULES = 256
 
 
 def _read_name(data, offset, boundaries):
@@ -236,9 +247,10 @@ def decode_query(data: bytes) -> dict:
 def _decode_edns_query(data):
     """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do) 或 None)。
 
-    问题段解码契约同 decode_query；AR 限 0 或 1 条，有则须为未压缩根
-    owner、TYPE41、CLASS512..65535、扩展码/版本 0、flags 仅 DO、
-    RDLENGTH0 的 OPT。非法 AR/OPT、截断或尾随抛 EDNSError。
+    data 非 bytes 抛 TypeError；长度/问题数非法沿用 decode_query 抛
+    MessageError；问题截断、非法名字、非空 AN/NS、非法 AR/OPT、尾随
+    抛 EDNSError。AR 限 0 或 1 条，有则须为未压缩根 owner、TYPE41、
+    CLASS512..65535、扩展码/版本 0、flags 仅 DO、RDLENGTH0 的 OPT。
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -253,16 +265,19 @@ def _decode_edns_query(data):
     if not 1 <= qdcount <= _MAX_QUESTIONS:
         raise MessageError("bad question count")
     if ancount or nscount:
-        raise MessageError("response sections must be empty")
+        raise EDNSError("response sections must be empty")
     if arcount > 1:
         raise EDNSError("additional section must contain at most one OPT")
     boundaries = set()
     questions = []
     pos = _MIN_MESSAGE_LEN
     for _ in range(qdcount):
-        name, pos = _read_name(data, pos, boundaries)
+        try:
+            name, pos = _read_name(data, pos, boundaries)
+        except MessageError as exc:
+            raise EDNSError(str(exc)) from None
         if pos + 4 > len(data):
-            raise MessageError("question truncated")
+            raise EDNSError("question truncated")
         qtype = int.from_bytes(data[pos:pos + 2], "big")
         qclass = int.from_bytes(data[pos + 2:pos + 4], "big")
         pos += 4
@@ -677,16 +692,17 @@ def encode_response(query: bytes, model: dict) -> bytes:
 def edns(query: bytes, model: dict, rcode: int = 0) -> bytes:
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
-    query/model 的解码与编码契约同 decode_query/encode_response；查询
-    AR 限 0 或 1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、
-    扩展码/版本 0、flags 仅 DO、RDLENGTH0 的 OPT。非法 AR/OPT、截断、
-    尾随或 model 含 OPT 抛 EDNSError。rcode 须非 bool 整数（类型错
-    TypeError）：有 OPT 限 0..4095、无 OPT 限 0..15，越界 EncodeError。
-    无 OPT 时上限 min(model.limit, 512) 且不回 OPT；有 OPT 时上限
-    min(model.limit, CLASS)，应答 ar 末项为同 CLASS 根 OPT，
-    TTL=(rcode>>4)<<24|DO，头部低 4 位为 rcode&15。编码其余同
-    encode_response：超限按 ar、ns、an 尾删并置 TC，OPT 不删；
-    问题与 OPT 超限抛 EncodeError。
+    query/rcode/model 类型错抛 TypeError（rcode 须非 bool 整数）。
+    查询长度或问题数非法沿用 decode_query 抛 MessageError；查询截断、
+    非法名字、非空 AN/NS、非法 AR/OPT、尾随或 model 含 OPT 抛
+    EDNSError。查询 AR 限 0 或 1 条，有则须为未压缩根 owner、
+    TYPE41、CLASS512..65535、扩展码/版本 0、flags 仅 DO、RDLENGTH0
+    的 OPT。QR 置位抛 EncodeError；rcode 有 OPT 限 0..4095、无 OPT
+    限 0..15，越界 EncodeError。无 OPT 时上限 min(model.limit, 512)
+    且不回 OPT；有 OPT 时上限 min(model.limit, CLASS)，应答 ar 末项
+    为同 CLASS 根 OPT，TTL=(rcode>>4)<<24|DO，头部低 4 位为
+    rcode&15。编码其余同 encode_response：超限按 ar、ns、an 尾删并
+    置 TC，OPT 不删；问题与 OPT 超限抛 EncodeError。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -756,6 +772,100 @@ def edns(query: bytes, model: dict, rcode: int = 0) -> bytes:
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
+
+
+def authorize(query: bytes, client: str, rules: list,
+              default: str = "deny") -> bool:
+    """按有序规则对单问题查询做客户端网段/名称/类型匹配并裁决。
+
+    规则按原序取首个 client、name、type 全部匹配项：client 为 "*"
+    （任意）或规范 IPv4/IPv6 CIDR（须与 client 地址同协议族且包含之），
+    name 为 "*"（任意）或小写绝对域名（与查询名逐字相等），type 为
+    None（任意）或 0..65535 的非 bool 整数；无匹配项时按 default
+    裁决，返回是否 allow。query 的解码沿用 decode_query 的异常；
+    非单问题或 QR 置位抛 EncodeError；client 须为裸 IP 地址（不得带
+    前缀）。任一入参或字段类型错抛 TypeError；规则数量（0..256）、
+    键序（恰为 client,name,type,action）或字段值错抛 PolicyError。
+    全部规则校验通过后才匹配；不修改任何入参，也不触碰 Resolver 状态。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    if not isinstance(client, str):
+        raise TypeError("client must be str")
+    if not isinstance(rules, list):
+        raise TypeError("rules must be list")
+    if not isinstance(default, str):
+        raise TypeError("default must be str")
+    if len(rules) > _MAX_POLICY_RULES:
+        raise PolicyError("too many rules")
+    parsed_rules = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise TypeError("rule must be dict")
+        if list(rule.keys()) != _POLICY_RULE_KEYS:
+            raise PolicyError("rule keys must be client,name,type,action")
+        rule_client = rule["client"]
+        rule_name = rule["name"]
+        rule_type = rule["type"]
+        action = rule["action"]
+        if not isinstance(rule_client, str):
+            raise TypeError("rule client must be str")
+        if not isinstance(rule_name, str):
+            raise TypeError("rule name must be str")
+        if rule_type is not None and (
+                not isinstance(rule_type, int) or isinstance(rule_type, bool)):
+            raise TypeError("rule type must be int or None")
+        if not isinstance(action, str):
+            raise TypeError("rule action must be str")
+        if rule_client == "*":
+            network = None
+        else:
+            try:
+                network = ipaddress.ip_network(rule_client, strict=False)
+            except ValueError:
+                raise PolicyError(
+                    "rule client must be '*' or a canonical CIDR"
+                ) from None
+            if str(network) != rule_client:
+                raise PolicyError("rule client CIDR must be canonical")
+        if rule_name == "*":
+            name = "*"
+        else:
+            if rule_name != rule_name.lower():
+                raise PolicyError("rule name must be lowercase")
+            try:
+                name = _labels_to_name(_normalize_name(rule_name))
+            except RecordError as exc:
+                raise PolicyError(str(exc)) from None
+        if rule_type is not None and not 0 <= rule_type <= 0xFFFF:
+            raise PolicyError("rule type out of range")
+        if action not in _POLICY_ACTIONS:
+            raise PolicyError("rule action must be allow or deny")
+        parsed_rules.append((network, name, rule_type, action))
+    msg = decode_query(query)
+    if len(msg["questions"]) != 1 or msg["flags"] & _FLAG_QR:
+        raise EncodeError("query must be a single-question non-response")
+    try:
+        client_addr = ipaddress.ip_address(client)
+    except ValueError:
+        raise PolicyError("client must be an IP address") from None
+    if default not in _POLICY_ACTIONS:
+        raise PolicyError("default must be allow or deny")
+    question = msg["questions"][0]
+    qname = question["name"]
+    qtype = question["type"]
+    for network, name, rule_type, action in parsed_rules:
+        if network is not None:
+            if network.version != client_addr.version:
+                continue
+            if client_addr not in network:
+                continue
+        if name != "*" and name != qname:
+            continue
+        if rule_type is not None and rule_type != qtype:
+            continue
+        return action == "allow"
+    return default == "allow"
 
 
 def _labels_to_name(labels):
