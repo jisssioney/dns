@@ -101,7 +101,19 @@
   紧凑 ASCII JSON，末尾单换行），只读且同状态逐字节相同；
   load_zones(text, plan, timeout=5) 类方法先校验全部快照再从配置
   文本恢复实例，以末项区域为当前区并恢复历史与修订号（后续成功
-  变更从 version+1 继续），新实例缓存为空、时钟未设、统计清零。
+  变更从 version+1 继续），新实例缓存为空、时钟未设、统计清零；
+  save_zones(path) 把 dump_zones() 字节写入同目录临时文件，fsync 后
+  os.replace 原子替换并返回字节数，失败保留旧文件、删临时文件且
+  解析器不变；
+  reload_zones_file(path, expected) 从持久化文件带修订号检查地原子
+  恢复区域，返回键序 version,result 的紧凑 ASCII JSON 报告（末尾
+  换行），result 为 "applied"、"unchanged" 或 "conflict"：path 非
+  str/空/含 NUL 分别抛 TypeError/ConfigError，expected 非 int 或
+  bool/负分别抛 TypeError/ConfigError，冲突不读文件；文件上限
+  16777216 字节，缺失、I/O 错、超限或非 ASCII 分别抛
+  FileNotFoundError、OSError、ConfigError；非同内容时文件版本须
+  更大，否则 ConfigError；成功原子替换区域、历史与修订号并清权威
+  缓存，保留递归缓存、时钟、plan 与统计。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -144,7 +156,9 @@ from collections import deque
 import copy
 import ipaddress
 import json
+import os
 import sys
+import tempfile
 
 
 class MessageError(ValueError):
@@ -294,6 +308,9 @@ _ZONE_HISTORY_CAPACITY = 32
 # 顶层 version。
 _ZONES_DUMP_KEYS = ["schema", "version", "history"]
 _ZONES_HISTORY_ITEM_KEYS = ["revision", "zone"]
+# save_zones/reload_zones_file 的持久化文件上限 16 MiB（严格小于等于
+# 16777216 字节），超限拒绝且旧文件与解析器状态均不变。
+_MAX_ZONES_FILE_BYTES = 16777216
 _MAX_PLAN_ITEMS = 16
 _PLAN_EVENTS_USED = 2
 _MIN_TIMEOUT = 1
@@ -2169,6 +2186,28 @@ class Resolver:
     方法先校验全部快照再恢复实例，末项区域为当前区，历史与修订号
     一并恢复（后续成功变更从 version+1 继续），新实例缓存为空、
     时钟未设、统计清零；两者详见各自文档。
+
+    save_zones(path)：把 dump_zones() 字节持久化到 path，返回字节数。
+    path 非 str 抛 TypeError，空串或含 NUL 抛 ConfigError；在同目录
+    临时文件写完全部字节并 fsync 后 os.replace 原子替换，任何 I/O
+    失败原样传播 OSError、删尽临时文件、保留旧目标文件，解析器不
+    改变任何状态。
+
+    reload_zones_file(path, expected)：从持久化文件带修订号检查地
+    原子恢复区域，返回键序仅 version,result 的紧凑 ASCII JSON 报告
+    （末尾单换行）。path 非 str/空串/含 NUL 分别抛
+    TypeError/ConfigError/ConfigError；expected 非 int（含 bool）/
+    为负分别抛 TypeError/ConfigError。校验后 expected 不等于当前
+    修订号时不读文件，报告 conflict 且状态不变。相符时读文件：缺失
+    抛 FileNotFoundError，其余 I/O 错抛 OSError；上限 16777216 字节，
+    超限或非 ASCII 抛 ConfigError。按 load_zones 契约用当前 plan、
+    timeout 校验整份快照，异常原样传播且状态不变。文件快照规范化后
+    与当前 dump_zones() 相同报告 unchanged（版本、历史、缓存不变）；
+    内容不同时候选 version 必须大于当前修订号，否则抛 ConfigError。
+    成功后原子替换权威缓存（清空条目）、修订历史与修订号，保留递归
+    缓存、时钟、plan 与统计（提交当下 stats() 逐字节不变，c[0] 于
+    下次解析提交时同步）。version 取操作后修订号，result 为
+    "applied"、"unchanged" 或 "conflict"。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -3122,6 +3161,102 @@ class Resolver:
         instance._zone_history = {
             revision: copy.deepcopy(zone) for revision, zone in snapshots}
         return instance
+
+    def save_zones(self, path: str) -> int:
+        """把 dump_zones() 字节原子写入 path，返回写入字节数。
+
+        path 非 str 抛 TypeError；为空串或含 NUL 抛 ConfigError。写入在
+        path 同目录下的临时文件进行：先写全部字节并 flush、fsync，再
+        os.replace 原子替换目标，返回 dump_zones() 文本的 ASCII 字节
+        数。写入、fsync 或替换失败均原样传播 OSError：删除已建临时
+        文件、保留既有目标文件不变，解析器不改变任何状态（dump_zones
+        只读）。同状态逐字节相同。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not path:
+            raise ConfigError("path must not be empty")
+        if "\x00" in path:
+            raise ConfigError("path must not contain NUL")
+        data = self.dump_zones().encode("ascii")
+        directory = os.path.dirname(path) or "."
+        # 临时文件与目标同目录，os.replace 才是同文件系统内的原子改名。
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="." + os.path.basename(path) + ".", suffix=".tmp",
+            dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            # 任何失败都删尽临时文件；旧目标文件由 os.replace 的原子性
+            # 保证原样保留，解析器状态从未被触碰。
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return len(data)
+
+    def reload_zones_file(self, path: str, expected: int) -> str:
+        """从持久化文件带修订号检查地原子恢复区域，返回事务报告。
+
+        path 非 str 抛 TypeError，为空串或含 NUL 抛 ConfigError；
+        expected 非 int（含 bool）抛 TypeError，为负抛 ConfigError。
+        全部校验后先比较 expected：不等于当前修订号时不读文件，报告
+        conflict（version 为当前修订号），不改变任何状态。相符时才读
+        path：文件缺失抛 FileNotFoundError，其余 I/O 错误抛 OSError；
+        文件上限 16777216 字节，超限抛 ConfigError；内容须全部 ASCII，
+        否则抛 ConfigError。随后按 load_zones 契约用当前 plan、timeout
+        校验整份快照（结构错误抛 ConfigError，语义错误沿用
+        RecordError、ZoneError），校验期间解析器不变。候选快照与当前
+        dump_zones() 内容相同报告 unchanged（版本、缓存、历史不变）；
+        内容不同时候选 version 必须大于当前修订号，否则抛 ConfigError。
+        成功后原子替换权威缓存（条目清空）、修订历史与修订号，保留
+        递归缓存、时钟、plan 与统计（提交当下 stats() 逐字节不变，
+        c[0] 于下次解析提交时同步）。报告键序仅 version,result：
+        version 取操作后修订号，result 为 "applied"、"unchanged" 或
+        "conflict"；紧凑 ASCII JSON、十进制整数、末尾单换行。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not path:
+            raise ConfigError("path must not be empty")
+        if "\x00" in path:
+            raise ConfigError("path must not contain NUL")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if expected != self._revision:
+            # 冲突优先于一切文件操作：不得读取 path，冲突本身无副作用。
+            return self._tx_report(self._revision, "conflict")
+        # 缺失抛 FileNotFoundError，其余 I/O 错误原样抛 OSError。
+        with open(path, "rb") as handle:
+            data = handle.read()
+        if len(data) > _MAX_ZONES_FILE_BYTES:
+            raise ConfigError("zones file exceeds 16777216 bytes")
+        try:
+            text = data.decode("ascii")
+        except UnicodeDecodeError:
+            raise ConfigError("zones file must be ASCII") from None
+        # 先在独立候选实例上按 load_zones 完整校验全部快照：任何异常
+        # 都在提交前抛出，真实解析器与文件内容均不影响当前状态。
+        candidate = type(self).load_zones(text, self._plan, self._timeout)
+        if candidate.dump_zones() == self.dump_zones():
+            # 文件快照与当前状态规范化后等价：不换区、不改版本与历史。
+            return self._tx_report(self._revision, "unchanged")
+        if candidate._revision <= self._revision:
+            raise ConfigError("snapshot version must be greater than current")
+        # 以候选当前区另建空权威缓存，全部成功后原子提交；递归缓存、
+        # 时钟、plan 与统计保留。
+        cache = PositiveCache(candidate._zone_history[candidate._revision])
+        self._cache = cache
+        self._revision = candidate._revision
+        self._zone_history = copy.deepcopy(candidate._zone_history)
+        return self._tx_report(self._revision, "applied")
 
     def _rollback_batch(self, expected, steps):
         """在隔离状态依序执行 reload/rollback 暂存步，整体原子提交。
