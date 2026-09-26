@@ -38,6 +38,14 @@
   (拒绝应答, "policy", now, False)（flags=0x8400|(flags&0x7910)|5，
   QDCOUNT=1，其余计数为 0，超 limit 抛 EncodeError），拒绝与失败均
   不改变区域、缓存、FIFO、时钟或统计；
+  resolve_limited(query, client, policy, limiter, now, limit=512,
+  default="deny") 组合授权、限流与解析，返回 (应答报文, 来源,
+  结束时刻, 是否命中, 余量)：limiter 非 RateLimiter 抛 TypeError，
+  其余校验与异常依次沿用 authorize、resolve、limiter.allow；授权
+  拒绝不调用 limiter 与上游，返回 (拒绝应答, "policy", now, False,
+  -1)；放行仅调用一次 limiter.allow 后行为同 resolve 并追加余量；
+  超限不调用 resolve 与上游，返回 (REFUSED 应答, "rate", now,
+  False, 0)；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
@@ -1843,6 +1851,20 @@ class Resolver:
     抛 EncodeError。拒绝与任何失败都不改变区域、正/负缓存、FIFO、递归
     缓存、时钟或统计。
 
+    resolve_limited(query, client, policy, limiter, now, limit=512,
+    default="deny")：授权、限流与解析的组合入口，返回 (应答, 来源,
+    结束时刻, 是否命中, 余量) 五元组。limiter 非 RateLimiter 抛
+    TypeError；其余校验与异常依次沿用 authorize、resolve、
+    limiter.allow。授权拒绝时不调用 limiter 与上游，应答复用
+    resolve_authorized 的拒绝报文（超 limit 抛 EncodeError，解析器
+    与 limiter 均不变），后四值为 "policy",now,False,-1。授权放行后
+    仅调用一次 limiter.allow(query, client, now, "query")：放行时
+    行为等同 resolve 并追加余量，resolve 抛异常时额度已耗、失败语义
+    不变；超限时不调用 resolve 与上游，仅 limiter 提交 deny、清理、
+    时钟与统计，返回 (REFUSED 应答, "rate", now, False, 0)。IP 规范、
+    固定窗、4096 键与 CacheError 沿用 RateLimiter；同初态同调用序列
+    逐字节一致。
+
     resolve_recursive(query, levels, now, limit=512)：域内查询沿用
     resolve；域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、FIFO
     同 PositiveCache），命中返回 (应答报文, "cache", now, True)，未命中
@@ -2043,6 +2065,48 @@ class Resolver:
         # 拒绝：先编码成功（超 limit 抛 EncodeError），且不改任何状态。
         response = _encode_policy_refusal(query, limit)
         return response, "policy", now, False
+
+    def resolve_limited(self, query: bytes, client: str, policy: list,
+                        limiter, now: int, limit: int = 512,
+                        default: str = "deny"
+                        ) -> tuple[bytes, str, int, bool, int]:
+        """授权、限流与解析的组合入口，返回五元组。
+
+        limiter 非 RateLimiter 抛 TypeError；其余校验与异常依次沿用
+        authorize、resolve、limiter.allow，全部校验完成前不得改变任何
+        状态。授权拒绝时不调用 limiter 与上游，应答复用
+        resolve_authorized 的拒绝报文（超 limit 抛 EncodeError，解析器
+        与 limiter 均不变），返回 (应答, "policy", now, False, -1)。
+        授权放行后仅调用一次 limiter.allow(query, client, now,
+        "query")：放行时行为等同 resolve 并追加余量，返回 (应答, 来源,
+        结束时刻, 是否命中, 余量)，resolve 抛异常时额度已耗、失败语义
+        不变；超限时不调用 resolve 与上游，仅 limiter 提交 deny、清理、
+        时钟与统计，返回 (REFUSED 应答, "rate", now, False, 0)，拒绝
+        报文超 limit 抛 EncodeError。IP 规范、固定窗、4096 键与
+        CacheError 沿用 RateLimiter；同初态同调用序列逐字节一致。
+        """
+        if not isinstance(limiter, RateLimiter):
+            raise TypeError("limiter must be RateLimiter")
+        # 授权优先：其 TypeError、PolicyError 与报文/可应答性异常原样传播。
+        allowed = authorize(query, client, policy, default)
+        # 其余入参、时钟与 limit 校验完全沿用 resolve；此处不产生状态变更。
+        _check_resolve_inputs(query, now, limit, self._last_end)
+        if not allowed:
+            # 授权拒绝：复用 resolve_authorized 的拒绝应答，不调用
+            # limiter 与上游；编码失败（超 limit）双方状态均不变。
+            response = _encode_policy_refusal(query, limit)
+            return response, "policy", now, False, -1
+        # 授权放行：仅调用一次 limiter.allow；IP 规范、固定窗、4096 键、
+        # 时钟与统计提交均沿用 RateLimiter。
+        permitted, remaining = limiter.allow(query, client, now, "query")
+        if not permitted:
+            # 超限：不调用 resolve 与上游，仅 limiter 已提交 deny、清理、
+            # 时钟与统计；REFUSED 编码超 limit 抛 EncodeError。
+            response = _encode_policy_refusal(query, limit)
+            return response, "rate", now, False, 0
+        # 放行：行为等同 resolve 并追加余量；resolve 异常时额度已耗。
+        response, source, end, hit = self.resolve(query, now, limit)
+        return response, source, end, hit, remaining
 
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
