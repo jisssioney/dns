@@ -22,7 +22,9 @@
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
-  返回 (应答报文, 是否命中)；stats(reset=False) 返回键序 h,m,x,k 的
+  返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
+  含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
+  应答末项回显 OPT；stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
 - UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
@@ -1076,6 +1078,17 @@ def _encode_plan(query, rcode, an, ns, limit):
     return _encode_response(query, model, rcode)
 
 
+def _encode_plan_edns(query, rcode, an, ns, limit):
+    """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。"""
+    model = {
+        "an": [_rr_to_model(rr) for rr in an],
+        "ns": [_rr_to_model(rr) for rr in ns],
+        "ar": [],
+        "limit": limit,
+    }
+    return edns(query, model, rcode)
+
+
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
     msg = decode_query(query)  # MessageError/TypeError 原样传播
@@ -1286,6 +1299,18 @@ class PositiveCache:
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     任何失败（含编码失败）都不改变条目与时钟状态。
 
+    resolve_edns(query, now, limit=65535) 处理含一个 OPT 的单问题查询：
+    报文解码与 OPT 校验沿用 edns 契约（未压缩根 owner、TYPE41、
+    CLASS512..65535、扩展码与版本 0、flags 仅 DO、选项 TLV 校验），
+    QDCOUNT 非 1 或 QR 置位抛 EncodeError，其余报文/OPT 非法抛
+    EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
+    resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
+    权威计划以 edns 语义编码：上限为 min(limit, OPT CLASS)，RCODE 取
+    计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本及 RDLENGTH 为
+    0），普通 RR 超限按既有顺序整条尾删并置 TC、OPT 不删，头部、
+    问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计或最后时刻，
+    成功原子提交；同样调用序列逐字节一致。
+
     stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
     h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
     m 键序 p,nx,nd,o，按成功未命中后新写正缓存、NXDOMAIN、NODATA 或
@@ -1346,6 +1371,45 @@ class PositiveCache:
         if (msg["flags"] & 0x8000 or len(msg["questions"]) != 1
                 or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
             raise EncodeError("query or limit not answerable")
+        return self._resolve_cached(msg, query, now, limit, _encode_plan)
+
+    def resolve_edns(self, query: bytes, now: int,
+                     limit: int = 65535) -> tuple[bytes, bool]:
+        """处理含一个 OPT 的单问题查询，返回 (应答报文, 是否命中)。
+
+        query 非 bytes 抛 TypeError；QDCOUNT 非 1 或 QR 置位抛
+        EncodeError；其余报文/OPT 非法沿用 edns 契约抛 EDNSError。
+        now、limit 非 int 或为 bool 抛 TypeError；now 为负或回退抛
+        CacheError；limit 不在 12..65535 抛 EncodeError。缓存键、正负
+        缓存、TTL 衰减、FIFO、命中与统计和 resolve 完全共享（键忽略
+        OPT、ID、flags 与 limit）；应答按同一权威计划以 edns 语义编码，
+        异常不改变缓存、统计或最后时刻，成功原子提交。
+        """
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        _check_int(limit, "limit")
+        if (int.from_bytes(query[2:4], "big") & 0x8000
+                or int.from_bytes(query[4:6], "big") != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        # 长度与 QDCOUNT 已预检，其余报文/OPT 非法均为 EDNSError。
+        msg, _opt = _decode_edns_query(query)
+        return self._resolve_cached(msg, query, now, limit,
+                                    _encode_plan_edns)
+
+    def _resolve_cached(self, msg, query, now, limit, encode_plan):
+        """resolve/resolve_edns 共用的缓存查找、计划应答与原子提交。
+
+        msg 为已解码且通过可应答性检查的单问题报文；encode_plan 为
+        (query, rcode, an, ns, limit) -> 应答报文 的编码器，其异常即
+        本次失败，不改变条目、统计与时钟。
+        """
         question = msg["questions"][0]
         key = (question["name"], question["type"], question["class"])
         expired = None  # 到期条目在 _order 中的标记键，待编码成功后清理
@@ -1359,7 +1423,7 @@ class PositiveCache:
                         for labels, rrtype, rrclass, ttl, rdata in an]
                 # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
                 # 命中也不改变插入次序。
-                response = _encode_plan(query, 0, aged, [], limit)
+                response = encode_plan(query, 0, aged, [], limit)
                 # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                 self._stats_h[0] += 1
                 self._last_now = now
@@ -1381,7 +1445,7 @@ class PositiveCache:
                                 neg_ttl - elapsed, soa[4])
                     # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
                     # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
-                    response = _encode_plan(query, rcode, [], [aged_soa], limit)
+                    response = encode_plan(query, rcode, [], [aged_soa], limit)
                     # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                     # neg_key 首项区分 NXDOMAIN（h[1]）与 NODATA（h[2]）。
                     self._stats_h[1 if neg_key[0] == "nxdomain" else 2] += 1
@@ -1392,7 +1456,7 @@ class PositiveCache:
         rcode, an, ns = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
         # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
-        response = _encode_plan(query, rcode, an, ns, limit)
+        response = encode_plan(query, rcode, an, ns, limit)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
