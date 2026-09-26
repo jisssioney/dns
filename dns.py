@@ -23,8 +23,8 @@
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
-  含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
-  应答末项回显 OPT；stats(reset=False) 返回键序 h,m,x,k 的
+  恰含一个合法 OPT 的单问题查询（缺失、非法或尾随均抛 EDNSError），
+  与 resolve 共享条目、键、FIFO、时钟与统计，应答末项回显 OPT；stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
 - UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
@@ -33,6 +33,9 @@
   成功返回 (应答报文, 上游名, 结束时刻)。
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
+  resolve_authorized(query, client, rules, now, limit=512, default="deny")
+  按授权规则判定后解析，允许时行为等同 resolve，拒绝时返回
+  (REFUSED 应答, "policy", now, False) 且不访问上游、不改变任何状态；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
@@ -1299,12 +1302,12 @@ class PositiveCache:
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     任何失败（含编码失败）都不改变条目与时钟状态。
 
-    resolve_edns(query, now, limit=65535) 处理含一个 OPT 的单问题查询：
-    报文解码与 OPT 校验沿用 edns 契约（未压缩根 owner、TYPE41、
+    resolve_edns(query, now, limit=65535) 处理恰含一个合法 OPT 的单问题
+    查询：报文解码与 OPT 校验沿用 edns 契约（未压缩根 owner、TYPE41、
     CLASS512..65535、扩展码与版本 0、flags 仅 DO、选项 TLV 校验），
-    QDCOUNT 非 1 或 QR 置位抛 EncodeError，其余报文/OPT 非法抛
-    EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
-    resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
+    QDCOUNT 非 1 或 QR 置位抛 EncodeError；查询缺失 OPT、OPT 非法或
+    含尾随字节均抛 EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中
+    与统计和 resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
     权威计划以 edns 语义编码：上限为 min(limit, OPT CLASS)，RCODE 取
     计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本及 RDLENGTH 为
     0），普通 RR 超限按既有顺序整条尾删并置 TC、OPT 不删，头部、
@@ -1375,15 +1378,16 @@ class PositiveCache:
 
     def resolve_edns(self, query: bytes, now: int,
                      limit: int = 65535) -> tuple[bytes, bool]:
-        """处理含一个 OPT 的单问题查询，返回 (应答报文, 是否命中)。
+        """处理恰含一个合法 OPT 的单问题查询，返回 (应答报文, 是否命中)。
 
         query 非 bytes 抛 TypeError；QDCOUNT 非 1 或 QR 置位抛
-        EncodeError；其余报文/OPT 非法沿用 edns 契约抛 EDNSError。
-        now、limit 非 int 或为 bool 抛 TypeError；now 为负或回退抛
-        CacheError；limit 不在 12..65535 抛 EncodeError。缓存键、正负
-        缓存、TTL 衰减、FIFO、命中与统计和 resolve 完全共享（键忽略
-        OPT、ID、flags 与 limit）；应答按同一权威计划以 edns 语义编码，
-        异常不改变缓存、统计或最后时刻，成功原子提交。
+        EncodeError；查询缺失 OPT、OPT 非法或含尾随字节等其余报文/OPT
+        问题沿用 edns 契约抛 EDNSError。now、limit 非 int 或为 bool 抛
+        TypeError；now 为负或回退抛 CacheError；limit 不在 12..65535
+        抛 EncodeError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
+        resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
+        权威计划以 edns 语义编码，异常不改变缓存、统计或最后时刻，
+        成功原子提交。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
@@ -1399,7 +1403,10 @@ class PositiveCache:
                 or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
             raise EncodeError("query or limit not answerable")
         # 长度与 QDCOUNT 已预检，其余报文/OPT 非法均为 EDNSError。
-        msg, _opt = _decode_edns_query(query)
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            # 查缓存前须恰有一个合法 OPT：缺失、非法或尾随均抛 EDNSError。
+            raise EDNSError("query must contain exactly one OPT record")
         return self._resolve_cached(msg, query, now, limit,
                                     _encode_plan_edns)
 
@@ -1806,6 +1813,14 @@ class Resolver:
     任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后时钟单调性
     以该结束时刻为准。
 
+    resolve_authorized(query, client, rules, now, limit=512,
+    default="deny")：授权匹配、TypeError 与 PolicyError 沿用
+    authorize，其余校验及异常沿用 resolve，验完方可改状态。允许时
+    行为等同 resolve；拒绝时返回 (应答报文, "policy", now, False)，
+    应答保留 ID 并重编码问题，flags 为 0x8400|(查询 flags&0x7910)|5，
+    QDCOUNT=1，ANCOUNT/NSCOUNT/ARCOUNT 均为 0，超 limit 抛
+    EncodeError；不访问上游且不改变区域、正负缓存、FIFO、时钟或统计。
+
     stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
     换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
     同步），参数/计划/编码/时钟异常不更新，耗尽不改缓存与最后时刻。
@@ -2152,6 +2167,38 @@ class Resolver:
                 return (("terminal", rcode, an, ns, name, clock),
                         clock, saw_timeout, saw_other)
         return None, clock, saw_timeout, saw_other
+
+    def resolve_authorized(self, query: bytes, client: str, rules: list,
+                           now: int, limit: int = 512,
+                           default: str = "deny") -> tuple[bytes, str, int, bool]:
+        """按授权规则判定后解析查询，返回 (应答报文, 来源, 结束时刻, 是否命中)。
+
+        授权匹配、TypeError 与 PolicyError 沿用 authorize（规则在任何
+        匹配前整体校验，client 须为字面 IP 地址）；now、limit 及其余
+        校验与异常沿用 resolve。全部校验通过后才可能改变状态。允许时
+        行为等同 resolve；拒绝时返回 (应答报文, "policy", now, False)：
+        应答保留 ID 并重编码问题，flags 为 0x8400|(查询 flags&0x7910)|5，
+        QDCOUNT=1，ANCOUNT/NSCOUNT/ARCOUNT 均为 0，超 limit 抛
+        EncodeError；不访问上游，且不改变区域、正负缓存、FIFO、时钟
+        或统计。同初态同调用序列逐字节一致。
+        """
+        # 授权判定及其全部入参校验（含 query 解码与 QR/QDCOUNT 检查）
+        # 沿用 authorize。
+        allowed = authorize(query, client, rules, default)
+        # now、limit 的校验沿用 resolve；验完方可改状态。
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        _check_int(limit, "limit")
+        if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+            raise EncodeError("query or limit not answerable")
+        if allowed:
+            return self.resolve(query, now, limit)
+        # 拒绝：REFUSED 应答仅含重编码的问题；不访问上游，不改变区域、
+        # 正负缓存、FIFO、时钟或统计。
+        response = _encode_plan(query, _RCODE_REFUSED, [], [], limit)
+        return response, "policy", now, False
 
     def reload_zone(self, text: str) -> int:
         """导入配置文本并原子换区，返回从 0 递增的修订号。
