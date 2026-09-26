@@ -119,6 +119,17 @@
   I/O 错、超 16777216 字节或非 ASCII 分别抛 FileNotFoundError、
   OSError、ConfigError，内容不同时文件 version 须更大，result 为
   "applied"、"unchanged" 或 "conflict"。
+  dump_rec(now) 只读导出递归正/负缓存为 v=1 的紧凑 ASCII JSON（顶层键序
+  v,clock,items，clock=now，items 按 FIFO 至多 256 项，项键序
+  k,q,t,c,rr，rr 元素键序 n,t,c,ttl,d，末尾单换行）：k 为 p/nx/nd，
+  q 为小写绝对名，nx 的 t 为 null，t/c 为 uint16，d 为偶长小写十六
+  进制；p 的 rr 非空且 ttl 为各 RR 剩余正整数，nx/nd 恰一条 SOA 且
+  ttl 为负缓存剩余值，到期项不写出；
+  load_rec(text, now) 校验后按 now-clock 衰减、丢弃到期项，原子替换
+  递归正/负缓存与 FIFO、置成功时刻为 now，返回保留数；text 非 str 或
+  now 非 int/为 bool 抛 TypeError，超 1048576 码点、解析、重复键、
+  键序、非 RR 字段、重复缓存键错抛 ConfigError，now 负/回退/小于
+  clock 抛 CacheError，RR/SOA 错抛 RecordError，失败无副作用。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -244,6 +255,13 @@ _REPLAY_ROLLBACK_STEP_KEYS = ["op", "target"]
 _REPLAY_ROLLBACK_BATCH_KEYS = ["op", "expected", "steps"]
 _REPLAY_ROLLBACK_TX_KEYS = ["op", "target", "expected"]
 _MAX_MIGRATE_TEXT_LEN = 1048576
+# dump_rec/load_rec 配置：顶层键序仅 v,clock,items（v 恒为 1），
+# items 限 0..256；项键序 k,q,t,c,rr，rr 元素键序 n,t,c,ttl,d。
+_REC_DUMP_KEYS = ["v", "clock", "items"]
+_REC_ITEM_KEYS = ["k", "q", "t", "c", "rr"]
+_REC_RR_KEYS = ["n", "t", "c", "ttl", "d"]
+_REC_ITEM_KINDS = frozenset(("p", "nx", "nd"))
+_MAX_REC_TEXT_LEN = 1048576
 _MAX_ROLLBACK_BATCH_STEPS = 32
 _UPDATE_CHANGE_KEYS = ["op", "record"]
 _UPDATE_OPS = frozenset(("add", "delete"))
@@ -2128,6 +2146,135 @@ def _cache_watermark(pos_entries, neg_entries, order, now):
     )
 
 
+def _rec_dump_item(tag, key, value, now):
+    """把递归缓存 FIFO 条目组装为 dump_rec 项 dict（键序 k,q,t,c,rr）。
+
+    tag 为 "pos"/"neg"，key 为内部缓存键，value 为正 (插入时刻, an) 或
+    负 (插入时刻, rcode, SOA, 负 TTL) 条目；调用方只传 FIFO 内且在 now
+    未到期的条目，各项 TTL 按 now-插入时刻 衰减为剩余正整数（插入时刻
+    不写入文本）。
+    """
+    if tag == "pos":
+        qname, qtype, qclass = key
+        elapsed = now - value[0]
+        rrs = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+               for labels, rrtype, rrclass, ttl, rdata in value[1]]
+    elif key[0] == "nxdomain":
+        qname, qtype, qclass = key[1], None, key[2]
+        elapsed = now - value[0]
+        soa = value[2]
+        rrs = [(soa[0], soa[1], soa[2], value[3] - elapsed, soa[4])]
+    else:
+        qname, qtype, qclass = key[1], key[2], key[3]
+        elapsed = now - value[0]
+        soa = value[2]
+        rrs = [(soa[0], soa[1], soa[2], value[3] - elapsed, soa[4])]
+    return {
+        "k": "p" if tag == "pos" else ("nx" if key[0] == "nxdomain" else "nd"),
+        "q": qname,
+        "t": qtype,
+        "c": qclass,
+        "rr": [{
+            "n": _labels_to_name(labels),
+            "t": rrtype,
+            "c": rrclass,
+            "ttl": ttl,
+            "d": rdata.hex(),
+        } for labels, rrtype, rrclass, ttl, rdata in rrs],
+    }
+
+
+def _rec_load_item(item):
+    """校验单条 dump_rec 项，返回规范化原始元组。
+
+    返回 ("p", qname, qtype, qclass, rrs) 或
+    ("nx"/"nd", qname, qtype, qclass, [soa])；qname 为规范后的小写绝对
+    名，nx 的 qtype 恒为 None（键匹配任意类型），nd 保留其 uint16 qtype，
+    rrs/soa 为 _validate_rr 规范化的 RR 元组，ttl 仍是文本中的剩余值
+    （正项为各 RR 剩余，负项即负缓存剩余值）。结构错误（非对象、键序、
+    k 值、类型不符、数量、t/d 类型、t 为 bool）抛 ConfigError；名称、
+    整数范围等 RR 语义错误沿用 _validate_rr 抛 RecordError；nx/nd 唯一
+    RR 非 SOA 抛 RecordError。
+    """
+    if not isinstance(item, dict):
+        raise ConfigError("item must be an object")
+    if list(item.keys()) != _REC_ITEM_KEYS:
+        raise ConfigError("item keys must be k,q,t,c,rr")
+    kind = item["k"]
+    if not isinstance(kind, str) or kind not in _REC_ITEM_KINDS:
+        raise ConfigError("k must be p, nx or nd")
+    qname = item["q"]
+    qtype = item["t"]
+    qclass = item["c"]
+    rr_items = item["rr"]
+    if not isinstance(qname, str):
+        raise ConfigError("q must be str")
+    if kind == "nx":
+        if qtype is not None:
+            raise ConfigError("nx t must be null")
+    else:
+        if not isinstance(qtype, int) or isinstance(qtype, bool):
+            raise ConfigError("t must be int")
+        if not 0 <= qtype <= 0xFFFF:
+            raise ConfigError("t out of range")
+    if not isinstance(qclass, int) or isinstance(qclass, bool):
+        raise ConfigError("c must be int")
+    if not 0 <= qclass <= 0xFFFF:
+        raise ConfigError("c out of range")
+    if not isinstance(rr_items, list):
+        raise ConfigError("rr must be list")
+    if kind == "p":
+        if not rr_items:
+            raise ConfigError("p rr must be non-empty")
+    elif len(rr_items) != 1:
+        raise ConfigError("nx/nd rr must contain exactly one SOA")
+    rrs = []
+    for rr in rr_items:
+        if not isinstance(rr, dict):
+            raise ConfigError("rr entry must be an object")
+        if list(rr.keys()) != _REC_RR_KEYS:
+            raise ConfigError("rr keys must be n,t,c,ttl,d")
+        # RR 字段值域错误统一为 RecordError：load_rec 仅 text/now 类型错
+        # 抛 TypeError，故先于 _validate_rr 排除非整数与 bool。
+        for field in ("n", "d"):
+            if not isinstance(rr[field], str):
+                raise RecordError(field + " must be str")
+        for field in ("t", "c", "ttl"):
+            if not isinstance(rr[field], int) or isinstance(rr[field], bool):
+                raise RecordError(field + " must be int")
+        dtext = rr["d"]
+        if (len(dtext) % 2
+                or any(ch not in _LOWER_HEXDIGITS for ch in dtext)):
+            raise RecordError("d must be even-length lowercase hex")
+        # 名称、type/class/ttl 范围、rdata 长度沿用统一 RR 值域校验。
+        rrs.append(_validate_rr({
+            "name": rr["n"], "type": rr["t"], "class": rr["c"],
+            "ttl": rr["ttl"], "rdata": bytes.fromhex(dtext),
+        }))
+    # q 为非 RR 字段：其名值域错误归 ConfigError（接受大写并规范小写，
+    # 与 RR 名称的规范化一致）。
+    try:
+        canonical = _labels_to_name(_normalize_name(qname))
+    except RecordError:
+        raise ConfigError("q must be a lowercase absolute name") from None
+    if kind != "p":
+        if rrs[0][1] != _TYPE_SOA:
+            raise RecordError("nx/nd rr must be a SOA record")
+        minimum = _parse_soa_minimum(rrs[0][4])
+        if minimum is None:
+            raise RecordError("soa rdata must be two names and five uint32")
+        # 文本 ttl 即负缓存剩余值（必为正）且不大于 SOA minimum：缓存条目
+        # 恒有 neg_ttl=min(soa_ttl, minimum)，故该不变式必成立。
+        if rrs[0][3] <= 0 or rrs[0][3] > minimum:
+            raise RecordError("negative ttl must be a positive remaining value")
+        # nx 的 qtype 占位为 None（键匹配任意类型）；nd 保留其 qtype。
+        return kind, canonical, (None if kind == "nx" else qtype), qclass, rrs
+    # 正项各 RR 的 ttl 为剩余正整数。
+    if any(rr[3] <= 0 for rr in rrs):
+        raise RecordError("p rr ttl must be positive")
+    return kind, canonical, qtype, qclass, rrs
+
+
 class Resolver:
     """权威缓存与上游转发组合的解析器。
 
@@ -2329,6 +2476,25 @@ class Resolver:
     修订号，保留递归缓存、时钟、plan 与统计（提交当下 stats() 逐字节
     不变）；version 为操作后修订号，result 为 "applied"、"unchanged"
     或 "conflict"。
+
+    dump_rec(now)：只读导出递归正/负缓存，输出顶层键序 v,clock,items
+    的紧凑 ASCII JSON（v=1、clock=now、末尾单换行）。items 依 FIFO
+    插入顺序、至多 256 项，仅含在 now 剩余为正的有效条目（到期项不写
+    出但保留在内部状态）；项键序 k,q,t,c,rr，k 为 "p"/"nx"/"nd"，q
+    为小写绝对名，nx 的 t 为 null，其余 t/c 为 uint16；rr 元素键序
+    n,t,c,ttl,d，沿用统一 RR 值域，d 为偶长小写十六进制。p 的 rr 非
+    空且 ttl 为各 RR 在 now 的剩余正整数；nx/nd 恰一条 SOA，其 ttl
+    为负缓存在 now 的剩余值。now 非 int 或为 bool 抛 TypeError；
+    now<0 或早于上次成功结束时刻抛 CacheError；不改任何状态。
+
+    load_rec(text, now)：先完整校验再按 elapsed=now-clock 衰减，丢弃
+    到期项（正项任一 RR 剩余<=0 或负缓存剩余<=0），随后原子替换递归
+    正缓存、负缓存与 FIFO（保留项按文本顺序），置成功时刻为 now，返回
+    保留数；stats 与 x/v 清理累计不变。text 非 str 或 now 非 int/为
+    bool 抛 TypeError；text 超 1048576 码点、JSON 解析、重复键、键
+    序、非 RR 字段、非空数量或重复缓存键错抛 ConfigError；now 负、
+    回退或小于 clock 抛 CacheError；名称、值域、SOA/rdata 等 RR 错误
+    抛 RecordError。任何失败均无副作用；同态同参逐字节一致。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -2687,6 +2853,138 @@ class Resolver:
             tag, oldest = self._rec_order.popleft()
             del (self._rec_pos if tag == "pos" else self._rec_neg)[oldest]
             self._clean_evicted[1] += 1  # 容量 FIFO 淘汰
+
+    def dump_rec(self, now: int) -> str:
+        """导出递归正/负缓存为确定性只读文本（紧凑 ASCII JSON，末尾换行）。
+
+        顶层键序仅 v,clock,items：v 恒为 1，clock 取本次 now；items 按
+        FIFO 插入顺序至多 256 项，项键序 k,q,t,c,rr。k 为 "p"/"nx"/"nd"；
+        q 为小写绝对名；nx 的 t 为 null，其余 t、c 为 0..65535 整数。
+        p 的 rr 非空，ttl 为各 RR 在 now 的剩余正整数；nx/nd 恰一条
+        SOA，其 ttl 为负缓存在 now 的剩余正值（rcode 由 k 隐含）；rr
+        元素键序 n,t,c,ttl,d，d 为偶长小写十六进制。只读：不改变缓存、
+        FIFO、时钟或统计，同状态同参逐字节一致。now 非 int 或为 bool 抛
+        TypeError；now<0 或早于上次成功结束时刻抛 CacheError。
+        """
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        items = []
+        for tag, key in self._rec_order:
+            value = (self._rec_pos if tag == "pos" else self._rec_neg)[key]
+            # 只写在 now 仍有效（剩余为正）的条目；到期项保留在内部状态中
+            # （只读不清理），但不进入文本，其 FIFO 相对次序由保留项维持。
+            if tag == "pos":
+                if now - value[0] >= min(rr[3] for rr in value[1]):
+                    continue
+            elif now - value[0] >= value[3]:
+                continue
+            items.append(_rec_dump_item(tag, key, value, now))
+        config = {"v": 1, "clock": now, "items": items}
+        return json.dumps(config, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+
+    def load_rec(self, text: str, now: int) -> int:
+        """校验并按 now-clock 衰减恢复递归正/负缓存，返回保留条目数。
+
+        文本契约同 dump_rec：先完整解析与校验（任何失败均不改变解析器），
+        再以 elapsed=now-clock 衰减，丢弃到期项，随后原子替换递归正缓存、
+        负缓存与 FIFO 并把成功时刻置为 now。p 项各 RR 剩余 ttl-elapsed
+        均为正才保留；nx/nd 的剩余值为文本 SOA ttl-elapsed，正才保留；
+        保留项按文本顺序组成新 FIFO（容量必不超过 256）。stats 统计与
+        x/v 清理累计均不变。text 非 str 或 now 非 int/为 bool 抛
+        TypeError；text 超 1048576 码点、JSON 解析、重复键、键序、非 RR
+        字段或重复缓存键错误抛 ConfigError；now 负、回退（早于上次成功
+        结束时刻）或小于 clock 抛 CacheError；名称、值域、SOA/rdata 等
+        RR 错误抛 RecordError。同态同参逐字节一致。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if len(text) > _MAX_REC_TEXT_LEN:
+            raise ConfigError("rec dump exceeds 1048576 code points")
+        try:
+            config = json.loads(text, object_pairs_hook=_config_pairs)
+        except json.JSONDecodeError:
+            raise ConfigError("invalid JSON") from None
+        if not isinstance(config, dict):
+            raise ConfigError("config must be an object")
+        if list(config.keys()) != _REC_DUMP_KEYS:
+            raise ConfigError("config keys must be v,clock,items")
+        version = config["v"]
+        clock = config["clock"]
+        items = config["items"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ConfigError("v must be int")
+        if version != 1:
+            raise ConfigError("unsupported v")
+        if not isinstance(clock, int) or isinstance(clock, bool):
+            raise ConfigError("clock must be int")
+        if clock < 0:
+            raise ConfigError("clock must be non-negative")
+        if not isinstance(items, list):
+            raise ConfigError("items must be list")
+        if len(items) > _CACHE_CAPACITY:
+            raise ConfigError("items must contain at most 256 entries")
+        parsed = [_rec_load_item(item) for item in items]
+        # 重复缓存键属校验阶段：在时钟判定与衰减前对全部项求键查重，
+        # 即使重复项之后会到期也抛 ConfigError（"校验后"才衰减丢弃）。
+        seen_pos = set()
+        seen_neg = set()
+        keys = []
+        for kind, qname, qtype, qclass, _rrs in parsed:
+            if kind == "p":
+                cache_key = ("p", qname, qtype, qclass)
+                bucket = seen_pos
+            elif kind == "nx":
+                cache_key = ("neg", "nxdomain", qname, qclass)
+                bucket = seen_neg
+            else:
+                cache_key = ("neg", "nodata", qname, qtype, qclass)
+                bucket = seen_neg
+            if cache_key in bucket:
+                raise ConfigError("duplicate cache key")
+            bucket.add(cache_key)
+            keys.append(cache_key)
+        # 时钟判定在全部结构、RR 与重复键校验之后：校验失败只抛
+        # ConfigError/RecordError，绝不触及 CacheError 路径，也无副作用。
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        if now < clock:
+            raise CacheError("now must not be earlier than clock")
+        elapsed = now - clock
+        pos_entries = {}
+        neg_entries = {}
+        order = deque()
+        for (kind, qname, qtype, qclass, rrs), cache_key in zip(parsed, keys):
+            if kind == "p":
+                pos_key = cache_key[1:]
+                aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                        for labels, rrtype, rrclass, ttl, rdata in rrs]
+                # 到期（含恰为 0）即丢弃：与缓存查找的 elapsed < min_ttl 一致。
+                if not all(rr[3] > 0 for rr in aged):
+                    continue
+                pos_entries[pos_key] = (now, aged)
+                order.append(("pos", pos_key))
+                continue
+            soa = rrs[0]
+            remaining = soa[3] - elapsed  # 负缓存剩余值
+            if remaining <= 0:
+                continue
+            neg_key = cache_key[1:]
+            rcode = _RCODE_NXDOMAIN if kind == "nx" else 0
+            aged_soa = (soa[0], soa[1], soa[2], remaining, soa[4])
+            neg_entries[neg_key] = (now, rcode, aged_soa, remaining)
+            order.append(("neg", neg_key))
+        # 全部构建成功后原子提交：仅替换递归缓存、FIFO 与成功时刻，
+        # stats 与 x/v 清理累计保持不变。
+        self._rec_pos = pos_entries
+        self._rec_neg = neg_entries
+        self._rec_order = order
+        self._last_end = now
+        return len(order)
 
     def resolve_recursive(self, query: bytes, levels, now: int,
                           limit: int = 512) -> tuple[bytes, str, int, bool]:
