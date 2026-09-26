@@ -68,6 +68,11 @@
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
+  cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
+  （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
+  p,nx,nd,total,capacity,ttl，ttl 为同顺序三类最小剩余 TTL（无条目
+  为 -1），x、v 为 [权威,递归] 的成功解析到期删除数与 FIFO 淘汰数；
+  reset=True 先返回旧快照再清零 x、v，保留缓存、FIFO、时钟及统计；
   reload_zone(text) 原子换区并返回从 0 递增的修订号（stats() 不变，
   c[0] 于下次解析提交时同步）；
   reload_zone_tx(text, expected) 带修订号检查的原子换区事务，返回
@@ -1380,7 +1385,9 @@ class PositiveCache:
     resolve 成功返回时原子提交，任何异常均不改变它们；检测到期后编码
     失败不计 x，截断不改分类，命中不重排 FIFO。reset 非 bool 抛
     TypeError 且无变化；False 重复读取逐字节相同；True 先返回旧快照再
-    清零 h、m、x，保留缓存、FIFO、时钟与 k。
+    清零 h、m、x，保留缓存、FIFO、时钟与 k。另有仅供 Resolver 在成功
+    解析后折叠的清理事件累计（成功到期删除数、FIFO 淘汰数）：它们不在
+    stats() 的 JSON 中，也不随 stats(reset=True) 清零。
     """
 
     def __init__(self, zone: dict):
@@ -1399,6 +1406,12 @@ class PositiveCache:
         self._stats_h = [0, 0, 0]
         self._stats_m = [0, 0, 0, 0]
         self._stats_x = 0
+        # 清理事件累计（供 Resolver.cache_stats 读取，不属 stats() 的
+        # JSON）：clean_expired 计成功解析实际删除的到期条目，
+        # clean_evicted 计容量满时的 FIFO 淘汰；二者仅随成功缓存变更
+        # 原子提交，stats(reset=True) 不清零。
+        self._clean_expired = 0
+        self._clean_evicted = 0
 
     def _negative_entry(self, key, rcode, an, ns, now):
         """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。"""
@@ -1546,8 +1559,10 @@ class PositiveCache:
         if len(self._order) > _CACHE_CAPACITY:
             tag, oldest = self._order.popleft()  # 满时淘汰最早插入者
             del (self._entries if tag == "pos" else self._neg_entries)[oldest]
+            self._clean_evicted += 1  # 容量 FIFO 淘汰，随成功原子提交
         if expired is not None:
             self._stats_x += 1  # 本次成功 resolve 实际删除的到期条目
+            self._clean_expired += 1
         self._stats_m[m_index] += 1
         self._last_now = now
         return response, False
@@ -1848,6 +1863,51 @@ def _ratio_six(p, q):
     return "{}.{:06d}".format(quotient // 10**6, quotient % 10**6)
 
 
+def _min_remaining_ttl(entries, now, negative):
+    """该类全部条目的最小剩余 TTL（下限 0），无条目为 -1。
+
+    正条目值为 (插入时刻, 规范化 an)，负条目值为
+    (插入时刻, rcode, SOA, 负 TTL)；正条目剩余值为
+    max(0, 插入时刻 + RR 最小 TTL - now)，负条目以负 TTL 同算。
+    读取不清除到期项，故到期条目贡献 0。
+    """
+    remaining = -1
+    for value in entries.values():
+        inserted = value[0]
+        ttl = value[3] if negative else min(rr[3] for rr in value[1])
+        current = max(0, inserted + ttl - now)
+        if remaining < 0 or current < remaining:
+            remaining = current
+    return remaining
+
+
+def _cache_watermark(pos_entries, neg_entries, order, now):
+    """按 a/r 键序 p,nx,nd,total,capacity,ttl 构造缓存水位片段。
+
+    前三项为正缓存、NXDOMAIN、NODATA 条目数，total 为合计，capacity
+    固定 256；ttl 为同顺序三整数，各取该类最小剩余 TTL，无条目为 -1。
+    """
+    nx_keys = [key for key in neg_entries if key[0] == "nxdomain"]
+    nx_entries = {key: neg_entries[key] for key in nx_keys}
+    nd_entries = {key: neg_entries[key] for key in neg_entries
+                  if key[0] != "nxdomain"}
+    nx_count = len(nx_entries)
+    nd_count = len(nd_entries)
+    pos_count = len(pos_entries)
+    ttl_pos = _min_remaining_ttl(pos_entries, now, False)
+    ttl_nx = _min_remaining_ttl(nx_entries, now, True)
+    ttl_nd = _min_remaining_ttl(nd_entries, now, True)
+    return (
+        '{"p":' + str(pos_count)
+        + ',"nx":' + str(nx_count)
+        + ',"nd":' + str(nd_count)
+        + ',"total":' + str(len(order))
+        + ',"capacity":' + str(_CACHE_CAPACITY)
+        + ',"ttl":[' + str(ttl_pos) + "," + str(ttl_nx) + ","
+        + str(ttl_nd) + "]}"
+    )
+
+
 class Resolver:
     """权威缓存与上游转发组合的解析器。
 
@@ -1924,6 +1984,19 @@ class Resolver:
     stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
     换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
     同步），参数/计划/编码/时钟异常不更新，耗尽不改缓存与最后时刻。
+
+    cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
+    的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
+    p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
+    数，total 为合计，capacity 固定 256；ttl 为同顺序三整数，各取该类
+    最小剩余 TTL（正条目 = max(0, 插入时刻 + RR 最小 TTL - now)，负条目
+    以负 TTL 同算），无条目为 -1，读取不清除到期项。x、v 为 [权威,递归]
+    非负整数数组，累计构造或重置后成功解析实际删除的到期条目数与容量
+    FIFO 淘汰数；换区、更新、回滚的清空不计，既有累计随这些操作保留，
+    计数随成功缓存变更原子提交。now 非 int 或为 bool、reset 非 bool 抛
+    TypeError；now<0 或早于上次成功结束时刻抛 CacheError，均无副作用。
+    reset=False 只读；True 先返回按 now 计算的旧快照再清零 x、v，保留
+    缓存、FIFO、时钟及统计；同参逐字节一致。
 
     reload_zone(text)：导入 v0/v1/v2 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
@@ -2041,6 +2114,11 @@ class Resolver:
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
+        # cache_stats 的清理事件累计：[权威, 递归] 各两个非负整数，依次为
+        # 成功解析实际删除的到期条目数与容量 FIFO 淘汰数；换区、更新、
+        # 回滚的清空不计。权威缓存被替换时其已提交事件经 fold 保留。
+        self._clean_expired = [0, 0]
+        self._clean_evicted = [0, 0]
         self._revision = 0  # 当前区域修订号；成功换区/回滚后加 1，不复用
         # 修订历史：修订号 -> 规范化区域深拷贝。构造时初始区域存为
         # 修订 0，仅成功换区/回滚按新修订号归档；容量 32，超量淘汰
@@ -2058,6 +2136,7 @@ class Resolver:
         if _name_in_origin(question, origin, self._cache._zone_class):
             expired = self._authority_miss_expired(question, now)
             response, hit = self._cache.resolve(query, now, limit)
+            self._fold_authority_cleanup()
             if hit:
                 self._stats_h[0] += 1
             else:
@@ -2271,6 +2350,19 @@ class Resolver:
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
         self._stats_c0 = len(self._cache._order)
 
+    def _fold_authority_cleanup(self):
+        """把权威缓存自上次折叠以来的清理事件并入解析器累计。
+
+        权威缓存仅在成功解析时提交其到期删除与 FIFO 淘汰计数，此处紧随
+        成功的 _cache.resolve 折叠，故编码或上游异常不会带入事件；换区
+        替换缓存时新缓存自 0 起计，历史已折叠部分继续保留。
+        """
+        cache = self._cache
+        self._clean_expired[0] += cache._clean_expired
+        self._clean_evicted[0] += cache._clean_evicted
+        cache._clean_expired = 0
+        cache._clean_evicted = 0
+
     def _authority_miss_expired(self, question, now):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
         cache = self._cache
@@ -2323,12 +2415,14 @@ class Resolver:
     def _store_recursive_terminal(self, question, now, rcode, an, ns, expired):
         """终态按 PositiveCache 规则写入递归缓存（容量 256、FIFO）。
 
-        先清理到期旧条目（编码已成功），再按正/负规则写入并按需淘汰。
+        先清理到期旧条目（编码已成功），再按正/负规则写入并按需淘汰；
+        到期删除与 FIFO 淘汰各累计入递归清理事件计数。
         """
         if expired is not None:
             tag, ekey = expired
             del (self._rec_pos if tag == "pos" else self._rec_neg)[ekey]
             self._rec_order.remove(expired)
+            self._clean_expired[1] += 1  # 成功解析实际删除的到期条目
         key = (question["name"], question["type"], question["class"])
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
             self._rec_pos[key] = (now, an)
@@ -2343,6 +2437,7 @@ class Resolver:
         if len(self._rec_order) > _CACHE_CAPACITY:
             tag, oldest = self._rec_order.popleft()
             del (self._rec_pos if tag == "pos" else self._rec_neg)[oldest]
+            self._clean_evicted[1] += 1  # 容量 FIFO 淘汰
 
     def resolve_recursive(self, query: bytes, levels, now: int,
                           limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -2365,6 +2460,7 @@ class Resolver:
             # 域内沿用 resolve：经权威正/负缓存应答，source 为 "authority"。
             expired = self._authority_miss_expired(question, now)
             response, hit = self._cache.resolve(query, now, limit)
+            self._fold_authority_cleanup()
             if hit:
                 self._stats_h[0] += 1
             else:
@@ -2933,6 +3029,52 @@ class Resolver:
             + ',"l":[' + ",".join(map(str, elapsed_buckets)) + "]"
             + ',"r":' + _ratio_six(sum(h), sum(h) + m) + "}\n"
         )
+
+    def cache_stats(self, now: int, reset: bool = False) -> str:
+        """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
+
+        a、r 分别为权威、递归缓存，键序均为 p,nx,nd,total,capacity,ttl：
+        前三项为正缓存、NXDOMAIN、NODATA 条目数，total 为合计，capacity
+        固定 256；ttl 为同顺序三整数，各取该类最小剩余 TTL，无条目为
+        -1。正条目剩余值 = max(0, 插入时刻 + RR 最小 TTL - now)，负条目
+        以负 TTL 同算；读取不清除到期项。x、v 各为 [权威, 递归] 非负
+        整数数组，分别累计自构造或重置后成功解析实际删除的到期条目数、
+        容量 FIFO 淘汰数；换区、更新、回滚的清空不计。计数随成功缓存
+        变更原子提交，编码或上游异常不改变它们。
+
+        now 非 int 或为 bool、reset 非 bool 抛 TypeError；now<0 或早于
+        上次成功结束时刻抛 CacheError，均无副作用。reset=False 只读；
+        True 先返回按 now 计算的旧计数快照，再清零 x、v，保留缓存、
+        FIFO、时钟及统计。同参逐字节一致。
+        """
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        authority = _cache_watermark(
+            self._cache._entries, self._cache._neg_entries,
+            self._cache._order, now)
+        recursive = _cache_watermark(
+            self._rec_pos, self._rec_neg, self._rec_order, now)
+        text = (
+            '{"a":' + authority
+            + ',"r":' + recursive
+            + ',"x":[' + str(self._clean_expired[0]) + ","
+            + str(self._clean_expired[1]) + "]"
+            + ',"v":[' + str(self._clean_evicted[0]) + ","
+            + str(self._clean_evicted[1]) + "]}\n"
+        )
+        if reset:
+            # 先返回按 now 计算的旧快照再清零；缓存、FIFO、时钟与统计保留。
+            self._clean_expired = [0, 0]
+            self._clean_evicted = [0, 0]
+            # 权威缓存尚未折叠的待并入事件一并归零（成功解析后已同步折叠，
+            # 此处通常为 0），保证重置后仅累计新发生的清理事件。
+            self._cache._clean_expired = 0
+            self._cache._clean_evicted = 0
+        return text
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
