@@ -33,6 +33,11 @@
   成功返回 (应答报文, 上游名, 结束时刻)。
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
+  resolve_authorized(query, client, rules, now, limit=512, default="deny")
+  先按授权规则判定再解析，放行行为同 resolve，拒绝返回
+  (拒绝应答, "policy", now, False)（flags=0x8400|(flags&0x7910)|5，
+  QDCOUNT=1，其余计数为 0，超 limit 抛 EncodeError），拒绝与失败均
+  不改变区域、缓存、FIFO、时钟或统计；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
@@ -1089,6 +1094,34 @@ def _encode_plan_edns(query, rcode, an, ns, limit):
     return edns(query, model, rcode)
 
 
+def _encode_policy_refusal(query, limit):
+    """把单问题查询编码为授权拒绝应答（RCODE=5，三段为空）。
+
+    ID 保留，问题按规范化 qname/qtype/qclass 重编码；flags 为
+    QR|AA|(查询 flags 的 opcode/RD/CD 位)|REFUSED，QDCOUNT=1，
+    ANCOUNT/NSCOUNT/ARCOUNT 均为 0（不回显 OPT）。仅头部与问题超
+    limit 抛 EncodeError，其余报文非法已由调用方校验排除。
+    """
+    _check_int(limit, "limit")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    msg = decode_query(query)
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    flags = (_FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+             | _RCODE_REFUSED)
+    out += flags.to_bytes(2, "big")
+    out += (1).to_bytes(2, "big")
+    out += (0).to_bytes(6)  # ANCOUNT/NSCOUNT/ARCOUNT 均为 0
+    _write_name(out, _normalize_name(msg["questions"][0]["name"]), {})
+    question = msg["questions"][0]
+    out += question["type"].to_bytes(2, "big")
+    out += question["class"].to_bytes(2, "big")
+    if len(out) > limit:
+        raise EncodeError("header and question exceed limit")
+    return bytes(out)
+
+
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
     """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
     msg = decode_query(query)  # MessageError/TypeError 原样传播
@@ -1299,11 +1332,12 @@ class PositiveCache:
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     任何失败（含编码失败）都不改变条目与时钟状态。
 
-    resolve_edns(query, now, limit=65535) 处理含一个 OPT 的单问题查询：
-    报文解码与 OPT 校验沿用 edns 契约（未压缩根 owner、TYPE41、
-    CLASS512..65535、扩展码与版本 0、flags 仅 DO、选项 TLV 校验），
-    QDCOUNT 非 1 或 QR 置位抛 EncodeError，其余报文/OPT 非法抛
-    EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
+    resolve_edns(query, now, limit=65535) 处理恰含一个合法 OPT 的单问题
+    查询：查缓存前须恰有一个合法 OPT，OPT 缺失（ARCOUNT=0）、非法或
+    尾随字节均抛 EDNSError；报文解码与 OPT 校验沿用 edns 契约（未压缩
+    根 owner、TYPE41、CLASS512..65535、扩展码与版本 0、flags 仅 DO、
+    选项 TLV 校验），QDCOUNT 非 1 或 QR 置位抛 EncodeError，其余报文
+    非法抛 EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
     resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
     权威计划以 edns 语义编码：上限为 min(limit, OPT CLASS)，RCODE 取
     计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本及 RDLENGTH 为
@@ -1378,8 +1412,9 @@ class PositiveCache:
         """处理含一个 OPT 的单问题查询，返回 (应答报文, 是否命中)。
 
         query 非 bytes 抛 TypeError；QDCOUNT 非 1 或 QR 置位抛
-        EncodeError；其余报文/OPT 非法沿用 edns 契约抛 EDNSError。
-        now、limit 非 int 或为 bool 抛 TypeError；now 为负或回退抛
+        EncodeError；其余报文非法及 OPT 缺失（ARCOUNT=0）、OPT 非法或
+        尾随字节沿用 edns 契约抛 EDNSError，即查缓存前须恰有一个合法
+        OPT。now、limit 非 int 或为 bool 抛 TypeError；now 为负或回退抛
         CacheError；limit 不在 12..65535 抛 EncodeError。缓存键、正负
         缓存、TTL 衰减、FIFO、命中与统计和 resolve 完全共享（键忽略
         OPT、ID、flags 与 limit）；应答按同一权威计划以 edns 语义编码，
@@ -1398,8 +1433,12 @@ class PositiveCache:
                 or int.from_bytes(query[4:6], "big") != 1
                 or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
             raise EncodeError("query or limit not answerable")
-        # 长度与 QDCOUNT 已预检，其余报文/OPT 非法均为 EDNSError。
-        msg, _opt = _decode_edns_query(query)
+        # 长度、QDCOUNT 与可应答性已预检；EDNS 查询查缓存前须恰有一个
+        # 合法 OPT：opt 为 None（缺失）、OPT 非法或尾随字节均为
+        # EDNSError（_decode_edns_query 对其余非法已统一抛 EDNSError）。
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
         return self._resolve_cached(msg, query, now, limit,
                                     _encode_plan_edns)
 
@@ -1795,6 +1834,15 @@ class Resolver:
     调用 forward，返回 (应答报文, 上游名, 结束时刻, False)，转发结果
     不缓存。
 
+    resolve_authorized(query, client, rules, now, limit=512,
+    default="deny")：授权匹配、TypeError 与 PolicyError 沿用 authorize，
+    其余校验及异常沿用 resolve，全部校验通过后方可改变状态。放行时
+    行为等同 resolve。拒绝时不访问上游，返回
+    (应答, "policy", now, False)，应答保留 ID 并重编码问题，flags 为
+    0x8400|(查询 flags&0x7910)|5，QDCOUNT=1，其余计数为 0；超 limit
+    抛 EncodeError。拒绝与任何失败都不改变区域、正/负缓存、FIFO、递归
+    缓存、时钟或统计。
+
     resolve_recursive(query, levels, now, limit=512)：域内查询沿用
     resolve；域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、FIFO
     同 PositiveCache），命中返回 (应答报文, "cache", now, True)，未命中
@@ -1966,6 +2014,35 @@ class Resolver:
         self._sync_stats_c0()
         self._last_end = end
         return reply, name, end, False
+
+    def resolve_authorized(self, query: bytes, client: str, rules: list,
+                           now: int, limit: int = 512,
+                           default: str = "deny"
+                           ) -> tuple[bytes, str, int, bool]:
+        """先按授权规则判定，再以 resolve 语义解析。
+
+        授权匹配与规则、client、default 的 TypeError 及 PolicyError 沿用
+        authorize（规则全部校验通过后才解码 query）；query、now、limit
+        的其余校验及异常沿用 resolve（含时钟以上次成功结束时刻为准的
+        单调性）；全部校验完成前不得改变任何状态。放行时行为与 resolve
+        完全相同（权威缓存或上游转发，返回其来源、结束时刻与命中标记）。
+        拒绝时不访问上游，返回 (拒绝应答, "policy", now, False)：应答
+        保留 query 的 ID 并重编码问题段，flags 为
+        0x8400|(查询 flags & 0x7910)|5，QDCOUNT=1，
+        ANCOUNT/NSCOUNT/ARCOUNT 均为 0（不回显 OPT）；仅头部与问题超
+        limit 抛 EncodeError。拒绝应答编码失败或任何校验异常均不改变
+        区域、正/负缓存、FIFO、递归缓存、时钟与统计；拒绝本身也不更新
+        时钟与统计。同初态同调用序列逐字节一致。
+        """
+        # 授权优先：其 TypeError、PolicyError 与报文/可应答性异常原样传播。
+        allowed = authorize(query, client, rules, default)
+        # 其余入参、时钟与 limit 校验完全沿用 resolve；此处不产生状态变更。
+        _check_resolve_inputs(query, now, limit, self._last_end)
+        if allowed:
+            return self.resolve(query, now, limit)
+        # 拒绝：先编码成功（超 limit 抛 EncodeError），且不改任何状态。
+        response = _encode_policy_refusal(query, limit)
+        return response, "policy", now, False
 
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
