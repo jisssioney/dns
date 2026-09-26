@@ -122,8 +122,9 @@
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
-  上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
-  rollback/rollback_batch/update/cache_stats 操作并记录为紧凑 ASCII JSON
+  上依次回放 reload/reload_tx/migrate/migrate_tx/restore_zones/
+  resolve/recursive/rollback/rollback_batch/update/cache_stats 操作
+  并记录为紧凑 ASCII JSON
   （末尾单换行）；ops 限 0..4096 项，结果上限 16777216 字节。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
@@ -3594,7 +3595,9 @@ def _validate_ops(ops):
     op,text,expected 且 op 为 "reload_tx"、text 为 str、expected 为非负
     非 bool int；migrate 键序 op,text 且 op 为 "migrate"，text 为
     1..1048576 码点的 str；migrate_tx 键序 op,text,expected 且 op 为
-    "migrate_tx"，text 长度同 migrate，expected 同 reload_tx；resolve
+    "migrate_tx"，text 长度同 migrate，expected 同 reload_tx；
+    restore_zones 键序 op,text,expected 且 op 为 "restore_zones"，
+    text 长度同 migrate，expected 同 reload_tx；resolve
     键序 op,query,now,limit 且 op 为 "resolve"、query 为偶长小写十六
     进制、now/limit 为非 bool int；recursive 键序
     op,query,levels,now,limit 且 op 为 "recursive"，query 为偶长小写
@@ -3628,7 +3631,7 @@ def _validate_ops(ops):
         if keys == _REPLAY_RELOAD_KEYS:
             valid_names = ("reload", "migrate")
         elif keys == _REPLAY_RELOAD_TX_KEYS:
-            valid_names = ("reload_tx", "migrate_tx")
+            valid_names = ("reload_tx", "migrate_tx", "restore_zones")
         elif keys == _REPLAY_RESOLVE_KEYS:
             valid_names = ("resolve",)
         elif keys == _REPLAY_RECURSIVE_KEYS:
@@ -3776,12 +3779,12 @@ def _validate_ops(ops):
         else:
             if not isinstance(op["text"], str):
                 raise ReplayError("text must be str")
-            if kind in ("migrate", "migrate_tx"):
+            if kind in ("migrate", "migrate_tx", "restore_zones"):
                 # len() 按 Unicode 码点计数；配置文本不得为空。
                 if not 1 <= len(op["text"]) <= _MAX_MIGRATE_TEXT_LEN:
                     raise ReplayError(
                         "text must contain 1..1048576 code points")
-            if kind in ("reload_tx", "migrate_tx"):
+            if kind in ("reload_tx", "migrate_tx", "restore_zones"):
                 expected = op["expected"]
                 if not isinstance(expected, int) or isinstance(expected, bool):
                     raise ReplayError("expected must be int")
@@ -3794,11 +3797,13 @@ def _validate_ops(ops):
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
-    resolve/recursive/rollback/rollback_batch/update/cache_stats 操作，返回记录的紧凑 JSON。
+    restore_zones/resolve/recursive/rollback/rollback_batch/update/
+    cache_stats 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 限 0..4096 项，
     超量或操作项、键序、op 名或字段类型/内容错误（含 recursive 的 levels
-    层级结构、RR 与十六进制形式、migrate/migrate_tx 的 text 码点长度、
+    层级结构、RR 与十六进制形式、migrate/migrate_tx/restore_zones 的
+    text 码点长度、
     rollback 的 target/expected、rollback_batch 的 expected/steps 及其
     reload/rollback 步、update 的 changes/serial/expected 及其项结构、
     记录语义与十六进制、cache_stats 的 now/reset）均在创建 Resolver 前
@@ -3811,7 +3816,14 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     ok,version,result,text，先比较修订号，冲突时不解析 text，result
     为 "conflict" 且 text 为 null，相等时先迁移校验再按 reload_zone_tx
     原子换区，result 为 "applied"/"unchanged"，text 为规范 v2 文本
-    （版本、缓存语义沿用 reload_zone_tx）；resolve 与 recursive 键序
+    （版本、缓存语义沿用 reload_zone_tx）；restore_zones 键序
+    ok,version,result，先比较修订号，冲突时不解析 text，result 为
+    "conflict"；相等时按 migrate_zones 与 load_zones 契约校验
+    schema=0/1 历史并构造候选，候选规范化导出与当前 dump_zones()
+    相同为 "unchanged"（状态不变），不同则候选 version 须大于当前
+    修订号（违反抛 ConfigError），applied 原子替换区域、历史与修订
+    号并清权威缓存，保留递归缓存、时钟、plan 与统计，其余结果或
+    异常无副作用（后续操作可见已提交项）；resolve 与 recursive 键序
     ok,response,source,end,hit，response 为小写十六进制；rollback 键序
     ok,version,result,target，先比较修订号，版本不符为 conflict 且不查
     历史，target 为当前版为 unchanged、未保留为 missing、命中为
@@ -3875,6 +3887,34 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                         resolver.reload_zone_tx(migrated, op["expected"]))
                     out = {"ok": True, "version": report["version"],
                            "result": report["result"], "text": migrated}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "restore_zones":
+            try:
+                if op["expected"] != resolver._revision:
+                    # 冲突：不解析 text，version 为当前修订号。
+                    out = {"ok": True, "version": resolver._revision,
+                           "result": "conflict"}
+                else:
+                    # 相等：按 load_zones（schema 0/1 历史）校验整份
+                    # 快照并构造候选；失败原样记异常且无任何状态副作用。
+                    candidate = Resolver.load_zones(
+                        op["text"], resolver._plan, resolver._timeout)
+                    if candidate.dump_zones() == resolver.dump_zones():
+                        # 规范化结果与当前一致：不换区、不改版本。
+                        out = {"ok": True, "version": resolver._revision,
+                               "result": "unchanged"}
+                    else:
+                        if candidate._revision <= resolver._revision:
+                            raise ConfigError(
+                                "text version must be greater than current")
+                        # 原子提交：区域、历史与修订号一并替换，权威缓存
+                        # 随候选清空；递归缓存、时钟、plan 与统计保留。
+                        resolver._cache = candidate._cache
+                        resolver._revision = candidate._revision
+                        resolver._zone_history = candidate._zone_history
+                        out = {"ok": True, "version": resolver._revision,
+                               "result": "applied"}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         elif kind == "resolve":
