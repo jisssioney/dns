@@ -3,7 +3,7 @@
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
 - EDNSError: EDNS 查询截断、尾随、名字非法、AN/NS 非空或 AR/OPT
-  非法、模型含 OPT（MessageError 子类）。
+  （含 OPT 选项 TLV）非法、模型含 OPT（MessageError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
@@ -14,8 +14,8 @@
 - PolicyError: 授权规则数量、键序或字段值非法（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
-- edns(query: bytes, model: dict, rcode: int = 0) -> bytes: 编码可含
-  OPT 的查询的 EDNS 应答报文。
+- edns(query: bytes, model: dict, rcode: int = 0, options: list | None = None)
+  -> bytes: 编码可含 OPT（查询 RDATA 按选项 TLV 解析）的 EDNS 应答报文。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -82,7 +82,7 @@ class MessageError(ValueError):
 
 
 class EDNSError(MessageError):
-    """EDNS 报文无法解码：AR/OPT 非法、截断、尾随或模型含 OPT。"""
+    """EDNS 报文无法解码：AR/OPT（含选项 TLV）非法、截断、尾随或模型含 OPT。"""
 
 
 class ZoneError(ValueError):
@@ -309,13 +309,15 @@ def decode_query(data: bytes) -> dict:
 
 
 def _decode_edns_query(data):
-    """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do) 或 None)。
+    """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do, opts) 或 None)。
 
     问题段解码契约同 decode_query，但查询截断（问题区越界）、非法名字
     （含压缩问题）、AN/NS 非空、非法 AR/OPT 与尾随字节一律抛
     EDNSError；报文长度与问题数等其余错误仍抛 MessageError。AR 限 0 或
     1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、扩展码/
-    版本 0、flags 仅 DO、RDLENGTH0 的 OPT。
+    版本 0、flags 仅 DO 的 OPT。OPT 的 RDATA 按选项 TLV 解析：每项为
+    网络序 uint16 code、uint16 length、length 字节 data，重复项保序；
+    头或数据截断、RDLENGTH 内残缺抛 EDNSError。
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -370,9 +372,21 @@ def _decode_edns_query(data):
             raise EDNSError("opt extended rcode and version must be 0")
         if ttl & 0xFFFF & ~_FLAG_DO:
             raise EDNSError("opt flags must be DO only")
-        if rdlength:
-            raise EDNSError("opt rdlength must be 0")
-        opt = (rrclass, bool(ttl & _FLAG_DO))
+        if pos + rdlength > len(data):
+            raise EDNSError("opt record truncated")
+        rdata_end = pos + rdlength
+        opts = []
+        while pos < rdata_end:
+            if pos + 4 > rdata_end:
+                raise EDNSError("opt option truncated")
+            code = int.from_bytes(data[pos:pos + 2], "big")
+            opt_len = int.from_bytes(data[pos + 2:pos + 4], "big")
+            pos += 4
+            if pos + opt_len > rdata_end:
+                raise EDNSError("opt option data truncated")
+            opts.append((code, bytes(data[pos:pos + opt_len])))
+            pos += opt_len
+        opt = (rrclass, bool(ttl & _FLAG_DO), opts)
     if pos != len(data):
         raise EDNSError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}, opt
@@ -477,6 +491,42 @@ def _validate_model(model):
     limit = model["limit"]
     _check_int(limit, "limit")
     return sections[0], sections[1], sections[2], limit
+
+
+def _validate_edns_options(options):
+    """校验应答 EDNS 选项表并编码为 OPT RDATA，重复项原序保留。
+
+    options 为 None 时按空列表处理；每项须为仅含 "code"、"data" 两键
+    （此序）的 dict，code 为 0..65535 非 bool 整数，data 为 bytes。
+    容器或字段类型错抛 TypeError；键序错、code 越界、单项 data 或总
+    RDATA 超 65535 字节抛 EncodeError。
+    """
+    if options is None:
+        options = []
+    if not isinstance(options, list):
+        raise TypeError("options must be list")
+    rdata = bytearray()
+    for option in options:
+        if not isinstance(option, dict):
+            raise TypeError("option must be dict")
+        if list(option.keys()) != ["code", "data"]:
+            raise EncodeError("option keys must be code,data")
+        code = option["code"]
+        data = option["data"]
+        if not isinstance(code, int) or isinstance(code, bool):
+            raise TypeError("option code must be int")
+        if not isinstance(data, bytes):
+            raise TypeError("option data must be bytes")
+        if not 0 <= code <= 0xFFFF:
+            raise EncodeError("option code out of range")
+        if len(data) > _MAX_RDATA_LEN:
+            raise EncodeError("option data too long")
+        if len(rdata) + 4 + len(data) > _MAX_RDATA_LEN:
+            raise EncodeError("opt rdata too long")
+        rdata += code.to_bytes(2, "big")
+        rdata += len(data).to_bytes(2, "big")
+        rdata += data
+    return bytes(rdata)
 
 
 def _decode_cname_target(rdata):
@@ -763,19 +813,26 @@ def encode_response(query: bytes, model: dict) -> bytes:
     return _encode_response(query, model, 0)
 
 
-def edns(query: bytes, model: dict, rcode: int = 0) -> bytes:
+def edns(query: bytes, model: dict, rcode: int = 0,
+         options: list | None = None) -> bytes:
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
     query/model 的解码与编码契约同 decode_query/encode_response；查询
     AR 限 0 或 1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、
-    扩展码/版本 0、flags 仅 DO、RDLENGTH0 的 OPT。非法 AR/OPT、截断、
-    尾随或 model 含 OPT 抛 EDNSError。rcode 须非 bool 整数（类型错
-    TypeError）：有 OPT 限 0..4095、无 OPT 限 0..15，越界 EncodeError。
-    无 OPT 时上限 min(model.limit, 512) 且不回 OPT；有 OPT 时上限
-    min(model.limit, CLASS)，应答 ar 末项为同 CLASS 根 OPT，
+    扩展码/版本 0、flags 仅 DO 的 OPT，其 RDATA 按选项 TLV 解析（重复
+    项保序，头或数据截断、RDLENGTH 内残缺抛 EDNSError）。非法 AR/OPT、
+    截断、尾随或 model 含 OPT 抛 EDNSError。rcode 须非 bool 整数（类型
+    错 TypeError）：有 OPT 限 0..4095、无 OPT 限 0..15，越界 EncodeError。
+    options 为应答 OPT 的 TLV 选项表，None 表示空列表：每项为键序
+    "code"、"data" 的 dict，code 为 0..65535 非 bool 整数，data 为
+    bytes，原序编码且不合并重复 code，RDLENGTH 精确；容器或字段类型
+    错抛 TypeError，键序错、code 越界、单项 data 或总 RDATA 超 65535
+    字节抛 EncodeError。查询无 OPT 时 options 必须为 None，否则
+    EncodeError。无 OPT 时上限 min(model.limit, 512) 且不回 OPT；有
+    OPT 时上限 min(model.limit, CLASS)，应答 ar 末项为同 CLASS 根 OPT，
     TTL=(rcode>>4)<<24|DO，头部低 4 位为 rcode&15。编码其余同
-    encode_response：超限按 ar、ns、an 尾删并置 TC，OPT 不删；
-    问题与 OPT 超限抛 EncodeError。
+    encode_response：超限普通 RR 按 ar、ns、an 尾删并置 TC，OPT 固定
+    不删不截；问题与 OPT 超限抛 EncodeError。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -791,18 +848,21 @@ def edns(query: bytes, model: dict, rcode: int = 0) -> bytes:
         raise EncodeError("limit out of range")
     opt_wire = b""
     if opt is None:
+        if options is not None:
+            raise EncodeError("options require an OPT record in the query")
         if not 0 <= rcode <= 0xF:
             raise EncodeError("rcode out of range")
         limit = min(limit, _MAX_MESSAGE_LEN)
     else:
         if not 0 <= rcode <= _MAX_EDNS_RCODE:
             raise EncodeError("rcode out of range")
-        opt_class, do = opt
+        opt_rdata = _validate_edns_options(options)
+        opt_class, do, _query_opts = opt
         limit = min(limit, opt_class)
         ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
         opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
                     + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
-                    + b"\x00\x00")
+                    + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
     truncated = False
     # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
     max_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
