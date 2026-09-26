@@ -111,12 +111,17 @@
   stats(reset=False) -> str 返回键序 query,response,expired,evicted,
   keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数；
   reload_rules(rules, expected) 带版本检查的原子规则热加载，版本初始
-  为 0，返回键序 version,result,kept,dropped 的紧凑 ASCII JSON 报告
-  （末尾换行），result 为 "applied"、"unchanged" 或 "conflict"。
+  为 0（构造时规范规则记为版本 0 并入容量 32 的历史，仅 applied 归档，
+  超量淘汰最小版本，版本不复用），返回键序 version,result,kept,dropped
+  的紧凑 ASCII JSON 报告（末尾换行），result 为 "applied"、"unchanged"
+  或 "conflict"；rollback_rules(target, expected) 带版本检查的原子
+  回滚，返回键序 version,result,target,kept,dropped 的紧凑 ASCII JSON
+  报告（末尾换行），result 为 "applied"、"unchanged"、"missing" 或
+  "conflict"。
 - replay_rate(rules, ops, expected=None, policy=None, default="deny")
-  -> str: 在 RateLimiter 上依次回放 allow/authorize/reload 操作并
-  记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，结果上限
-  16777216 字节。
+  -> str: 在 RateLimiter 上依次回放 allow/authorize/reload/rollback
+  操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，结果
+  上限 16777216 字节。
 
 命令行：python dns.py decode HEX
 """
@@ -221,6 +226,7 @@ _REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
 _REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
 _REPLAY_AUTHORIZE_OP_KEYS = ["op", "query", "client"]
 _REPLAY_RELOAD_OP_KEYS = ["op", "rules", "expected"]
+_REPLAY_RATE_ROLLBACK_OP_KEYS = ["op", "target", "expected"]
 _MAX_REPLAY_RATE_OPS = 4096
 _REPLAY_CACHE_STATS_KEYS = ["op", "reset"]
 _MAX_REPLAY_CACHE_OPS = 4096
@@ -236,6 +242,7 @@ _MIN_RATE_WINDOW = 1
 _MAX_RATE_WINDOW = 3600
 _MAX_RATE_QUOTA = 65535
 _RATE_TABLE_CAPACITY = 4096
+_RATE_HISTORY_CAPACITY = 32
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -3615,6 +3622,32 @@ def _validate_policy_rules(rules):
     return checked
 
 
+def _decode_authorizable_query(query):
+    """解码 authorize/RateLimiter 路径的查询，沿用 decode_query 契约。
+
+    解码成功但问题数非 1（含 QDCOUNT=0）或 QR 置位属可授权性错误，
+    抛 EncodeError；其余不可解码情形（报文长度、QDCOUNT 超 64、截断、
+    名字非法、尾随字节等）仍抛 MessageError。TypeError 原样传播。
+    """
+    try:
+        msg = decode_query(query)
+    except MessageError:
+        # QDCOUNT=0 且无任何应答段是可授权性错误而非报文不可解码：仅
+        # 零问题数这一唯一缺陷改判 EncodeError，其余 MessageError（含
+        # QDCOUNT=0 但 AN/NS/AR 非空、QDCOUNT 超 64、截断等）原样传播。
+        if (_MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN
+                and int.from_bytes(query[4:6], "big") == 0
+                and query[6:12] == b"\x00" * 6):
+            raise EncodeError(
+                "query must contain exactly one question") from None
+        raise
+    if msg["flags"] & _FLAG_QR:
+        raise EncodeError("query has QR set")
+    if len(msg["questions"]) != 1:
+        raise EncodeError("query must contain exactly one question")
+    return msg
+
+
 def authorize(query: bytes, client: str, rules: list,
               default: str = "deny") -> bool:
     """按规则原序判定 query 是否放行，返回是否 allow。
@@ -3643,11 +3676,7 @@ def authorize(query: bytes, client: str, rules: list,
         addr = ipaddress.ip_address(client)
     except (ValueError, TypeError):
         raise PolicyError("client must be an IP address") from None
-    msg = decode_query(query)
-    if msg["flags"] & _FLAG_QR:
-        raise EncodeError("query has QR set")
-    if len(msg["questions"]) != 1:
-        raise EncodeError("query must contain exactly one question")
+    msg = _decode_authorizable_query(query)
     qname = msg["questions"][0]["name"]
     qtype = msg["questions"][0]["type"]
     for net_kind, net, name, rule_type, is_allow in checked:
@@ -3760,17 +3789,33 @@ class RateLimiter:
     PolicyError；先验 expected 再比版本，不等则不检查 rules 并报告
     "conflict"；相等时 rules 沿用构造器契约校验、规范化并深拷贝，
     与当前规范规则逐项相同报告 "unchanged"，否则替换、版本加 1 并
-    报告 "applied"。applied 仅保留规则序号及规范化规则均未改变的
-    计数键（计数与创建序保留），其余删除；时钟、全局创建序与 stats
-    累计值不变。返回键序 version,result,kept,dropped 的紧凑 ASCII
-    JSON（末尾单换行），kept/dropped 仅 applied 时为保留/删除数，
-    否则均为 0。异常、conflict、unchanged 不改变任何状态。
+    报告 "applied"，且仅 applied 按新版本归档规范规则快照。applied
+    仅保留规则序号及规范化规则均未改变的计数键（计数与创建序保留），
+    其余删除；时钟、全局创建序与 stats 累计值不变。返回键序
+    version,result,kept,dropped 的紧凑 ASCII JSON（末尾单换行），
+    kept/dropped 仅 applied 时为保留/删除数，否则均为 0。异常、
+    conflict、unchanged 不改变任何状态。
+
+    构造时规范规则记为版本 0 并入历史；历史容量 32，仅 applied 的
+    热加载/回滚归档，超量淘汰最小版本号，版本号不复用。
+    rollback_rules(target, expected) 带版本检查的原子回滚：target、
+    expected 非 int 或 bool 抛 TypeError、任一负值抛 PolicyError；
+    先验两参再比 expected，冲突时不查询 target；target 为当前版本或
+    目标规则与当前相同报告 "unchanged"，未保留报告 "missing"，否则
+    恢复、版本加 1 并归档、报告 "applied"，仅保留序号及规范六字段均
+    未变的计数键。返回键序 version,result,target,kept,dropped 的
+    紧凑 ASCII JSON（末尾单换行），kept/dropped 仅 applied 时为
+    保留/删除数，否则均为 0；非 applied 或异常无副作用。
     """
 
     def __init__(self, rules: list):
         # 校验即构造全新的不可变元组列表，与外部对入参的后续改动隔离。
         self._rules = _validate_rate_rules(rules)
         self._version = 0  # 规则版本：初始为 0，每次 applied 热加载加 1
+        # 版本历史：版本号 -> 该版本规范化规则深拷贝。构造时规范规则记为
+        # 版本 0，仅 applied 的热加载/回滚按新版本号归档；容量 32，超量
+        # 淘汰最小版本号，版本号单调递增、不复用。
+        self._rule_history = {0: copy.deepcopy(self._rules)}
         # 计数键 -> [窗起始, 窗截止, 计数, 创建序]
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
@@ -3804,11 +3849,7 @@ class RateLimiter:
             addr = ipaddress.ip_address(client)
         except (ValueError, TypeError):
             raise PolicyError("client must be an IP address") from None
-        msg = decode_query(query)
-        if msg["flags"] & _FLAG_QR:
-            raise EncodeError("query has QR set")
-        if len(msg["questions"]) != 1:
-            raise EncodeError("query must contain exactly one question")
+        msg = _decode_authorizable_query(query)
         qname = msg["questions"][0]["name"]
         qtype = msg["questions"][0]["type"]
         matched = None
@@ -3907,11 +3948,7 @@ class RateLimiter:
             ipaddress.ip_address(client)
         except (ValueError, TypeError):
             raise PolicyError("client must be an IP address") from None
-        msg = decode_query(query)
-        if msg["flags"] & _FLAG_QR:
-            raise EncodeError("query has QR set")
-        if len(msg["questions"]) != 1:
-            raise EncodeError("query must contain exactly one question")
+        msg = _decode_authorizable_query(query)
         if not _matching_reply(query, response):
             raise EncodeError("response is not a valid reply to query")
         # 全部校验已通过：仅调用一次 allow，统计随其成功返回提交一次。
@@ -3969,7 +4006,9 @@ class RateLimiter:
         先校验 expected，再与当前版本比较：不等则不检查 rules，直接
         报告 "conflict"。相等时 rules 沿用构造器全部契约校验、规范化
         并深拷贝，异常与构造器一致；与当前规范规则逐项相同报告
-        "unchanged"，否则原子替换规则、版本加 1 并报告 "applied"。
+        "unchanged"，否则原子替换规则、版本加 1、按新版本归档规范
+        规则快照（历史容量 32，超量淘汰最小版本号，版本不复用）并
+        报告 "applied"。
         applied 仅保留规则序号存在且该序号规范化规则逐项未改变的计数
         键（计数与创建序原样保留），其余删除；时钟、全局创建序与 stats
         累计值不变，keys 反映保留后的键数，容量仍为 4096。异常、
@@ -4011,9 +4050,83 @@ class RateLimiter:
                 self._counts = counts
                 self._rules = new_rules
                 self._version += 1
+                self._archive_rules(self._version, new_rules)
                 result = "applied"
         return ('{"version":' + str(self._version)
                 + ',"result":' + json.dumps(result)
+                + ',"kept":' + str(kept)
+                + ',"dropped":' + str(dropped) + "}\n")
+
+    def _archive_rules(self, version, rules):
+        """按版本号保存规范化规则深拷贝；超容量 32 淘汰最小版本号。
+
+        归档仅在热加载/回滚成功 applied 时进行，版本号单调递增、不复用。
+        """
+        self._rule_history[version] = copy.deepcopy(rules)
+        if len(self._rule_history) > _RATE_HISTORY_CAPACITY:
+            oldest = min(self._rule_history)
+            del self._rule_history[oldest]
+
+    def rollback_rules(self, target: int, expected: int) -> str:
+        """带版本检查的原子规则回滚，返回键序 version,result,target,
+        kept,dropped 的紧凑 ASCII JSON 报告（末尾单换行）。
+
+        target/expected 非 int 或为 bool 抛 TypeError，任一为负抛
+        PolicyError；两参数校验完成后先比较 expected：与当前版本不等时
+        不查询 target，报告 "conflict"（version 为当前版本）。相等且
+        target 为当前版本、或目标版本保留的规范规则与当前逐项相同，报告
+        "unchanged"；target 未保留（含已淘汰）报告 "missing"；否则原子
+        恢复目标规则、版本加 1 并按新版本归档，报告 "applied"
+        （version 为新版本）。applied 仅保留规则序号存在于恢复规则中且
+        规范化规则逐项未改变的计数键（计数与创建序原样保留），其余删除，
+        kept/dropped 为保留/删除数；其余结果二者均为 0。时钟、全局创建
+        序与 stats 累计值不变，容量仍为 4096。非 applied 结果或任何异常
+        都不改变规则、版本、历史、计数、时钟与统计；版本号不复用。
+        result 为 "applied"、"unchanged"、"missing" 或 "conflict"。
+        """
+        if not isinstance(target, int) or isinstance(target, bool):
+            raise TypeError("target must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if target < 0:
+            raise PolicyError("target must be non-negative")
+        if expected < 0:
+            raise PolicyError("expected must be non-negative")
+        kept = 0
+        dropped = 0
+        # 两参数校验完成后才比较 expected；冲突时不得查询 target。
+        if expected != self._version:
+            result = "conflict"
+        elif target == self._version:
+            result = "unchanged"
+        else:
+            snapshot = self._rule_history.get(target)
+            if snapshot is None:
+                result = "missing"
+            elif snapshot == self._rules:
+                result = "unchanged"
+            else:
+                target_rules = copy.deepcopy(snapshot)
+                # 规则序号在当前与恢复规则中均存在且规范化规则逐项相同的
+                # 计数键保留（计数与创建序不变），其余删除。
+                same = {index for index, rule in enumerate(target_rules)
+                        if index < len(self._rules)
+                        and self._rules[index] == rule}
+                counts = {}
+                for key, value in self._counts.items():
+                    if key[0] in same:
+                        counts[key] = value
+                        kept += 1
+                    else:
+                        dropped += 1
+                self._counts = counts
+                self._rules = target_rules
+                self._version += 1
+                self._archive_rules(self._version, target_rules)
+                result = "applied"
+        return ('{"version":' + str(self._version)
+                + ',"result":' + json.dumps(result)
+                + ',"target":' + str(target)
                 + ',"kept":' + str(kept)
                 + ',"dropped":' + str(dropped) + "}\n")
 
@@ -4023,13 +4136,15 @@ def _validate_rate_ops(ops):
 
     ops 限 0..4096 项；allow 项键序仅 op,query,client,now,kind，
     authorize 项键序仅 op,query,client，reload 项键序仅
-    op,rules,expected：op 与键序形状一致；allow/authorize 项 query 为
-    偶长小写十六进制，client 为 str；allow 项 now 为非 bool 整数、
-    kind 为 str；reload 项 rules 沿用 RateLimiter 构造契约（结构、
-    键序、类型、值域非法均抛 ReplayError），expected 为非负非 bool
-    整数。ops 非 list 抛 TypeError；超量及项、键序、op 名、值类型或
-    格式非法抛 ReplayError。kind 取值、client 是否为 IP 地址与 query
-    报文可解码性不在此校验，留待执行时判定。
+    op,rules,expected，rollback 项键序仅 op,target,expected：op 与
+    键序形状一致；allow/authorize 项 query 为偶长小写十六进制，client
+    为 str；allow 项 now 为非 bool 整数、kind 为 str；reload 项 rules
+    沿用 RateLimiter 构造契约（结构、键序、类型、值域非法均抛
+    ReplayError），expected 为非负非 bool 整数；rollback 项 target、
+    expected 均为非负非 bool 整数。ops 非 list 抛 TypeError；超量及
+    项、键序、op 名、值类型或格式非法抛 ReplayError。kind 取值、
+    client 是否为 IP 地址与 query 报文可解码性不在此校验，留待执行时
+    判定。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
@@ -4045,10 +4160,13 @@ def _validate_rate_ops(ops):
             kind = "authorize"
         elif keys == _REPLAY_RELOAD_OP_KEYS:
             kind = "reload"
+        elif keys == _REPLAY_RATE_ROLLBACK_OP_KEYS:
+            kind = "rollback"
         else:
             raise ReplayError(
                 "op keys must be op,query,client,now,kind"
-                " or op,query,client or op,rules,expected")
+                " or op,query,client or op,rules,expected"
+                " or op,target,expected")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] != kind:
@@ -4066,6 +4184,14 @@ def _validate_rate_ops(ops):
                 raise ReplayError("expected must be int")
             if expected < 0:
                 raise ReplayError("expected must be non-negative")
+            continue
+        if kind == "rollback":
+            for field in ("target", "expected"):
+                value = op[field]
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ReplayError(field + " must be int")
+                if value < 0:
+                    raise ReplayError(field + " must be non-negative")
             continue
         query = op["query"]
         if not isinstance(query, str):
@@ -4085,31 +4211,37 @@ def _validate_rate_ops(ops):
 
 def replay_rate(rules: list, ops: list, expected=None, policy=None,
                 default: str = "deny") -> str:
-    """在 RateLimiter 上依次回放 allow/authorize/reload 操作，返回记录的 JSON。
+    """在 RateLimiter 上依次回放 allow/authorize/reload/rollback 操作，返回记录的 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 超 4096 项
     及项、键序、op 名、值类型或格式非法（allow 项键序
     op,query,client,now,kind，authorize 项键序 op,query,client，
-    reload 项键序 op,rules,expected；query 非偶长小写十六进制、
-    client/kind 非 str、now 为 bool 或非整数、reload 项 rules 不满足
-    RateLimiter 构造契约或 expected 为 bool/非整数/负值）均在构造
-    RateLimiter 前抛 ReplayError。ops 校验通过后校验
-    policy/default：policy 为 None 视为空列表（不校验 default），
-    否则 default 与 policy 的校验及异常同 authorize；随后 rules 的
-    校验与异常同 RateLimiter 构造。每项记录键序 in,out,stats：in 为
-    操作原文，stats 为该操作后的 stats(False) 原文。allow 项成功
+    reload 项键序 op,rules,expected，rollback 项键序
+    op,target,expected；query 非偶长小写十六进制、client/kind 非 str、
+    now 为 bool 或非整数、reload 项 rules 不满足 RateLimiter 构造契约
+    或 expected 为 bool/非整数/负值、rollback 项 target/expected 为
+    bool/非整数/负值）均在构造 RateLimiter 前抛 ReplayError。ops 校验
+    通过后校验 policy/default：policy 为 None 视为空列表（不校验
+    default），否则 default 与 policy 的校验及异常同 authorize；随后
+    rules 的校验与异常同 RateLimiter 构造。每项记录键序 in,out,stats：
+    in 为操作原文，stats 为该操作后的 stats(False) 原文。allow 项成功
     out 键序 ok,allow,remaining（ok 为 true，后两项为 allow 的返回
     值）；authorize 项按同名函数执行，成功 out 键序 ok,allow；reload
     项调用 reload_rules(rules, expected)，成功 out 键序
     ok,version,result,kept,dropped（ok 为 true，后四项为该方法报告的
-    四值）。三者抛出的异常均记为 out 键序 ok,error（false 与异常
-    类名）并继续后续操作；allow 的失败原子性不变（计数、时钟与统计
-    均不改），authorize 不改限流状态，reload 的冲突、未变与异常无
-    副作用，applied 沿用版本及计数键保留删除语义且后续 allow 使用
-    新规则。输出为紧凑 ASCII JSON，顶层键序
-    version,ops，version 为 1，末尾单换行；同输入逐字节一致。结果
-    超 16777216 字节抛 ReplayError 且不比较 expected。expected 为
-    None 时仅记录；为 str 时与输出整体比较，不一致抛 ReplayError。
+    四值）；rollback 项调用 rollback_rules(target, expected)，成功
+    out 键序 ok,version,result,target,kept,dropped，result 取
+    "applied"/"unchanged"/"missing"/"conflict"，kept/dropped 仅
+    applied 为保留与删除数，否则均为 0，状态副作用沿用
+    rollback_rules（后续操作观察其提交）。四者抛出的异常均记为 out
+    键序 ok,error（false 与异常类名）并继续后续操作；allow 的失败
+    原子性不变（计数、时钟与统计均不改），authorize 不改限流状态，
+    reload/rollback 的冲突、未变、缺失与异常无副作用，applied 沿用
+    版本、历史归档及计数键保留删除语义且后续 allow 使用新规则。输出
+    为紧凑 ASCII JSON，顶层键序 version,ops，version 为 1，末尾单
+    换行；同输入逐字节一致。结果超 16777216 字节抛 ReplayError 且不
+    比较 expected。expected 为 None 时仅记录；为 str 时与输出整体
+    比较，不一致抛 ReplayError。
     """
     if expected is not None and not isinstance(expected, str):
         raise TypeError("expected must be str or None")
@@ -4143,6 +4275,15 @@ def replay_rate(rules: list, ops: list, expected=None, policy=None,
                 out = {"ok": True, "version": report["version"],
                        "result": report["result"], "kept": report["kept"],
                        "dropped": report["dropped"]}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif op["op"] == "rollback":
+            try:
+                report = json.loads(limiter.rollback_rules(
+                    op["target"], op["expected"]))
+                out = {"ok": True, "version": report["version"],
+                       "result": report["result"], "target": report["target"],
+                       "kept": report["kept"], "dropped": report["dropped"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         else:
