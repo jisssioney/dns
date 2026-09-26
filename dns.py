@@ -1399,6 +1399,12 @@ class PositiveCache:
         self._stats_h = [0, 0, 0]
         self._stats_m = [0, 0, 0, 0]
         self._stats_x = 0
+        # 供 Resolver.cache_stats 的累计计数：成功 resolve 实际删除的
+        # 到期条目数与容量 FIFO 淘汰条目数。与本类 stats 的 h/m/x 相互
+        # 独立，不随 stats(reset=True) 清零；与缓存变更同一原子提交点
+        # 递增，任何失败（含编码失败）都不改变。
+        self._removed_expired = 0
+        self._evicted = 0
 
     def _negative_entry(self, key, rcode, an, ns, now):
         """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。"""
@@ -1546,8 +1552,10 @@ class PositiveCache:
         if len(self._order) > _CACHE_CAPACITY:
             tag, oldest = self._order.popleft()  # 满时淘汰最早插入者
             del (self._entries if tag == "pos" else self._neg_entries)[oldest]
+            self._evicted += 1
         if expired is not None:
             self._stats_x += 1  # 本次成功 resolve 实际删除的到期条目
+            self._removed_expired += 1
         self._stats_m[m_index] += 1
         self._last_now = now
         return response, False
@@ -2007,6 +2015,20 @@ class Resolver:
     仍超 limit 抛 TransferError。非 int 或 bool 抛 TypeError，整数越界
     抛 ConfigError；所读 SOA 不符两个未压缩绝对名加五个 uint32 格式
     抛 ZoneError。只读：同状态同参逐字节一致，不改变任何状态。
+
+    cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅
+    a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。a/r 为权威/递归缓存
+    水位，键序 p,nx,nd,total,capacity,ttl：前三项为正、NXDOMAIN、
+    NODATA 条目数，total 为合计，capacity 固定 256；ttl 按同顺序
+    取各类最小剩余 TTL（正条目 max(0,插入时刻+RR最小TTL-now)，负
+    条目以负 TTL 同算），无条目为 -1；读取不清除到期项。x/v 为
+    [权威,递归] 非负整数数组，累计自构造或重置后成功解析删除的
+    到期项、容量 FIFO 淘汰项（换区、更新、回滚的清空不计），随
+    成功缓存变更原子提交，编码或上游异常不变。now 非 int 或为
+    bool、reset 非 bool 抛 TypeError；now<0 或早于上次成功结束
+    时刻抛 CacheError，无副作用。reset=False 只读；True 先返回
+    按 now 计算的旧计数快照，再清零 x、v，保留缓存、FIFO、时钟
+    及统计。同参逐字节一致。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -2038,6 +2060,15 @@ class Resolver:
         self._rated_o = [0, 0, 0, 0]
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
+        # cache_stats 的 x/v：自构造或 cache_stats 重置后累计的清理事件。
+        # 权威侧 = 已换出缓存折入的基数（_cache_x_base/_cache_v_base）加
+        # 当前 PositiveCache 的 _removed_expired/_evicted；递归侧随
+        # _store_recursive_terminal 的成功缓存变更原子递增。换区、更新、
+        # 回滚的清空不计，但换出前已累计的计数折入基数保留。
+        self._cache_x_base = 0
+        self._cache_v_base = 0
+        self._rec_x = 0
+        self._rec_v = 0
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -2271,6 +2302,16 @@ class Resolver:
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
         self._stats_c0 = len(self._cache._order)
 
+    def _swap_cache(self, cache):
+        """原子换入新权威缓存（换区、更新、回滚的提交点）。
+
+        旧缓存已累计的到期删除/淘汰计数折入 cache_stats 基数保留；
+        换区清空本身不计入 x/v。
+        """
+        self._cache_x_base += self._cache._removed_expired
+        self._cache_v_base += self._cache._evicted
+        self._cache = cache
+
     def _authority_miss_expired(self, question, now):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
         cache = self._cache
@@ -2329,6 +2370,7 @@ class Resolver:
             tag, ekey = expired
             del (self._rec_pos if tag == "pos" else self._rec_neg)[ekey]
             self._rec_order.remove(expired)
+            self._rec_x += 1  # 成功解析删除的到期项（随缓存变更原子提交）
         key = (question["name"], question["type"], question["class"])
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
             self._rec_pos[key] = (now, an)
@@ -2343,6 +2385,7 @@ class Resolver:
         if len(self._rec_order) > _CACHE_CAPACITY:
             tag, oldest = self._rec_order.popleft()
             del (self._rec_pos if tag == "pos" else self._rec_neg)[oldest]
+            self._rec_v += 1  # 容量 FIFO 淘汰（随缓存变更原子提交）
 
     def resolve_recursive(self, query: bytes, levels, now: int,
                           limit: int = 512) -> tuple[bytes, str, int, bool]:
@@ -2465,7 +2508,7 @@ class Resolver:
         zone = import_zone(text)
         cache = PositiveCache(zone)
         # 全部成功后原子提交：换区、修订号加 1，并按新当前修订号归档。
-        self._cache = cache
+        self._swap_cache(cache)
         revision = self._revision
         self._revision += 1
         self._archive_revision(self._revision, cache)
@@ -2503,7 +2546,7 @@ class Resolver:
         if candidate_text == current_text:
             # 候选与当前区域规范化后等价：不换区、不加修订号、不归档。
             return self._tx_report(self._revision, "unchanged")
-        self._cache = cache
+        self._swap_cache(cache)
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._tx_report(self._revision, "applied")
@@ -2571,7 +2614,7 @@ class Resolver:
                 return self._update_report(
                     self._revision, "stale", candidate_serial)
         # force=True 或序列号更新：全部校验成功后原子提交。
-        self._cache = cache
+        self._swap_cache(cache)
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._update_report(
@@ -2626,7 +2669,7 @@ class Resolver:
             return self._rollback_report(self._revision, "missing", target)
         # 先用快照构造候选缓存，成功后才提交，保证失败不改任何状态。
         cache = PositiveCache(snapshot)
-        self._cache = cache
+        self._swap_cache(cache)
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._rollback_report(self._revision, "applied", target)
@@ -2726,7 +2769,7 @@ class Resolver:
                      "records": [_rr_to_model(rr) for rr in bumped]}
         # 经 PositiveCache 完整验证，成功后才原子提交，失败无副作用。
         cache = PositiveCache(candidate)
-        self._cache = cache
+        self._swap_cache(cache)
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._update_report(self._revision, "applied", serial)
@@ -2958,6 +3001,84 @@ class Resolver:
             self._rated_o = [0, 0, 0, 0]
             self._rated_e = [0, 0]
             self._rated_l = [0, 0, 0, 0]
+        return text
+
+    @staticmethod
+    def _cache_watermark(pos, neg, now):
+        """单个缓存（权威或递归）的水位快照。
+
+        pos/neg 为正/负缓存字典（与 PositiveCache 条目形态一致）。返回
+        键序 p,nx,nd,total,capacity,ttl 的字典：前三项为正、NXDOMAIN、
+        NODATA 条目数，total 为合计，capacity 固定 256；ttl 按同顺序
+        取各类最小剩余 TTL（正条目 max(0,插入时刻+RR最小TTL-now)，负
+        条目以负 TTL 同算），无条目为 -1。只读：到期未清理的条目仍
+        计入，剩余 TTL 钳为 0，不删除任何条目。
+        """
+        p_min = nx_min = nd_min = None
+        for inserted, an in pos.values():
+            remaining = inserted + min(rr[3] for rr in an) - now
+            if remaining < 0:
+                remaining = 0
+            if p_min is None or remaining < p_min:
+                p_min = remaining
+        nx = nd = 0
+        for neg_key, entry in neg.items():
+            remaining = entry[0] + entry[3] - now
+            if remaining < 0:
+                remaining = 0
+            if neg_key[0] == "nxdomain":
+                nx += 1
+                if nx_min is None or remaining < nx_min:
+                    nx_min = remaining
+            else:
+                nd += 1
+                if nd_min is None or remaining < nd_min:
+                    nd_min = remaining
+        p = len(pos)
+        return {"p": p, "nx": nx, "nd": nd, "total": p + nx + nd,
+                "capacity": _CACHE_CAPACITY,
+                "ttl": [-1 if best is None else best
+                        for best in (p_min, nx_min, nd_min)]}
+
+    def cache_stats(self, now: int, reset: bool = False) -> str:
+        """缓存水位快照：占用、TTL 衰减与清理事件（键序 a,r,x,v）。
+
+        返回顶层键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。a/r
+        为权威/递归缓存水位，键序 p,nx,nd,total,capacity,ttl：前三项
+        为正、NXDOMAIN、NODATA 条目数，total 为合计，capacity 固定
+        256；ttl 按同顺序取各类最小剩余 TTL（正条目 max(0,插入时刻+
+        RR最小TTL-now)，负条目以负 TTL 同算），无条目为 -1；读取不
+        清除到期项。x/v 为 [权威,递归] 非负整数数组，累计自构造或
+        重置后成功解析删除的到期项、容量 FIFO 淘汰项（换区、更新、
+        回滚的清空不计），随成功缓存变更原子提交，编码或上游异常
+        不变。now 非 int 或为 bool、reset 非 bool 抛 TypeError；
+        now<0 或早于上次成功结束时刻抛 CacheError，无副作用。
+        reset=False 只读；True 先返回按 now 计算的旧计数快照，再
+        清零 x、v，保留缓存、FIFO、时钟及统计。同参逐字节一致。
+        """
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        text = json.dumps(
+            {"a": self._cache_watermark(
+                self._cache._entries, self._cache._neg_entries, now),
+             "r": self._cache_watermark(self._rec_pos, self._rec_neg, now),
+             "x": [self._cache_x_base + self._cache._removed_expired,
+                   self._rec_x],
+             "v": [self._cache_v_base + self._cache._evicted,
+                   self._rec_v]},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+        if reset:
+            # 先返回旧快照再清零 x、v；缓存、FIFO、时钟与其余统计均保留。
+            self._cache_x_base = 0
+            self._cache_v_base = 0
+            self._cache._removed_expired = 0
+            self._cache._evicted = 0
+            self._rec_x = 0
+            self._rec_v = 0
         return text
 
 
