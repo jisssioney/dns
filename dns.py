@@ -106,6 +106,10 @@ class ReplayError(ValueError):
     """回放操作序列非法或回放记录与期望不符。"""
 
 
+class TransferError(ValueError):
+    """区域传送无法在给定限制内完成。"""
+
+
 class PolicyError(ValueError):
     """授权规则数量、键序或字段值非法。"""
 
@@ -844,6 +848,12 @@ def _rr_to_model(rr):
     labels, rrtype, rrclass, ttl, rdata = rr
     return {"name": _labels_to_name(labels), "type": rrtype,
             "class": rrclass, "ttl": ttl, "rdata": rdata}
+
+
+def _transfer_rr_key(model):
+    """传送求差所用 RR 五字段（名称、类型、类、TTL、rdata）哈希键。"""
+    return (model["name"], model["type"], model["class"], model["ttl"],
+            model["rdata"])
 
 
 def _hop(records, nodes, origin, current, qtype):
@@ -1653,6 +1663,19 @@ class Resolver:
     统计），修订号加 1 并按新修订号归档，报告 applied。version 取
     操作后修订号，serial 原样；非 applied 或任何异常均不改变任何
     状态。
+
+    transfer_zone(from_serial, limit=65535)：只读区域传送，返回键序
+    仅 version,serial,mode,delete,add 的紧凑 ASCII JSON（末尾换行）。
+    from_serial 为 uint32、limit 为 1..65535，非 int（含 bool）抛
+    TypeError，越界抛 ConfigError；所读当前 SOA 不符 update_zone_tx
+    格式抛 ZoneError。等于当前序列号时 mode 为 "none"、两列表空；
+    否则取历史中同序列号的最大修订，按 RR 五字段及重复次数求差
+    （delete 依旧区原序、add 依当前区原序），总数不超 limit 用
+    "ixfr"；无匹配或超限改用 "axfr"（delete 空、add 为当前全部 RR
+    原序），仍超 limit 抛 TransferError。version 取当前修订号，
+    serial 取当前 SOA 序列号；RR 键序仅 name,type,class,ttl,rdata，
+    名称为小写绝对名，整数十进制，rdata 为偶长小写十六进制。同状态
+    同参逐字节一致，不改变任何状态。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -2121,6 +2144,114 @@ class Resolver:
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._update_report(self._revision, "applied", serial)
+
+    def transfer_zone(self, from_serial: int, limit: int = 65535) -> str:
+        """按 SOA 序列号产出区域传送报告（只读，不改变任何状态）。
+
+        from_serial 为 uint32，limit 为 1..65535；非 int（含 bool）抛
+        TypeError，越界抛 ConfigError。当前 SOA 的 rdata 须完整为两个
+        未压缩绝对名与五个网络序 uint32 且无尾随（同 update_zone_tx），
+        否则抛 ZoneError。from_serial 等于当前序列号时 mode 为 "none"
+        且 delete、add 皆空。否则取历史中同序列号的最大修订（快照 SOA
+        无法解析者不参与匹配），按 RR 五字段（名称、类型、类、TTL、
+        rdata）及重复次数求差：delete 为旧区多出者、依旧区原序，add 为
+        当前区多出者、依当前区原序；两列表总数不超 limit 时 mode 为
+        "ixfr"。无匹配修订或总数超限改用 "axfr"：delete 为空、add 为
+        当前全部 RR 原序；add 数仍超 limit 抛 TransferError。报告键序
+        仅 version,serial,mode,delete,add，version 取当前修订号，
+        serial 取当前 SOA 序列号；RR 键序仅 name,type,class,ttl,rdata，
+        名称为小写绝对名，整数为十进制，rdata 为偶长小写十六进制。
+        报告为紧凑 ASCII JSON（末尾单换行）；同状态同参逐字节一致。
+        """
+        if not isinstance(from_serial, int) or isinstance(from_serial, bool):
+            raise TypeError("from_serial must be int")
+        if not 0 <= from_serial <= _MAX_TTL:
+            raise ConfigError("from_serial out of range")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError("limit must be int")
+        if not 1 <= limit <= _MAX_LIMIT:
+            raise ConfigError("limit out of range")
+        # 当前 SOA 序列号：rdata 须完整为两个未压缩绝对名与五个 uint32。
+        origin = self._cache._origin
+        records = self._cache._records
+        soa = [rr for rr in records
+               if rr[0] == origin and rr[1] == _TYPE_SOA][0]
+        soa_offset = _parse_soa_uint32_offset(soa[4])
+        if soa_offset is None:
+            raise ZoneError("soa rdata must be two names and five uint32")
+        current_serial = int.from_bytes(
+            soa[4][soa_offset:soa_offset + 4], "big")
+        current_models = [_rr_to_model(rr) for rr in records]
+        if from_serial == current_serial:
+            deleted, added, mode = [], [], "none"
+        else:
+            # 历史中同序列号的最大修订；快照 SOA 无法解析者不参与匹配。
+            match = None
+            for revision, snapshot in self._zone_history.items():
+                old_soa = [rr for rr in snapshot["records"]
+                           if rr["name"] == snapshot["origin"]
+                           and rr["type"] == _TYPE_SOA][0]
+                offset = _parse_soa_uint32_offset(old_soa["rdata"])
+                if offset is None:
+                    continue
+                serial = int.from_bytes(
+                    old_soa["rdata"][offset:offset + 4], "big")
+                if serial == from_serial and (
+                        match is None or revision > match):
+                    match = revision
+            if match is not None:
+                old_models = self._zone_history[match]["records"]
+                # 按五字段及重复次数求差：delete 依旧区原序，add 依
+                # 当前区原序。
+                new_counts = {}
+                for model in current_models:
+                    key = _transfer_rr_key(model)
+                    new_counts[key] = new_counts.get(key, 0) + 1
+                deleted = []
+                for model in old_models:
+                    key = _transfer_rr_key(model)
+                    if new_counts.get(key, 0) > 0:
+                        new_counts[key] -= 1
+                    else:
+                        deleted.append(model)
+                old_counts = {}
+                for model in old_models:
+                    key = _transfer_rr_key(model)
+                    old_counts[key] = old_counts.get(key, 0) + 1
+                added = []
+                for model in current_models:
+                    key = _transfer_rr_key(model)
+                    if old_counts.get(key, 0) > 0:
+                        old_counts[key] -= 1
+                    else:
+                        added.append(model)
+                mode = "ixfr"
+            else:
+                deleted, added = [], current_models
+                mode = "axfr"
+            if len(deleted) + len(added) > limit:
+                # 超限或无匹配改用全量传送；仍超限抛 TransferError。
+                deleted, added = [], current_models
+                mode = "axfr"
+                if len(added) > limit:
+                    raise TransferError("zone transfer exceeds limit")
+        return self._transfer_report(
+            self._revision, current_serial, mode, deleted, added)
+
+    @staticmethod
+    def _transfer_report(version, serial, mode, deleted, added):
+        """构造键序 version,serial,mode,delete,add 的紧凑 ASCII JSON
+        报告（末尾单换行）；RR 键序 name,type,class,ttl,rdata，rdata
+        为偶长小写十六进制。"""
+        def rr_json(model):
+            return {"name": model["name"], "type": model["type"],
+                    "class": model["class"], "ttl": model["ttl"],
+                    "rdata": model["rdata"].hex()}
+        return json.dumps(
+            {"version": version, "serial": serial, "mode": mode,
+             "delete": [rr_json(model) for model in deleted],
+             "add": [rr_json(model) for model in added]},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
 
     def _rollback_batch(self, expected, steps):
         """在隔离状态依序执行 reload/rollback 暂存步，整体原子提交。
