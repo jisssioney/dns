@@ -49,7 +49,7 @@
   或 "conflict"，修订号与 reload_zone 共用。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
-  rollback/rollback_batch 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+  rollback/rollback_batch/update 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
@@ -142,6 +142,7 @@ _REPLAY_RELOAD_TX_KEYS = ["op", "text", "expected"]
 _REPLAY_ROLLBACK_STEP_KEYS = ["op", "target"]
 _REPLAY_ROLLBACK_BATCH_KEYS = ["op", "expected", "steps"]
 _REPLAY_ROLLBACK_TX_KEYS = ["op", "target", "expected"]
+_REPLAY_UPDATE_KEYS = ["op", "changes", "serial", "expected"]
 _MAX_MIGRATE_TEXT_LEN = 1048576
 _MAX_ROLLBACK_BATCH_STEPS = 32
 _UPDATE_CHANGE_KEYS = ["op", "record"]
@@ -2304,6 +2305,66 @@ def _validate_replay_levels(levels):
     return converted
 
 
+def _validate_replay_update(op):
+    """校验 replay update 的 changes/serial/expected，返回转换后的 changes。
+
+    changes 为 1..256 项，项键序 op,record，op 为 "add"/"delete"；record
+    键序 name,type,class,ttl,rdata，前四字段沿用 zone.records 契约
+    （名称允许通配，type 不得为 6），rdata 为偶长小写十六进制并转换为
+    bytes；serial 为 uint32，expected 为非负整数，均拒绝 bool。任何
+    结构、类型、范围、记录语义（含 SOA 禁止与 CNAME rdata 规范）或
+    十六进制错误统一抛 ReplayError。语义校验在此完整把关、结果丢弃，
+    回传的原始形态供 update_zone_tx 执行时再校验一次。
+    """
+    changes = op["changes"]
+    if not isinstance(changes, list):
+        raise ReplayError("changes must be list")
+    if not 1 <= len(changes) <= _MAX_UPDATE_CHANGES:
+        raise ReplayError("changes must contain 1..256 items")
+    serial = op["serial"]
+    if not isinstance(serial, int) or isinstance(serial, bool):
+        raise ReplayError("serial must be int")
+    if not 0 <= serial <= _MAX_TTL:
+        raise ReplayError("serial out of range")
+    expected = op["expected"]
+    if (not isinstance(expected, int) or isinstance(expected, bool)
+            or expected < 0):
+        raise ReplayError("expected must be a non-negative int")
+    converted = []
+    for change in changes:
+        if (not isinstance(change, dict)
+                or list(change.keys()) != _UPDATE_CHANGE_KEYS):
+            raise ReplayError("change keys must be op,record")
+        change_op = change["op"]
+        if not isinstance(change_op, str) or change_op not in _UPDATE_OPS:
+            raise ReplayError("op must be add or delete")
+        record = change["record"]
+        if not isinstance(record, dict) or list(record.keys()) != _RR_KEYS:
+            raise ReplayError("record keys must be name,type,class,ttl,rdata")
+        rdata = record["rdata"]
+        if not isinstance(rdata, str):
+            raise ReplayError("rdata must be str")
+        if (len(rdata) % 2
+                or any(c not in _LOWER_HEXDIGITS for c in rdata)):
+            raise ReplayError("rdata must be even-length lowercase hex")
+        converted_record = {"name": record["name"], "type": record["type"],
+                            "class": record["class"], "ttl": record["ttl"],
+                            "rdata": bytes.fromhex(rdata)}
+        try:
+            # 记录语义（名称、类型/类/TTL 范围、SOA 禁止、CNAME rdata）
+            # 在此收口，确保构造 Resolver 前即抛 ReplayError。
+            _labels, rrtype, _rrclass, _ttl, converted_rdata = _validate_rr(
+                converted_record, allow_wildcard=True)
+            if rrtype == _TYPE_SOA:
+                raise ZoneError("change record must not be SOA")
+            if rrtype == _TYPE_CNAME:
+                _decode_cname_target(converted_rdata)
+        except (TypeError, ValueError) as exc:
+            raise ReplayError(str(exc)) from None
+        converted.append({"op": change_op, "record": converted_record})
+    return converted
+
+
 def _validate_ops(ops):
     """校验回放操作序列，返回 [(kind, op, plans), ...]（不执行）。
 
@@ -2322,7 +2383,8 @@ def _validate_ops(ops):
     "reload"（text 为 1..1048576 码点的 str）或键序 op,target 的
     "rollback"（target 为非负非 bool int）；rollback 键序
     op,target,expected 且 op 为 "rollback"，target/expected 为非负非
-    bool int。
+    bool int；update 键序 op,changes,serial,expected 且 op 为 "update"，
+    经 _validate_replay_update 校验并转换（非 update 项 plans 为 None）。
     ops 非 list 抛 TypeError；项、键序、op 名或字段类型/内容错误均抛
     ReplayError。
     """
@@ -2345,18 +2407,23 @@ def _validate_ops(ops):
             valid_names = ("rollback_batch",)
         elif keys == _REPLAY_ROLLBACK_TX_KEYS:
             valid_names = ("rollback",)
+        elif keys == _REPLAY_UPDATE_KEYS:
+            valid_names = ("update",)
         else:
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
                 " op,query,now,limit, op,query,levels,now,limit,"
-                " op,expected,steps or op,target,expected")
+                " op,expected,steps, op,target,expected"
+                " or op,changes,serial,expected")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] not in valid_names:
             raise ReplayError("op name does not match op keys")
         kind = op["op"]
         plans = None
-        if kind == "rollback":
+        if kind == "update":
+            plans = _validate_replay_update(op)
+        elif kind == "rollback":
             target = op["target"]
             if (not isinstance(target, int) or isinstance(target, bool)
                     or target < 0):
@@ -2434,13 +2501,14 @@ def _validate_ops(ops):
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
-    resolve/recursive/rollback/rollback_batch 操作，返回记录的紧凑 JSON。
+    resolve/recursive/rollback/rollback_batch/update 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
     op 名或字段类型/内容错误（含 recursive 的 levels 层级结构、RR 与
     十六进制形式、migrate/migrate_tx 的 text 码点长度、rollback 的
     target/expected、rollback_batch 的 expected/steps 及其 reload/
-    rollback 步）均在创建 Resolver 前抛 ReplayError；zone、plan、
+    rollback 步、update 的 changes/serial/expected 结构、范围、记录
+    语义与十六进制）均在创建 Resolver 前抛 ReplayError；zone、plan、
     timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
     in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
     为 true：reload 键序 ok,revision；reload_tx 键序
@@ -2462,11 +2530,13 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     放弃整批（index 为 zero-based 步下标），完成后含 applied 步结果为
     "applied"、否则 "unchanged"（index 为 steps 长度）；version 为提交
     后修订号，未提交取原修订号。放弃整批保留区域、版本、历史、权威与
-    递归缓存、时钟及统计。操作抛出的异常记为 out 键序 ok,error
-    （false 与异常类名）并继续后续操作，状态语义沿用各操作（失败不
-    改变任何状态）。输出为紧凑 ASCII JSON，顶层键序 version,ops，
-    version 为 1，末尾单换行。expected 为 None 时仅记录；为 str 时与
-    输出整体比较，不一致抛 ReplayError。
+    递归缓存、时钟及统计。update 键序 ok,version,result,serial，
+    serial 为入参原值，result 为 "applied"/"unchanged"/"stale"/
+    "conflict"，事务语义沿用 update_zone_tx。操作抛出的异常记为 out
+    键序 ok,error（false 与异常类名）并继续后续操作，状态语义沿用各
+    操作（失败不改变任何状态）。输出为紧凑 ASCII JSON，顶层键序
+    version,ops，version 为 1，末尾单换行。expected 为 None 时仅记录；
+    为 str 时与输出整体比较，不一致抛 ReplayError。
     """
     if expected is not None and not isinstance(expected, str):
         raise TypeError("expected must be str or None")
@@ -2536,6 +2606,15 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                     op["expected"], steps)
                 out = {"ok": True, "version": version,
                        "result": result_name, "index": index}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "update":
+            try:
+                report = json.loads(
+                    resolver.update_zone_tx(
+                        plans, op["serial"], op["expected"]))
+                out = {"ok": True, "version": report["version"],
+                       "result": report["result"], "serial": report["serial"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
         else:
