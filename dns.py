@@ -65,7 +65,10 @@
   限流，放行返回 (response, 余量)，拒绝返回 (None, 0) 或仅含问题
   段的截断应答 (tc, 0)；
   stats(reset=False) -> str 返回键序 query,response,expired,evicted,
-  keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数。
+  keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数；
+  reload_rules(rules, expected) 带版本检查的原子规则热加载，版本初始
+  为 0，返回键序 version,result,kept,dropped 的紧凑 ASCII JSON 报告
+  （末尾换行），result 为 "applied"、"unchanged" 或 "conflict"。
 - replay_rate(rules, ops, expected=None) -> str: 在 RateLimiter 上
   依次回放 allow 操作并记录为紧凑 ASCII JSON（末尾单换行）。
 
@@ -3099,11 +3102,23 @@ class RateLimiter:
     False 重复读取不改状态；True 先返回重置前快照，再清零六个分类计数
     及 expired、evicted，保留规则、计数键、创建序和最后时钟，因此 keys
     不清零。相同初态和调用序列须逐字节相同。
+
+    reload_rules(rules, expected) 带版本检查的原子规则热加载：版本
+    初始为 0，expected 非 int 或 bool 抛 TypeError、负值抛
+    PolicyError；先验 expected 再比版本，不等则不检查 rules 并报告
+    "conflict"；相等时 rules 沿用构造器契约校验、规范化并深拷贝，
+    与当前规范规则逐项相同报告 "unchanged"，否则替换、版本加 1 并
+    报告 "applied"。applied 仅保留规则序号及规范化规则均未改变的
+    计数键（计数与创建序保留），其余删除；时钟、全局创建序与 stats
+    累计值不变。返回键序 version,result,kept,dropped 的紧凑 ASCII
+    JSON（末尾单换行），kept/dropped 仅 applied 时为保留/删除数，
+    否则均为 0。异常、conflict、unchanged 不改变任何状态。
     """
 
     def __init__(self, rules: list):
         # 校验即构造全新的不可变元组列表，与外部对入参的后续改动隔离。
         self._rules = _validate_rate_rules(rules)
+        self._version = 0  # 规则版本：初始为 0，每次 applied 热加载加 1
         # 计数键 -> [窗起始, 窗截止, 计数, 创建序]
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
@@ -3294,6 +3309,61 @@ class RateLimiter:
             stat["expired"] = 0
             stat["evicted"] = 0
         return text
+
+    def reload_rules(self, rules: list, expected: int) -> str:
+        """带版本检查的原子规则热加载，返回紧凑 ASCII JSON 报告。
+
+        expected 非 int 或为 bool 抛 TypeError，负值抛 PolicyError；
+        先校验 expected，再与当前版本比较：不等则不检查 rules，直接
+        报告 "conflict"。相等时 rules 沿用构造器全部契约校验、规范化
+        并深拷贝，异常与构造器一致；与当前规范规则逐项相同报告
+        "unchanged"，否则原子替换规则、版本加 1 并报告 "applied"。
+        applied 仅保留规则序号存在且该序号规范化规则逐项未改变的计数
+        键（计数与创建序原样保留），其余删除；时钟、全局创建序与 stats
+        累计值不变，keys 反映保留后的键数，容量仍为 4096。异常、
+        conflict、unchanged 均不改变规则、版本、计数、时钟与统计；
+        调用后修改 rules 不影响实例。返回键序 version,result,kept,
+        dropped 的紧凑 ASCII JSON（末尾单换行）：version 为操作后的
+        整数版本，result 为 "applied"、"unchanged" 或 "conflict"，
+        kept/dropped 仅 applied 时为保留/删除的计数键数，否则均为 0。
+        相同状态与输入逐字节一致。
+        """
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise PolicyError("expected must be non-negative")
+        kept = 0
+        dropped = 0
+        if expected != self._version:
+            # 版本不符：不校验 rules，不改变任何状态。
+            result = "conflict"
+        else:
+            # 校验、规范化与深拷贝同构造器契约，异常原样传播。
+            new_rules = copy.deepcopy(_validate_rate_rules(rules))
+            if new_rules == self._rules:
+                result = "unchanged"
+            else:
+                # 规则序号在新旧规则中均存在且规范化规则逐项相同的计数键
+                # 保留（计数与创建序不变），其余删除。
+                old_rules = self._rules
+                common = min(len(old_rules), len(new_rules))
+                same = {index for index in range(common)
+                        if old_rules[index] == new_rules[index]}
+                counts = {}
+                for key, value in self._counts.items():
+                    if key[0] in same:
+                        counts[key] = value
+                        kept += 1
+                    else:
+                        dropped += 1
+                self._counts = counts
+                self._rules = new_rules
+                self._version += 1
+                result = "applied"
+        return ('{"version":' + str(self._version)
+                + ',"result":' + json.dumps(result)
+                + ',"kept":' + str(kept)
+                + ',"dropped":' + str(dropped) + "}\n")
 
 
 def _validate_rate_ops(ops):
