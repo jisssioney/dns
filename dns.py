@@ -48,6 +48,16 @@
   REFUSED 报文及 "rate",now,False,0，仅提交 limiter 的 deny、清理、
   时钟与统计，拒绝报文超 limit 抛 EncodeError 且解析器与 limiter 均
   不变；放行调用 resolve 并追加余量，resolve 异常仍耗额度；
+  resolve_rated(query, client, policy, limiter, now, limit=512,
+  default="deny", truncate=True) 在 ACL 与查询限流之后追加响应限流，
+  返回六元组 (应答报文或 None, 来源, 结束时刻, 是否命中, 查询余量,
+  响应余量)；truncate 非 bool 抛 TypeError；ACL 拒绝后五值为
+  "policy",now,False,-1,-1，查询配额拒绝为 "rate",now,False,0,-1；
+  查询放行仅调用一次 resolve（异常保留查询计数、响应不计），解析
+  成功再以应答与结束时刻调用一次 limiter.respond：放行保留原
+  source/end/hit 并返回两维余量，拒绝时解析器已提交不回滚，source
+  改为 "response-rate"，end/hit 保留，truncate 真返回 TC 截断报文、
+  假返回 None，响应余量为 0；两维各自计数；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
@@ -2122,6 +2132,74 @@ class Resolver:
         # resolve；成功时追加 allow 返回的余量。
         response, source, end, hit = self.resolve(query, now, limit)
         return response, source, end, hit, remaining
+
+    def resolve_rated(self, query: bytes, client: str, policy: list,
+                      limiter, now: int, limit: int = 512,
+                      default: str = "deny", truncate: bool = True
+                      ) -> tuple[bytes | None, str, int, bool, int, int]:
+        """组合 ACL、查询/响应两维限流与解析，返回六元组。
+
+        返回 (应答报文或 None, 来源, 结束时刻, 是否命中, 查询余量,
+        响应余量)。limiter 非 RateLimiter、truncate 非 bool 抛
+        TypeError（依次最先校验）；其余校验与异常依次沿用 authorize、
+        resolve、limiter.allow/respond，全部前置校验通过前不改变解析器
+        与 limiter 的任何状态。
+
+        授权拒绝复用 resolve_authorized 的拒绝应答（flags 为
+        0x8400|(查询 flags&0x7910)|5，QDCOUNT=1，其余计数为 0），不
+        调用 limiter 也不访问上游，后五值为 "policy",now,False,-1,-1。
+        授权放行后仅调用一次 limiter.allow(query, client, now,
+        "query")：查询配额拒绝不解析、不转发，返回同形 REFUSED 报文及
+        "rate",now,False,0,-1，仅提交 limiter 的 deny、清理、时钟与
+        统计（可能的拒绝报文先于 allow 编码，超 limit 抛 EncodeError
+        时解析器与 limiter 均不变）。查询放行仅调用一次 resolve；其
+        异常保留查询计数、响应不计，原样传播，失败语义同 resolve。
+        解析成功再以应答报文与结束时刻调用一次
+        limiter.respond(query, wire, client, end, truncate)：放行保留
+        原 source/end/hit 并返回查询、响应两余量；拒绝时解析器已提交
+        （不回滚、不重算、不再访上游），source 改为 "response-rate"，
+        end/hit 保留，truncate 为真返回 TC 截断报文、为假返回 None，
+        响应余量为 0。查询与响应两维各自计数；同初态同调用序列逐字节
+        一致。
+        """
+        # limiter 与 truncate 的类型最先判定；其后异常依次沿用
+        # authorize、resolve、limiter.allow/respond。
+        if not isinstance(limiter, RateLimiter):
+            raise TypeError("limiter must be a RateLimiter")
+        if not isinstance(truncate, bool):
+            raise TypeError("truncate must be bool")
+        # 授权优先：其 TypeError、PolicyError 与报文/可应答性异常原样
+        # 传播，此时不触碰 limiter。
+        allowed = authorize(query, client, policy, default)
+        # resolve 的入参、时钟与 limit 校验须先于 limiter 计数完成，
+        # 保证校验失败不消耗限流额度。
+        _check_resolve_inputs(query, now, limit, self._last_end)
+        if not allowed:
+            # ACL 拒绝：复用 resolve_authorized 应答，不调用
+            # limiter/上游，编码失败（超 limit）时双方均未改变。
+            response = _encode_policy_refusal(query, limit)
+            return response, "policy", now, False, -1, -1
+        # 查询配额拒绝的 REFUSED 只取决于 query 与 limit：先编码成功再
+        # 调用 allow，保证超 limit 抛 EncodeError 时双方不变。
+        refusal = _encode_policy_refusal(query, limit)
+        # 授权后仅此一次查询限流调用；其 deny、过期清理、淘汰、时钟与
+        # 统计随返回原子提交。
+        permitted, qleft = limiter.allow(query, client, now, "query")
+        if not permitted:
+            # 查询配额拒绝：不解析、不转发；仅 limiter 提交，解析器不变。
+            return refusal, "rate", now, False, 0, -1
+        # 查询放行：仅调用一次 resolve；其异常保留查询计数、响应不计
+        # （limiter 的查询提交不回滚），失败语义同 resolve。
+        wire, source, end, hit = self.resolve(query, now, limit)
+        # 解析已提交：仅此一次响应限流调用；拒绝不回滚、不重算、不再
+        # 访上游。放行时 respond 原样返回传入的应答对象。
+        rated, rleft = limiter.respond(query, wire, client, end, truncate)
+        if rated is wire:
+            # 响应放行：保留原 source/end/hit，返回两维余量。
+            return wire, source, end, hit, qleft, rleft
+        # 响应配额拒绝：source 改为 response-rate，end/hit 保留；
+        # truncate 为真时 rated 为 TC 截断报文，为假时 rated 为 None。
+        return rated, "response-rate", end, hit, qleft, 0
 
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
