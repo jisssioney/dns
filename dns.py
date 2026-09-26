@@ -118,7 +118,12 @@
   rollback_rules(target, expected) 带版本检查的原子规则回滚，返回
   键序 version,result,target,kept,dropped 的紧凑 ASCII JSON 报告
   （末尾换行），result 为 "applied"、"unchanged"、"missing" 或
-  "conflict"。
+  "conflict"；dump() 把规则版本历史导出为 schema=1 的确定性配置
+  文本（顶层键序 schema,version,history，history 升序，项键序
+  version,rules；紧凑 ASCII JSON，末尾单换行），只读且同状态逐
+  字节相同；load(text) 类方法从配置文本恢复实例（schema 0/1，
+  schema=0 历史限 256 项仅留最新 32 项），以末项为当前规则，
+  版本继续递增，新实例计数为空、时钟未设、统计清零。
 - replay_rate(rules, ops, expected=None, policy=None, default="deny")
   -> str: 在 RateLimiter 上依次回放 allow/authorize/reload/rollback
   操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，
@@ -247,6 +252,12 @@ _RATE_TABLE_CAPACITY = 4096
 # 回滚按新版本保存一份规范规则深拷贝，超量淘汰最小版本；版本号单调
 # 递增、不复用。
 _RATE_RULE_HISTORY_CAPACITY = 32
+# dump/load 配置：顶层键序仅 schema,version,history，history 项键序仅
+# version,rules；schema=0 的历史限 256 项且 load 仅留最新 32 项，
+# schema=1 的历史限 32 项（与规则历史容量一致）。
+_RATE_CONFIG_KEYS = ["schema", "version", "history"]
+_RATE_HISTORY_ITEM_KEYS = ["version", "rules"]
+_RATE_LOAD_HISTORY_LIMIT_V0 = 256
 _MAX_LABEL_LEN = 63
 _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
@@ -3637,7 +3648,8 @@ def authorize(query: bytes, client: str, rules: list,
     "allow"/"deny"。按原序取首个网段、名称、类型均匹配项，无匹配取
     default。任一入参或字段类型错抛 TypeError；规则数量、键序或字段
     值错（含 client 非 IP 地址）抛 PolicyError；query 解码错误沿用
-    decode_query，非单问题（含 QDCOUNT=0）或 QR 置位抛 EncodeError。
+    decode_query，非单问题（QDCOUNT=0 且 ANCOUNT/NSCOUNT/ARCOUNT
+    全为 0，或问题数非 1）或 QR 置位抛 EncodeError。
     规则全部校验通过后才解码 query 并匹配；不修改任何入参。
     """
     if not isinstance(query, bytes):
@@ -3655,8 +3667,11 @@ def authorize(query: bytes, client: str, rules: list,
     except (ValueError, TypeError):
         raise PolicyError("client must be an IP address") from None
     if (_MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN
-            and not int.from_bytes(query[4:6], "big")):
-        # QDCOUNT=0 属"非单问题"而非解码错误：按契约抛 EncodeError。
+            and not int.from_bytes(query[4:6], "big")
+            and not int.from_bytes(query[6:12], "big")):
+        # QDCOUNT=0 且 ANCOUNT/NSCOUNT/ARCOUNT 全为 0 属"非单问题"而非
+        # 解码错误：按契约抛 EncodeError；任一区段非零时留给
+        # decode_query 抛 MessageError。
         raise EncodeError("query must contain exactly one question")
     msg = decode_query(query)
     if msg["flags"] & _FLAG_QR:
@@ -3730,6 +3745,18 @@ def _validate_rate_rules(rules):
     return checked
 
 
+def _rate_rule_model(rule):
+    """把规范化限流规则元组还原为构造器契约的 dict（键序固定）。
+
+    client 为 "*" 或规范 CIDR 文本，type 为 None 或整数；还原结果可经
+    _validate_rate_rules 原样通过，保证 dump/load 往返一致。
+    """
+    net_kind, net, name, qtype, window, query_quota, response_quota = rule
+    return {"client": "*" if net_kind == "*" else str(net),
+            "name": name, "type": qtype, "window": window,
+            "query": query_quota, "response": response_quota}
+
+
 class RateLimiter:
     """确定性固定窗查询/响应限流器。
 
@@ -3792,6 +3819,17 @@ class RateLimiter:
     reload_rules。返回键序 version,result,target,kept,dropped 的
     紧凑 ASCII JSON（末尾单换行），kept/dropped 仅 applied 时为
     保留/删除数，否则均为 0；非 applied 或异常不改变任何状态。
+
+    dump() 把规则版本历史导出为 schema=1 的确定性配置文本（顶层键序
+    schema,version,history，history 按版本升序，项键序
+    version,rules；紧凑 ASCII JSON，末尾单换行），只读且同状态逐
+    字节相同。load(text) 类方法从配置文本恢复实例：schema 为 0 或
+    1（schema=0 的历史限 256 项，仅留最新 32 项；schema=1 限 32
+    项），以末项为当前规则，版本取顶层 version 并继续递增，新实例
+    计数为空、时钟未设、统计清零；text 非 str 抛 TypeError，解析、
+    重复键、键序、schema、版本关系或空/超量历史抛 ConfigError，
+    rules 的类型错抛 TypeError、数量/键序/值错抛 PolicyError，
+    失败无副作用。
     """
 
     def __init__(self, rules: list):
@@ -4123,6 +4161,114 @@ class RateLimiter:
                 + ',"target":' + str(target)
                 + ',"kept":' + str(kept)
                 + ',"dropped":' + str(dropped) + "}\n")
+
+    def dump(self) -> str:
+        """把规则版本历史导出为确定性配置文本（schema=1），只读。
+
+        顶层键序仅 schema,version,history：schema 恒为 1，version 为
+        当前规则版本；history 按版本严格升序，项键序仅 version,rules，
+        rules 为构造器契约的规则数组（项键序
+        client,name,type,window,query,response，type 为 null 或整数）。
+        输出为紧凑 ASCII JSON、十进制整数、末尾单换行；不改变任何状态，
+        同状态逐字节相同，load(dump()) 得到规则、版本与历史等价的实例。
+        """
+        history = []
+        for version in sorted(self._history):
+            history.append({
+                "version": version,
+                "rules": [_rate_rule_model(rule)
+                          for rule in self._history[version]],
+            })
+        config = {"schema": 1, "version": self._version,
+                  "history": history}
+        return json.dumps(config, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+
+    @classmethod
+    def load(cls, text: str) -> "RateLimiter":
+        """从 dump 配置文本恢复限流器实例。
+
+        新实例以末项规则为当前规则，版本取顶层 version（之后继续递增），
+        计数为空、时钟未设、统计清零。text 非 str 抛 TypeError；JSON
+        解析、重复键、键序、schema、版本关系或空/超量历史抛
+        ConfigError；rules 沿用构造器契约，字段类型错抛 TypeError，
+        数量、键序或值错抛 PolicyError；失败无副作用。
+
+        配置为 JSON 对象，顶层键序仅 schema,version,history：schema 为
+        非 bool 整数 0 或 1，version 为非负非 bool 整数；history 项
+        键序仅 version,rules，version 为严格递增的非负非 bool 整数且
+        末项等于顶层 version。schema=0 的 history 限 1..256 项，仅留
+        最新 32 项；schema=1 限 1..32 项。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        try:
+            config = json.loads(text, object_pairs_hook=_config_pairs)
+        except json.JSONDecodeError:
+            raise ConfigError("invalid JSON") from None
+        if not isinstance(config, dict):
+            raise ConfigError("config must be an object")
+        if list(config.keys()) != _RATE_CONFIG_KEYS:
+            raise ConfigError("config keys must be schema,version,history")
+        schema = config["schema"]
+        if not isinstance(schema, int) or isinstance(schema, bool):
+            raise ConfigError("schema must be int")
+        if schema not in (0, 1):
+            raise ConfigError("unsupported schema")
+        version = config["version"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ConfigError("version must be int")
+        if version < 0:
+            raise ConfigError("version must be non-negative")
+        history = config["history"]
+        if not isinstance(history, list):
+            raise ConfigError("history must be list")
+        capacity = (_RATE_LOAD_HISTORY_LIMIT_V0 if schema == 0
+                    else _RATE_RULE_HISTORY_CAPACITY)
+        if not 1 <= len(history) <= capacity:
+            raise ConfigError(
+                "history must contain 1.." + str(capacity) + " items")
+        # 结构层校验（键序、版本类型与严格递增、末项等于顶层值）全部
+        # 先于 rules 契约校验完成，ConfigError 优先于 TypeError/PolicyError。
+        versions = []
+        for item in history:
+            if not isinstance(item, dict):
+                raise ConfigError("history item must be an object")
+            if list(item.keys()) != _RATE_HISTORY_ITEM_KEYS:
+                raise ConfigError("history item keys must be version,rules")
+            item_version = item["version"]
+            if (not isinstance(item_version, int)
+                    or isinstance(item_version, bool)):
+                raise ConfigError("history version must be int")
+            if item_version < 0:
+                raise ConfigError("history version must be non-negative")
+            if versions and item_version <= versions[-1]:
+                raise ConfigError(
+                    "history versions must be strictly increasing")
+            versions.append(item_version)
+        if versions[-1] != version:
+            raise ConfigError("last history version must equal version")
+        # rules 沿用构造器契约：类型错抛 TypeError，数量、键序或值错抛
+        # PolicyError；schema=0 仅留最新 32 项归档。
+        parsed = [(item["version"], _validate_rate_rules(item["rules"]))
+                  for item in history]
+        kept = parsed[-_RATE_RULE_HISTORY_CAPACITY:]
+        instance = cls.__new__(cls)
+        instance._rules = copy.deepcopy(parsed[-1][1])
+        instance._version = version
+        instance._history = {
+            item_version: copy.deepcopy(rules)
+            for item_version, rules in kept}
+        instance._counts = {}
+        instance._serial = 0
+        instance._last_now = None
+        instance._stat = {
+            "query": {"allow": 0, "deny": 0, "unmatched": 0},
+            "response": {"allow": 0, "deny": 0, "unmatched": 0},
+            "expired": 0,
+            "evicted": 0,
+        }
+        return instance
 
 
 def _validate_rate_ops(ops):
