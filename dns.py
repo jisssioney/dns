@@ -113,8 +113,10 @@
   reload_rules(rules, expected) 带版本检查的原子规则热加载，版本初始
   为 0，返回键序 version,result,kept,dropped 的紧凑 ASCII JSON 报告
   （末尾换行），result 为 "applied"、"unchanged" 或 "conflict"。
-- replay_rate(rules, ops, expected=None) -> str: 在 RateLimiter 上
-  依次回放 allow 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+- replay_rate(rules, ops, expected=None, policy=None, default="deny")
+  -> str: 在 RateLimiter 上依次回放 allow/authorize 操作并记录为紧凑
+  ASCII JSON（末尾单换行）；ops 限 0..4096 项，policy 为 None 视同
+  空列表、否则与 default 的校验同 authorize，结果上限 16777216 字节。
 
 命令行：python dns.py decode HEX
 """
@@ -217,6 +219,7 @@ _REPLAY_LEVEL_KEYS = ["name", "events"]
 _REPLAY_EVENT_KEYS = ["delay", "reply"]
 _REPLAY_REPLY_KEYS = ["kind", "an", "ns"]
 _REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
+_REPLAY_RATE_AUTH_KEYS = ["op", "query", "client"]
 _MAX_REPLAY_RATE_OPS = 4096
 _REPLAY_CACHE_STATS_KEYS = ["op", "reset"]
 _MAX_REPLAY_CACHE_OPS = 4096
@@ -4017,11 +4020,13 @@ class RateLimiter:
 def _validate_rate_ops(ops):
     """校验 replay_rate 的操作序列（不执行）。
 
-    ops 限 0..4096 项，项键序仅 op,query,client,now,kind：op 为
+    ops 限 0..4096 项。allow 项键序仅 op,query,client,now,kind：op 为
     "allow"，query 为偶长小写十六进制，client/kind 为 str，now 为非
-    bool 整数。ops 非 list 抛 TypeError；超量及项、键序、值类型或
-    格式非法抛 ReplayError。kind 取值、client 是否为 IP 地址与 query
-    报文可解码性不在此校验，留待执行时由 allow 判定。
+    bool 整数；authorize 项键序仅 op,query,client：op 为 "authorize"，
+    query 为偶长小写十六进制，client 为 str。ops 非 list 抛 TypeError；
+    超量及项、键序、op 名、值类型或格式非法抛 ReplayError。kind 取值、
+    client 是否为 IP 地址与 query 报文可解码性不在此校验，留待执行时
+    由 allow/authorize 判定。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
@@ -4030,12 +4035,18 @@ def _validate_rate_ops(ops):
     for op in ops:
         if not isinstance(op, dict):
             raise ReplayError("op must be dict")
-        if list(op.keys()) != _REPLAY_RATE_OP_KEYS:
-            raise ReplayError("op keys must be op,query,client,now,kind")
+        keys = list(op.keys())
+        if keys == _REPLAY_RATE_OP_KEYS:
+            kind = "allow"
+        elif keys == _REPLAY_RATE_AUTH_KEYS:
+            kind = "authorize"
+        else:
+            raise ReplayError(
+                "op keys must be op,query,client,now,kind or op,query,client")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
-        if op["op"] != "allow":
-            raise ReplayError("op must be allow")
+        if op["op"] != kind:
+            raise ReplayError("op name does not match op keys")
         query = op["query"]
         if not isinstance(query, str):
             raise ReplayError("query must be str")
@@ -4044,45 +4055,69 @@ def _validate_rate_ops(ops):
             raise ReplayError("query must be even-length lowercase hex")
         if not isinstance(op["client"], str):
             raise ReplayError("client must be str")
-        if not isinstance(op["now"], int) or isinstance(op["now"], bool):
-            raise ReplayError("now must be int")
-        if not isinstance(op["kind"], str):
-            raise ReplayError("kind must be str")
+        if kind == "allow":
+            if not isinstance(op["now"], int) or isinstance(op["now"], bool):
+                raise ReplayError("now must be int")
+            if not isinstance(op["kind"], str):
+                raise ReplayError("kind must be str")
 
 
-def replay_rate(rules: list, ops: list, expected=None) -> str:
-    """在 RateLimiter 上依次回放 allow 操作，返回记录的紧凑 JSON。
+def replay_rate(rules: list, ops: list, expected=None, policy=None,
+                default="deny") -> str:
+    """在 RateLimiter 上依次回放 allow/authorize 操作，返回紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 超 4096 项
-    及项、键序、值类型或格式非法（op 非 "allow"、query 非偶长小写
-    十六进制、client/kind 非 str、now 为 bool 或非整数）均在构造
-    RateLimiter 前抛 ReplayError；rules 的校验与异常同 RateLimiter
-    构造，且在 ops 完整校验通过后才进行。每项记录键序 in,out,stats：
-    in 为操作原文，stats 为该操作后的 stats(False) 原文。成功 out
-    键序 ok,allow,remaining（ok 为 true，后两项为 allow 的返回值）；
-    allow 抛出的异常记为 out 键序 ok,error（false 与异常类名）并继续
-    后续操作，allow 的失败原子性不变（计数、时钟与统计均不改）。输出
-    为紧凑 ASCII JSON，顶层键序 version,ops，version 为 1，末尾单
-    换行；同输入逐字节一致。expected 为 None 时仅记录；为 str 时与
-    输出整体比较，不一致抛 ReplayError。
+    及项、键序、值类型或格式非法（allow 项键序 op,query,client,now,kind
+    且 op 为 "allow"、now 为非 bool 整数、kind 为 str；authorize 项键序
+    op,query,client 且 op 为 "authorize"；两者 query 均为偶长小写十六
+    进制、client 均为 str）均在构造 RateLimiter 前抛 ReplayError。ops
+    校验通过后校验 policy/default：policy 为 None 视同空列表，否则
+    policy 与 default 的校验及异常同 authorize；随后才构造 RateLimiter，
+    rules 的校验与异常同 RateLimiter 构造。每项记录键序 in,out,stats：
+    in 为操作原文，stats 为该操作后的 stats(False) 原文。allow 项成功
+    out 键序 ok,allow,remaining（ok 为 true，后两项为 allow 的返回值）；
+    authorize 项按同名函数执行，成功 out 键序 ok,allow（ok 为 true，
+    allow 为判定结果）。操作抛出的异常记为 out 键序 ok,error（false 与
+    异常类名）并继续后续操作；allow 的失败原子性不变，authorize 不改
+    限流状态（计数、时钟与统计均不改）。输出为紧凑 ASCII JSON，顶层
+    键序 version,ops，version 为 1，末尾单换行；同输入逐字节一致。
+    结果超 16777216 字节抛 ReplayError 且不比较 expected；expected 为
+    None 时仅记录，为 str 时与输出整体比较，不一致抛 ReplayError。
     """
     if expected is not None and not isinstance(expected, str):
         raise TypeError("expected must be str or None")
     # 全部操作校验在构造 RateLimiter 前完成。
     _validate_rate_ops(ops)
+    if policy is None:
+        policy = []
+    if not isinstance(default, str):
+        raise TypeError("default must be str")
+    if default not in _POLICY_ACTIONS:
+        raise PolicyError("default must be allow or deny")
+    _validate_policy_rules(policy)
     limiter = RateLimiter(rules)
     items = []
     for op in ops:
-        try:
-            allowed, remaining = limiter.allow(
-                bytes.fromhex(op["query"]), op["client"], op["now"],
-                op["kind"])
-            out = {"ok": True, "allow": allowed, "remaining": remaining}
-        except Exception as exc:
-            out = {"ok": False, "error": type(exc).__name__}
+        if op["op"] == "allow":
+            try:
+                allowed, remaining = limiter.allow(
+                    bytes.fromhex(op["query"]), op["client"], op["now"],
+                    op["kind"])
+                out = {"ok": True, "allow": allowed, "remaining": remaining}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
+        else:
+            try:
+                allowed = authorize(bytes.fromhex(op["query"]),
+                                    op["client"], policy, default)
+                out = {"ok": True, "allow": allowed}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
         items.append({"in": op, "out": out, "stats": limiter.stats(False)})
     result = json.dumps({"version": 1, "ops": items},
                         ensure_ascii=True, separators=(",", ":")) + "\n"
+    if len(result) > _MAX_REPLAY_RESULT_BYTES:
+        raise ReplayError("replay result exceeds 16777216 bytes")
     if expected is not None and result != expected:
         raise ReplayError("output does not match expected")
     return result
