@@ -21,6 +21,10 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
+- migrate_zones(text: str) -> str: 把 schema=0/1 的区域修订历史配置
+  文本完整校验、规范化并迁移为 schema=1 配置文本（schema=0 历史限
+  1..256 项、zone 沿用 migrate_zone 的 v0/v1/v2 对象契约，仅留
+  revision 最大的 32 项并转 v2；紧凑 ASCII JSON，末尾单换行）。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
@@ -100,13 +104,16 @@
   项键序 revision,zone，zone 为 migrate_zone 的 v2 配置对象；
   紧凑 ASCII JSON，末尾单换行），只读且同状态逐字节相同；
   load_zones(text, plan, timeout=5) 类方法先校验全部快照再从配置
-  文本恢复实例，以末项区域为当前区并恢复历史与修订号（后续成功
-  变更从 version+1 继续），新实例缓存为空、时钟未设、统计清零；
+  文本恢复实例（schema 0/1，schema=0 历史限 256 项、zone 可为
+  v0/v1/v2 对象，仅留 revision 最大的 32 项），以末项区域为当前区
+  并恢复历史与修订号（后续成功变更从 version+1 继续），新实例缓存
+  为空、时钟未设、统计清零；
   save_zones(path) 把 dump_zones() 字节写入同目录临时文件，fsync 后
   以 os.replace 原子替换，返回写入字节数，失败保留旧文件、删除临时
   文件且解析器不变；
   reload_zones_file(path, expected) 带修订号检查地从区域文件校验整份
-  快照并原子换区，返回键序 version,result 的紧凑 ASCII JSON 报告
+  快照（schema 0/1，含旧格式）并原子换区，返回键序 version,result
+  的紧凑 ASCII JSON 报告
   （末尾换行），path 非 str/空串/含 NUL 或 expected 非 int（含
   bool）/负分别抛 TypeError/ConfigError，冲突不读文件，文件缺失、
   I/O 错、超 16777216 字节或非 ASCII 分别抛 FileNotFoundError、
@@ -300,12 +307,14 @@ _CACHE_CAPACITY = 256
 # 区域修订历史容量：每个成功换区修订保存一份规范化区域深拷贝，
 # 超量淘汰最小修订号；修订号单调递增、不复用。
 _ZONE_HISTORY_CAPACITY = 32
-# dump_zones/load_zones 配置：顶层键序仅 schema,version,history
-# （schema 恒为 1），history 项键序仅 revision,zone，限 1..32 项
-# （与区域修订历史容量一致），revision 非负且严格递增、末项等于
-# 顶层 version。
+# dump_zones/load_zones 配置：顶层键序仅 schema,version,history，
+# history 项键序仅 revision,zone，revision 非负且严格递增、末项
+# 等于顶层 version；schema=0 的历史限 1..256 项、zone 为 v0/v1/v2
+# 对象，仅留 revision 最大的 32 项并转 v2，schema=1 的历史限
+# 1..32 项（与区域修订历史容量一致）、zone 为 v2 对象。
 _ZONES_DUMP_KEYS = ["schema", "version", "history"]
 _ZONES_HISTORY_ITEM_KEYS = ["revision", "zone"]
+_ZONES_LOAD_HISTORY_LIMIT_V0 = 256
 # save_zones/reload_zones_file 的区域文件大小上限（字节）。
 _MAX_ZONES_FILE_BYTES = 16777216
 _MAX_PLAN_ITEMS = 16
@@ -1379,6 +1388,95 @@ def migrate_zone(text: str) -> str:
                       separators=(",", ":")) + "\n"
 
 
+def _migrate_zone_object(zone):
+    """把已解析的 v0/v1/v2 zone 配置对象校验、规范化并迁移为 v2 对象。
+
+    结构错误（键序、版本、字段类型、布尔整数、十六进制）抛
+    ConfigError；zone 语义错误沿用 RecordError、ZoneError。
+    """
+    parsed, _version = _check_zone_config(zone)
+    origin_labels, rrs, zone_class = _validate_zone(parsed)
+    return _zone_to_v2(origin_labels, rrs, zone_class)
+
+
+def migrate_zones(text: str) -> str:
+    """把 schema=0/1 的区域修订历史配置文本迁移为 schema=1 配置文本。
+
+    顶层键序仅 schema,version,history：schema 为非 bool 整数 0 或 1，
+    version 为非负非 bool 整数；history 项键序仅 revision,zone，
+    revision 为严格递增的非负非 bool 整数且末项等于顶层 version。
+    schema=0 的 history 限 1..256 项、zone 沿用 migrate_zone 的
+    v0/v1/v2 对象契约；schema=1 限 1..32 项、zone 为 migrate_zone
+    的 v2 配置对象。先校验全部快照，再保留 revision 最大的 32 项
+    并将 zone 规范化为 v2。输出为 schema=1 格式（version 不变），
+    紧凑 ASCII JSON、整数十进制、rdata 为偶长小写十六进制、末尾
+    单换行；同输入逐字节一致，对迁移结果再次迁移不变。text 非 str
+    抛 TypeError；JSON 解析、重复键、键序、未知 schema、版本关系、
+    数量或 zone 结构错误抛 ConfigError；zone 语义错误沿用
+    RecordError、ZoneError。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    try:
+        config = json.loads(text, object_pairs_hook=_config_pairs)
+    except json.JSONDecodeError:
+        raise ConfigError("invalid JSON") from None
+    if not isinstance(config, dict):
+        raise ConfigError("config must be an object")
+    if list(config.keys()) != _ZONES_DUMP_KEYS:
+        raise ConfigError("config keys must be schema,version,history")
+    schema = config["schema"]
+    if not isinstance(schema, int) or isinstance(schema, bool):
+        raise ConfigError("schema must be int")
+    if schema not in (0, 1):
+        raise ConfigError("unsupported schema")
+    version = config["version"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ConfigError("version must be int")
+    if version < 0:
+        raise ConfigError("version must be non-negative")
+    history = config["history"]
+    if not isinstance(history, list):
+        raise ConfigError("history must be list")
+    capacity = (_ZONES_LOAD_HISTORY_LIMIT_V0 if schema == 0
+                else _ZONE_HISTORY_CAPACITY)
+    if not 1 <= len(history) <= capacity:
+        raise ConfigError(
+            "history must contain 1.." + str(capacity) + " items")
+    # 结构层校验（项键序、revision 类型与严格递增、末项等于顶层
+    # version）全部先于各 zone 快照校验完成。
+    revisions = []
+    for item in history:
+        if not isinstance(item, dict):
+            raise ConfigError("history item must be an object")
+        if list(item.keys()) != _ZONES_HISTORY_ITEM_KEYS:
+            raise ConfigError("history item keys must be revision,zone")
+        revision = item["revision"]
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            raise ConfigError("revision must be int")
+        if revision < 0:
+            raise ConfigError("revision must be non-negative")
+        if revisions and revision <= revisions[-1]:
+            raise ConfigError("revisions must be strictly increasing")
+        revisions.append(revision)
+    if revisions[-1] != version:
+        raise ConfigError("last history revision must equal version")
+    # 先校验全部快照（结构错误抛 ConfigError，语义错误沿用
+    # RecordError、ZoneError），再保留 revision 最大的 32 项；
+    # revision 严格递增，最大 32 项即末 32 项。
+    if schema == 0:
+        zones = [_migrate_zone_object(item["zone"]) for item in history]
+    else:
+        zones = [_zone_model_to_v2(_load_zone_snapshot(item["zone"]))
+                 for item in history]
+    kept = list(zip(revisions, zones))[-_ZONE_HISTORY_CAPACITY:]
+    migrated = {"schema": 1, "version": version,
+                "history": [{"revision": revision, "zone": zone}
+                            for revision, zone in kept]}
+    return json.dumps(migrated, ensure_ascii=True,
+                      separators=(",", ":")) + "\n"
+
+
 def import_zone(text: str) -> dict:
     """把 v0/v1/v2 配置文本导入为规范化 zone dict（键序 origin,records）。
 
@@ -2180,9 +2278,11 @@ class Resolver:
 
     dump_zones()：把区域修订历史导出为 schema=1 的确定性配置文本，
     只读且同状态逐字节相同；load_zones(text, plan, timeout=5) 类
-    方法先校验全部快照再恢复实例，末项区域为当前区，历史与修订号
-    一并恢复（后续成功变更从 version+1 继续），新实例缓存为空、
-    时钟未设、统计清零；两者详见各自文档。
+    方法先校验全部快照再恢复实例（schema 0/1，schema=0 历史限
+    256 项、zone 可为 v0/v1/v2 对象，仅留 revision 最大的 32 项），
+    末项区域为当前区，历史与修订号一并恢复（后续成功变更从
+    version+1 继续），新实例缓存为空、时钟未设、统计清零；两者
+    详见各自文档。
 
     save_zones(path)：把 dump_zones() 字节写入与目标同目录的临时
     文件，flush 并 fsync 后以 os.replace 原子替换目标，返回写入字节
@@ -2197,8 +2297,8 @@ class Resolver:
     （version 为当前修订号）。相符时读取文件：缺失抛
     FileNotFoundError，其余 I/O 错抛 OSError；内容上限
     16777216 字节，超限或含非 ASCII 字节抛 ConfigError。随后以当前
-    plan、timeout 按 load_zones 校验全快照并构造候选解析器，异常原样
-    传播且解析器不变。候选规范化内容与当前相同报告 unchanged（版本、
+    plan、timeout 按 load_zones 校验全快照（schema 0/1，含旧格式）
+    并构造候选解析器，异常原样传播且解析器不变。候选规范化内容与当前相同报告 unchanged（版本、
     状态不变）；不同时文件 version 必须大于当前修订号，否则抛
     ConfigError。成功后原子替换权威缓存（候选缓存为空）、修订历史与
     修订号，保留递归缓存、时钟、plan 与统计（提交当下 stats() 逐字节
@@ -3097,10 +3197,12 @@ class Resolver:
         Resolver 构造。
 
         配置为 JSON 对象，顶层键序仅 schema,version,history：schema
-        为非 bool 整数 1，version 为非负非 bool 整数；history 限
-        1..32 项，项键序仅 revision,zone，revision 为严格递增的
-        非负非 bool 整数且末项等于顶层 version；zone 为
-        migrate_zone 的 v2 配置对象。
+        为非 bool 整数 0 或 1，version 为非负非 bool 整数；history
+        项键序仅 revision,zone，revision 为严格递增的非负非 bool
+        整数且末项等于顶层 version。schema=0 的 history 限 1..256
+        项、zone 沿用 migrate_zone 的 v0/v1/v2 对象契约，仅留
+        revision 最大的 32 项并转为 v2；schema=1 限 1..32 项、
+        zone 为 migrate_zone 的 v2 配置对象。
         """
         if not isinstance(text, str):
             raise TypeError("text must be str")
@@ -3115,8 +3217,12 @@ class Resolver:
         schema = config["schema"]
         if not isinstance(schema, int) or isinstance(schema, bool):
             raise ConfigError("schema must be int")
-        if schema != 1:
+        if schema not in (0, 1):
             raise ConfigError("unsupported schema")
+        if schema == 0:
+            # 旧格式：先整体迁移为 schema=1 文本（校验全部快照、保留
+            # revision 最大的 32 项、zone 转 v2），再按 schema=1 恢复。
+            return cls.load_zones(migrate_zones(text), plan, timeout)
         version = config["version"]
         if not isinstance(version, int) or isinstance(version, bool):
             raise ConfigError("version must be int")
@@ -3198,7 +3304,8 @@ class Resolver:
         不改变任何状态。相符时读取文件：缺失抛 FileNotFoundError，其余
         I/O 错抛 OSError；内容上限 16777216 字节，超限或含非 ASCII 字节
         抛 ConfigError。随后以当前 plan、timeout 按 load_zones 校验整份
-        快照并构造候选解析器，异常原样不变且解析器不变。候选规范化导出
+        快照（schema 0/1，含旧格式）并构造候选解析器，异常原样不变且
+        解析器不变。候选规范化导出
         与当前 dump_zones() 相同报告 unchanged（版本与状态不变）；不同
         时文件 version 必须大于当前修订号，否则抛 ConfigError。成功后
         原子替换权威缓存（候选缓存为空）、修订历史与修订号，保留递归
