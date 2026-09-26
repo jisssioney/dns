@@ -3099,6 +3099,19 @@ class RateLimiter:
     False 重复读取不改状态；True 先返回重置前快照，再清零六个分类计数
     及 expired、evicted，保留规则、计数键、创建序和最后时钟，因此 keys
     不清零。相同初态和调用序列须逐字节相同。
+
+    reload_rules(rules, expected) 为带版本号检查的原子规则热加载，
+    返回键序 version,result,kept,dropped 的紧凑 ASCII JSON（末尾单
+    换行）。版本初始为 0：expected 非 int（含 bool）抛 TypeError，
+    expected<0 抛 PolicyError；先验 expected 再比较版本，不等时不校验
+    rules 并报告 conflict。相等时 rules 沿用构造器全部契约校验、规范化
+    并深拷贝；与当前规范规则逐项相同报告 unchanged，否则原子换规、
+    版本加 1 并报告 applied。applied 仅保留规则序号仍存在且规范化六
+    字段 client,name,type,window,query,response 均未改变的活动计数键
+    （连同计数与创建序），其余删除，kept/dropped 为保留/删除数；时钟、
+    全局创建序与 stats 累计值不变，keys 反映保留数，容量仍为 4096。
+    异常、conflict、unchanged 不改规则、版本、计数、时钟或统计；调用后
+    修改 rules 不影响实例。
     """
 
     def __init__(self, rules: list):
@@ -3108,6 +3121,8 @@ class RateLimiter:
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
         self._last_now = None  # 上次成功 allow 的时钟值
+        # 规则版本：构造时为 0，每次 reload_rules 实际换规加 1。
+        self._version = 0
         # 统计：各 kind 的 allow/deny/unmatched，以及本次重置周期内
         # 实际删除的过期键数与容量淘汰键数。仅在 allow 成功返回后提交。
         self._stat = {
@@ -3116,6 +3131,63 @@ class RateLimiter:
             "expired": 0,
             "evicted": 0,
         }
+
+    @staticmethod
+    def _reload_report(version, result, kept, dropped):
+        """构造键序 version,result,kept,dropped 的紧凑 ASCII JSON（末尾换行）。"""
+        return json.dumps(
+            {"version": version, "result": result,
+             "kept": kept, "dropped": dropped},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+
+    def reload_rules(self, rules: list, expected: int) -> str:
+        """带版本号检查的原子规则热加载，返回键序 version,result,kept,
+        dropped 的紧凑 ASCII JSON 报告（末尾单换行）。
+
+        expected 非 int（含 bool）抛 TypeError；expected<0 抛
+        PolicyError。先验 expected 再比较版本：expected 不等于当前版本
+        时不校验 rules，报告 conflict（version 为当前版本，kept/dropped
+        均为 0），不改变任何状态。相等时 rules 沿用构造器全部契约校验、
+        规范化并深拷贝，异常与构造器一致且状态不变。规范化候选与当前
+        规则逐项相同时报告 unchanged（版本不变，kept/dropped 均为 0）；
+        否则原子换规、版本加 1 并报告 applied。applied 仅保留计数键中
+        规则序号仍存在且规范化六字段 client,name,type,window,query,
+        response 均未改变的活动键，连同其计数与创建序一并保留，其余键
+        删除；kept/dropped 为保留/删除数。时钟、全局创建序与 stats 累计
+        值（含 keys）均不变，容量仍为 4096。异常、conflict、unchanged
+        不改规则、版本、计数、时钟或统计；调用后修改 rules 不影响实例。
+        """
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise PolicyError("expected version must be non-negative")
+        if expected != self._version:
+            # 版本不匹配：不得校验 rules，冲突本身不改变任何状态。
+            return self._reload_report(self._version, "conflict", 0, 0)
+        # 校验即得到全新规范化元组列表；任何异常都在提交前传播，状态不变。
+        candidate = _validate_rate_rules(rules)
+        if candidate == self._rules:
+            # 规范化后逐项相同：不换规、不加版本，计数与统计均不变。
+            return self._reload_report(self._version, "unchanged", 0, 0)
+        # 仅保留规则序号仍在且规范化六字段均未改变的活动键；先在局部
+        # 构造新计数表，全部完成后才原子替换，保证中途异常不改状态。
+        new_rules = candidate
+        kept_rules = {}
+        for index, rule in enumerate(new_rules):
+            if index < len(self._rules) and self._rules[index] == rule:
+                kept_rules[index] = rule
+        new_counts = {}
+        kept = 0
+        for key, value in self._counts.items():
+            if key[0] in kept_rules:
+                new_counts[key] = value
+                kept += 1
+        dropped = len(self._counts) - kept
+        self._rules = new_rules
+        self._counts = new_counts
+        self._version += 1
+        # 时钟、全局创建序与统计（含 keys）均不在此改动。
+        return self._reload_report(self._version, "applied", kept, dropped)
 
     def allow(self, query: bytes, client: str, now: int,
               kind: str = "query") -> tuple[bool, int]:
