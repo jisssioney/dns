@@ -55,6 +55,8 @@
   TypeError，解析成功后以应答与结束时刻调用一次 limiter.respond：
   放行保留原来源并返回两维余量，拒绝时来源为 "response-rate"、
   响应余量 0，truncate 真返回 TC 截断报文、假返回 None；
+  rated_stats(reset=False) 返回 resolve_rated 统计的紧凑 ASCII
+  JSON（键序 o,e,l，末尾换行），reset=True 先返回快照再清零计数；
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
@@ -1887,6 +1889,18 @@ class Resolver:
     "response-rate"，end/hit 保留，truncate 真返回 TC、假返回
     None，响应余量 0。两维各计数；同初态同序列逐字节一致。
 
+    rated_stats(reset=False)：resolve_rated 的确定性统计，返回键序
+    o,e,l 的紧凑 ASCII JSON（末尾单换行），值为非负十进制整数数组。
+    o 四项依次计 policy 拒绝、query-rate 拒绝、response-rate 拒绝、
+    响应放行；e 两项依次计查询放行后 resolve 异常、解析成功后
+    limiter.respond 异常（异常仍传播但原子计一次）；l 四项为实际
+    上游耗时分桶（0、1..timeout、timeout+1..2*timeout、>2*timeout），
+    仅实际上游成功（按 end-now）或耗尽（按模拟总时长）计一次，
+    权威、缓存及未访问上游不计。每次 resolve_rated 调用只增加一个
+    o 或 e；前置参数、授权异常、查询限流异常或拒绝报文编码异常不
+    计。reset 非 bool 抛 TypeError 且状态不变；False 只读；True
+    先返回旧快照再清零十个计数，保留其他状态及 stats。
+
     resolve_recursive(query, levels, now, limit=512)：域内查询沿用
     resolve；域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、FIFO
     同 PositiveCache），命中返回 (应答报文, "cache", now, True)，未命中
@@ -2008,6 +2022,12 @@ class Resolver:
         self._stats_x = 0
         self._stats_u = [0, 0, 0]
         self._stats_l = [0, 0, 0, 0]
+        # resolve_rated 专用统计：o 为策略/查询限流/响应限流拒绝与响应放行，
+        # e 为查询放行后 resolve 异常与解析成功后 limiter.respond 异常，
+        # l 为实际上游耗时分桶（权威、缓存及未访问上游不计）。
+        self._rated_o = [0, 0, 0, 0]
+        self._rated_e = [0, 0]
+        self._rated_l = [0, 0, 0, 0]
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -2183,35 +2203,90 @@ class Resolver:
         allowed = authorize(query, client, policy, default)
         # resolve 的入参、时钟与 limit 校验须先于 limiter 计数完成，
         # 保证校验失败不消耗限流额度。
-        _check_resolve_inputs(query, now, limit, self._last_end)
+        msg = _check_resolve_inputs(query, now, limit, self._last_end)
+        # 是否访问上游与 resolve 的分支判定一致：仅域外查询经 forward。
+        in_origin = _name_in_origin(msg["questions"][0],
+                                    self._cache._origin,
+                                    self._cache._zone_class)
         if not allowed:
             # ACL 拒绝：复用 resolve_authorized 应答，不调用 limiter，
-            # 编码失败（超 limit）时双方均未改变。
+            # 编码失败（超 limit）时双方均未改变；编码异常不计 rated 统计。
             response = _encode_policy_refusal(query, limit)
+            self._rated_o[0] += 1
             return response, "policy", now, False, -1, -1
         # 查询限流可能返回的 REFUSED 应答只取决于 query 与 limit：先编码
         # 成功再调用 allow，保证超 limit 抛 EncodeError 时 limiter 未被
-        # 调用、解析器未改变（双方不变）。
+        # 调用、解析器未改变（双方不变）；编码异常不计 rated 统计。
         refusal = _encode_policy_refusal(query, limit)
         # 授权后仅此一次查询限流调用；其 deny、过期清理、淘汰、时钟与
-        # 统计随返回原子提交。
+        # 统计随返回原子提交。allow 自身异常原样传播且不计 rated 统计。
         qpermitted, qleft = limiter.allow(query, client, now, "query")
         if not qpermitted:
             # 查询配额拒绝：不解析、不转发；仅 limiter 提交，解析器不变。
+            self._rated_o[1] += 1
             return refusal, "rate", now, False, 0, -1
         # 查询放行：仅此一次 resolve；其异常仍耗查询额度（limiter 提交
-        # 不回滚），响应维度不计数，失败语义同 resolve。
-        response, source, end, hit = self.resolve(query, now, limit)
+        # 不回滚），响应维度不计数，失败语义同 resolve。异常原子计一次
+        # e[0] 后原样传播；实际上游耗尽（UpstreamError）另按模拟总时长
+        # 计一次 l 桶，权威路径等未访问上游的异常不计 l。
+        try:
+            response, source, end, hit = self.resolve(query, now, limit)
+        except UpstreamError:
+            self._rated_e[0] += 1
+            if not in_origin:
+                self._rated_l[_duration_bucket(
+                    _plan_total_elapsed(self._plan, self._timeout),
+                    self._timeout)] += 1
+            raise
+        except Exception:
+            self._rated_e[0] += 1
+            raise
+        # 实际上游成功按 end-now 计一次 l 桶；权威应答未访问上游不计。
+        if not in_origin:
+            self._rated_l[_duration_bucket(end - now, self._timeout)] += 1
         # 解析成功：仅此一次响应限流调用，时钟取解析结束时刻；其校验
-        # 异常保留查询计数、响应不计数，原样传播。
-        wire, rleft = limiter.respond(query, response, client, end, truncate)
+        # 异常保留查询计数、响应不计数，原子计一次 e[1] 后原样传播。
+        try:
+            wire, rleft = limiter.respond(query, response, client, end,
+                                          truncate)
+        except Exception:
+            self._rated_e[1] += 1
+            raise
         if wire is response:
             # 响应配额放行：来源、结束时刻与命中标记均保留，返回两维余量。
+            self._rated_o[3] += 1
             return response, source, end, hit, qleft, rleft
         # 响应配额拒绝：解析器已提交，不回滚、不重算、不再访上游；来源
         # 改为 "response-rate"，end/hit 保留，truncate 真为 TC 报文、
         # 假为 None，响应余量为 0。
+        self._rated_o[2] += 1
         return wire, "response-rate", end, hit, qleft, 0
+
+    def rated_stats(self, reset: bool = False) -> str:
+        """返回 resolve_rated 统计的紧凑 ASCII JSON（键序 o,e,l，末尾换行）。
+
+        o 为 [策略拒绝, 查询限流拒绝, 响应限流拒绝, 响应放行]；e 为
+        [查询放行后 resolve 异常, 解析成功后 limiter.respond 异常]；
+        l 为实际上游耗时分桶（0、1..timeout、timeout+1..2*timeout、
+        >2*timeout），仅实际上游成功（按 end-now）或耗尽（按模拟总
+        时长）计一次，权威、缓存及未访问上游不计。值均为非负十进制
+        整数。reset 非 bool 抛 TypeError 且状态不变；False 只读，
+        重复调用逐字节相同；True 先返回旧快照再清零十个计数，保留
+        其他状态及 stats。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        text = (
+            '{"o":[' + ",".join(map(str, self._rated_o)) + "]"
+            + ',"e":[' + ",".join(map(str, self._rated_e)) + "]"
+            + ',"l":[' + ",".join(map(str, self._rated_l)) + "]}\n"
+        )
+        if reset:
+            # 先返回旧快照再清零；其余状态与 stats 统计均保留。
+            self._rated_o = [0, 0, 0, 0]
+            self._rated_e = [0, 0]
+            self._rated_l = [0, 0, 0, 0]
+        return text
 
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
