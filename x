@@ -1,0 +1,1 @@
+{"schema":1,"version":0,"history":[{"revision":0,"zone":{"version":2,"origin":"example.","class":1,"records":[{"name":"example.","type":6,"ttl":100,"rdata":"026e73076578616d706c65000161076578616d706c650000000001000000000000000000000000000000000000003c"},{"name":"ns.example.","type":1,"ttl":100,"rdata":"0a000001"}]}}]}
