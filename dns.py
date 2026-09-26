@@ -21,6 +21,10 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
+- compare_serial(left: int, right: int) -> str: 比较 uint32 环形 SOA
+  序列号，令 d=(left-right)%2^32：d=0 返回 "equal"，1≤d<2^31 返回
+  "newer"，d=2^31 返回 "ambiguous"，2^31<d<2^32 返回 "older"；非 int
+  或 bool 抛 TypeError，越出 0..4294967295 抛 ConfigError。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
@@ -50,7 +54,9 @@
   或 "conflict"，修订号与 reload_zone 共用；
   transfer_zone(from_serial, limit=65535) 只读返回键序
   version,serial,mode,delete,add 的紧凑 ASCII JSON（末尾换行），
-  mode 为 "none"、"ixfr" 或 "axfr"，超限抛 TransferError。
+  from_serial 与当前序列号 equal 或 newer 时 mode 为 "none" 且两列表空，
+  older 时按历史最大修订做 IXFR/AXFR，ambiguous 抛 TransferError，
+  超限抛 TransferError。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
   rollback/rollback_batch/update 操作并记录为紧凑 ASCII JSON（末尾单换行）。
@@ -1131,6 +1137,30 @@ def migrate_zone(text: str) -> str:
                       separators=(",", ":")) + "\n"
 
 
+def compare_serial(left: int, right: int) -> str:
+    """比较两个 uint32 SOA 序列号在模 2^32 环形序列上的先后。
+
+    令 d=(left-right)%2^32：d=0 返回 "equal"；1≤d<2^31 返回 "newer"
+    （left 新于 right）；2^31<d<2^32 返回 "older"（left 旧于 right）；
+    d=2^31 返回 "ambiguous"。参数非 int 或为 bool 抛 TypeError，
+    越出 0..4294967295 抛 ConfigError。
+    """
+    if not isinstance(left, int) or isinstance(left, bool):
+        raise TypeError("left must be int")
+    if not isinstance(right, int) or isinstance(right, bool):
+        raise TypeError("right must be int")
+    if not 0 <= left <= _MAX_TTL or not 0 <= right <= _MAX_TTL:
+        raise ConfigError("serial out of range")
+    d = (left - right) % (1 << 32)
+    if d == 0:
+        return "equal"
+    if d < 1 << 31:
+        return "newer"
+    if d > 1 << 31:
+        return "older"
+    return "ambiguous"
+
+
 def import_zone(text: str) -> dict:
     """把 v0/v1/v2 配置文本导入为规范化 zone dict（键序 origin,records）。
 
@@ -1686,9 +1716,10 @@ class Resolver:
     type 为 6（SOA）抛 ZoneError；serial 为 uint32，expected 非负。
     类型错（含 bool 整数）抛 TypeError；数量、项键、op 值或整数
     范围错抛 ConfigError。验参后先比 expected：不等于当前修订号报告
-    conflict 且不验项；再验项；当前 SOA rdata 须完整为两个未压缩
-    绝对名与五个 uint32 且无尾随，否则 ZoneError；serial 对当前
-    序列号模 2^32 的差在 1..2^31-1 才更新，否则报告 stale。隔离
+    冲突 且不验项；再验项；当前 SOA rdata 须完整为两个未压缩
+    绝对名与五个 uint32 且无尾随，否则 ZoneError；serial 与当前序列号
+    经 compare_serial 比较，仅 newer（模 2^32 的差在 1..2^31-1）才
+    执行隔离更新，equal/older/ambiguous 一律报告 stale 且状态不变。隔离
     执行：add 无同五字段 RR 才尾加，delete 删尽同 RR；记录列表不变
     报告 unchanged，否则把 SOA 序列号改为 serial，经 PositiveCache
     完整验证后原子换区（清空权威缓存，保留递归缓存、时钟、plan 与
@@ -1701,14 +1732,16 @@ class Resolver:
     version 为当前修订号，serial 为当前 SOA 序列号，delete/add 为 RR
     数组（RR 键序 name,type,class,ttl,rdata；名称为小写绝对名，整数
     十进制，rdata 为偶长小写十六进制）。from_serial 为 uint32、limit
-    为 1..65535 的非 bool int；from_serial 等于当前序列号时 mode 为
-    "none" 且两列表空。否则取历史中 SOA 序列号等于 from_serial 的最大
-    修订，按 RR 五字段与重复次数求差：delete 依旧区原序，add 依当前区
-    原序；delete+add 总数不超 limit 用 mode "ixfr"。无匹配修订或差异
-    超 limit 时改用 mode "axfr"：delete 为空、add 为当前全部 RR 原序；
-    仍超 limit 抛 TransferError。非 int 或 bool 抛 TypeError，整数越界
-    抛 ConfigError；所读 SOA 不符两个未压缩绝对名加五个 uint32 格式
-    抛 ZoneError。只读：同状态同参逐字节一致，不改变任何状态。
+    为 1..65535 的非 bool int；from_serial 与当前序列号经
+    compare_serial 比较：equal 或 newer 时 mode 为 "none" 且两列表空，
+    older 时取历史中 SOA 序列号等于 from_serial 的最大修订，按 RR
+    五字段与重复次数求差：delete 依旧区原序，add 依当前区原序；
+    delete+add 总数不超 limit 用 mode "ixfr"；无匹配修订或差异超
+    limit 时改用 mode "axfr"：delete 为空、add 为当前全部 RR 原序；
+    仍超 limit 抛 TransferError；ambiguous 抛 TransferError。非 int
+    或 bool 抛 TypeError，整数越界抛 ConfigError；所读 SOA 不符两个
+    未压缩绝对名加五个 uint32 格式抛 ZoneError。只读：同状态同参逐字节
+    一致，不改变任何状态。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -2091,8 +2124,10 @@ class Resolver:
         当前修订号时不验项，报告 conflict（version 为当前修订号）且
         不改变任何状态。相等时再验项；当前区域 SOA 的 rdata 须完整为
         两个未压缩绝对名与五个网络序 uint32 且无尾随，否则 ZoneError。
-        serial 对当前 SOA 序列号模 2^32 的差在 1..2^31-1 才更新，否则
-        报告 stale。隔离执行：在记录副本上按序应用，add 无同五字段
+        serial 与当前 SOA 序列号经 compare_serial 比较：仅 newer（模
+        2^32 的差在 1..2^31-1）才执行隔离更新，equal/older/ambiguous
+        一律按原键序报告 stale 且状态不变。隔离执行：在记录副本上按序
+        应用，add 无同五字段
         （名称、类型、类、TTL、rdata）RR 才尾加，delete 删尽同 RR；
         记录列表不变报告 unchanged（版本、缓存不变），否则把 SOA 序列号
         改为 serial，以候选区域构造 PositiveCache 完整验证，成功后才
@@ -2148,8 +2183,9 @@ class Resolver:
             raise ZoneError("soa rdata must be two names and five uint32")
         current_serial = int.from_bytes(
             soa[4][soa_offset:soa_offset + 4], "big")
-        # serial 对当前序列号模 2^32 的差须在 1..2^31-1 才更新。
-        if not 1 <= (serial - current_serial) % (1 << 32) <= (1 << 31) - 1:
+        # 仅 newer（模 2^32 的差在 1..2^31-1）才执行隔离更新；
+        # equal/older/ambiguous 一律报告 stale 且不改变任何状态。
+        if compare_serial(serial, current_serial) != "newer":
             return self._update_report(self._revision, "stale", serial)
         # 隔离执行：在副本上按序应用，add 无同五字段 RR 才尾加，
         # delete 删尽同 RR；任何失败都在提交前发生，真实状态不变。
@@ -2184,16 +2220,17 @@ class Resolver:
         ASCII JSON（末尾单换行）。
 
         from_serial 为 uint32、limit 为 1..65535 的非 bool int；非 int
-        或 bool 抛 TypeError，越界抛 ConfigError。from_serial 等于当前
-        SOA 序列号时 mode 为 "none"，delete/add 均空。否则取修订历史中
-        SOA 序列号等于 from_serial 的最大修订（须仍保留）：按 RR 五字段
-        （name,type,class,ttl,rdata）及重复次数求差，delete 依旧区原序、
-        add 依当前区原序，差异总数不超 limit 用 mode "ixfr"。无匹配修订
-        或差异超 limit 时改用 mode "axfr"：delete 为空、add 为当前全部
-        RR 原序；仍超 limit 抛 TransferError。version 取当前修订号，
-        serial 取当前 SOA 序列号。所读历史或当前 SOA rdata 不符两个未
-        压缩绝对名加五个 uint32 格式抛 ZoneError。只读：不改变任何状态，
-        同状态同参逐字节一致。
+        或 bool 抛 TypeError，越界抛 ConfigError。from_serial 与当前 SOA
+        序列号经 compare_serial 比较：equal 或 newer 时 mode 为 "none"，
+        delete/add 均空；ambiguous 抛 TransferError；仅 older 时取修订
+        历史中 SOA 序列号等于 from_serial 的最大修订（须仍保留）：按 RR
+        五字段（name,type,class,ttl,rdata）及重复次数求差，delete 依旧
+        区原序、add 依当前区原序，差异总数不超 limit 用 mode "ixfr"。
+        无匹配修订或差异超 limit 时改用 mode "axfr"：delete 为空、add
+        为当前全部 RR 原序；仍超 limit 抛 TransferError。version 取当前
+        修订号，serial 取当前 SOA 序列号。所读历史或当前 SOA rdata 不符
+        两个未压缩绝对名加五个 uint32 格式抛 ZoneError。只读：不改变任何
+        状态，同状态同参逐字节一致。
         """
         if not isinstance(from_serial, int) or isinstance(from_serial, bool):
             raise TypeError("from_serial must be int")
@@ -2209,12 +2246,16 @@ class Resolver:
         current_serial = _zone_soa_serial(cur_records, cur_origin)
         if current_serial is None:
             raise ZoneError("soa rdata must be two names and five uint32")
-        if from_serial == current_serial:
+        relation = compare_serial(from_serial, current_serial)
+        if relation in ("equal", "newer"):
             mode = "none"
             delete = []
             add = []
+        elif relation == "ambiguous":
+            # 序列号恰相差 2^31，环形序列上先后不可判定。
+            raise TransferError("serial comparison is ambiguous")
         else:
-            # 取历史中 SOA 序列号等于 from_serial 的最大修订（须仍保留）。
+            # older：取历史中 SOA 序列号等于 from_serial 的最大修订。
             match_records = None
             for revision in sorted(self._zone_history, reverse=True):
                 snapshot = self._zone_history[revision]
