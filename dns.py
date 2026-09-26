@@ -99,7 +99,8 @@
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/migrate/migrate_tx/resolve/recursive/
-  rollback/rollback_batch/update 操作并记录为紧凑 ASCII JSON（末尾单换行）。
+  rollback/rollback_batch/update/cache_stats 操作并记录为紧凑 ASCII JSON
+  （末尾单换行）；ops 限 0..4096 项，结果上限 16777216 字节。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
@@ -219,6 +220,9 @@ _REPLAY_RATE_OP_KEYS = ["op", "query", "client", "now", "kind"]
 _MAX_REPLAY_RATE_OPS = 4096
 _REPLAY_CACHE_STATS_KEYS = ["op", "reset"]
 _MAX_REPLAY_CACHE_OPS = 4096
+_REPLAY_RESOLVER_CACHE_STATS_KEYS = ["op", "now", "reset"]
+_MAX_REPLAY_OPS = 4096
+_MAX_REPLAY_RESULT_BYTES = 16777216
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -3214,12 +3218,16 @@ def _validate_ops(ops):
     键序 name,type,class,ttl,rdata，rdata 为偶长小写十六进制并在校验时
     转为 bytes，记录语义同 zone.records 契约且不得为 SOA），serial 为
     uint32 非 bool int，expected 为非负非 bool int（非 update 项第三元
-    为 None，update 项第三元为转换后的 changes）。
-    ops 非 list 抛 TypeError；项、键序、op 名或字段类型/内容错误均抛
-    ReplayError。
+    为 None，update 项第三元为转换后的 changes）。cache_stats 键序
+    op,now,reset 且 op 为 "cache_stats"、now 为非负非 bool int、reset
+    为 bool。
+    ops 非 list 抛 TypeError；ops 超 4096 项及项、键序、op 名或字段类型
+    /内容错误均抛 ReplayError。
     """
     if not isinstance(ops, list):
         raise TypeError("ops must be list")
+    if len(ops) > _MAX_REPLAY_OPS:
+        raise ReplayError("ops must contain 0..4096 items")
     checked = []
     for op in ops:
         if not isinstance(op, dict):
@@ -3239,12 +3247,14 @@ def _validate_ops(ops):
             valid_names = ("rollback",)
         elif keys == _REPLAY_UPDATE_KEYS:
             valid_names = ("update",)
+        elif keys == _REPLAY_RESOLVER_CACHE_STATS_KEYS:
+            valid_names = ("cache_stats",)
         else:
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
                 " op,query,now,limit, op,query,levels,now,limit,"
-                " op,expected,steps, op,target,expected"
-                " or op,changes,serial,expected")
+                " op,expected,steps, op,target,expected,"
+                " op,changes,serial,expected or op,now,reset")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] not in valid_names:
@@ -3365,6 +3375,12 @@ def _validate_ops(ops):
                         raise ReplayError(str(exc)) from None
                 converted.append({"op": change_op, "record": candidate})
             plans = converted
+        elif kind == "cache_stats":
+            now = op["now"]
+            if not isinstance(now, int) or isinstance(now, bool) or now < 0:
+                raise ReplayError("now must be a non-negative int")
+            if not isinstance(op["reset"], bool):
+                raise ReplayError("reset must be bool")
         else:
             if not isinstance(op["text"], str):
                 raise ReplayError("text must be str")
@@ -3386,28 +3402,28 @@ def _validate_ops(ops):
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
-    resolve/recursive/rollback/rollback_batch/update 操作，返回记录的紧凑 JSON。
+    resolve/recursive/rollback/rollback_batch/update/cache_stats 操作，返回记录的紧凑 JSON。
 
-    ops 非 list 或 expected 非 None/str 抛 TypeError；操作项、键序、
-    op 名或字段类型/内容错误（含 recursive 的 levels 层级结构、RR 与
-    十六进制形式、migrate/migrate_tx 的 text 码点长度、rollback 的
-    target/expected、rollback_batch 的 expected/steps 及其 reload/
-    rollback 步、update 的 changes/serial/expected 及其项结构、记录
-    语义与十六进制）均在创建 Resolver 前抛 ReplayError；zone、plan、
-    timeout 的校验与异常同 Resolver 构造。每项记录键序 in,out,stats：
-    in 为操作原文，stats 为该操作后的 stats() 原文。成功 out 首键 ok
-    为 true：reload 键序 ok,revision；reload_tx 键序
-    ok,version,result，result 为 "applied"/"unchanged"/"conflict"；
-    migrate 键序 ok,text，text 为规范 v2 文本且不改变任何状态；
-    migrate_tx 键序 ok,version,result,text，先比较修订号，冲突时不解析
-    text，result 为 "conflict" 且 text 为 null，相等时先迁移校验再按
-    reload_zone_tx 原子换区，result 为 "applied"/"unchanged"，text 为
-    规范 v2 文本（版本、缓存语义沿用 reload_zone_tx）；resolve 与
-    recursive 键序 ok,response,source,end,hit，response 为小写十六进制；
-    rollback 键序 ok,version,result,target，先比较修订号，版本不符为
-    conflict 且不查历史，target 为当前版为 unchanged、未保留为
-    missing、命中为 applied，状态副作用沿用 rollback_zone_tx（后续操作
-    观察其提交）；
+    ops 非 list 或 expected 非 None/str 抛 TypeError；ops 限 0..4096 项，
+    超量或操作项、键序、op 名或字段类型/内容错误（含 recursive 的 levels
+    层级结构、RR 与十六进制形式、migrate/migrate_tx 的 text 码点长度、
+    rollback 的 target/expected、rollback_batch 的 expected/steps 及其
+    reload/rollback 步、update 的 changes/serial/expected 及其项结构、
+    记录语义与十六进制、cache_stats 的 now/reset）均在创建 Resolver 前
+    抛 ReplayError；zone、plan、timeout 的校验与异常同 Resolver 构造。
+    每项记录键序 in,out,stats：in 为操作原文，stats 为该操作后的
+    stats() 原文。成功 out 首键 ok 为 true：reload 键序 ok,revision；
+    reload_tx 键序 ok,version,result，result 为
+    "applied"/"unchanged"/"conflict"；migrate 键序 ok,text，text 为
+    规范 v2 文本且不改变任何状态；migrate_tx 键序
+    ok,version,result,text，先比较修订号，冲突时不解析 text，result
+    为 "conflict" 且 text 为 null，相等时先迁移校验再按 reload_zone_tx
+    原子换区，result 为 "applied"/"unchanged"，text 为规范 v2 文本
+    （版本、缓存语义沿用 reload_zone_tx）；resolve 与 recursive 键序
+    ok,response,source,end,hit，response 为小写十六进制；rollback 键序
+    ok,version,result,target，先比较修订号，版本不符为 conflict 且不查
+    历史，target 为当前版为 unchanged、未保留为 missing、命中为
+    applied，状态副作用沿用 rollback_zone_tx（后续操作观察其提交）；
     rollback_batch 键序 ok,version,result,index，result 为 "conflict"/
     "missing"/"unchanged"/"applied"：expected 不等于当前修订号即冲突且
     不解析任何 text（index 为 -1）；相符时在隔离状态依序执行各步，各步
@@ -3418,12 +3434,14 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     递归缓存、时钟及统计。update 键序 ok,version,result,serial：changes
     的 rdata 在校验时已转为 bytes，事务语义（conflict/stale/unchanged/
     applied、修订号与归档、缓存与统计保留）沿用 update_zone_tx，version
-    与 result 取报告值，serial 为入参原值。操作抛出的异常记为 out 键序
-    ok,error
-    （false 与异常类名）并继续后续操作，状态语义沿用各操作（失败不
-    改变任何状态）。输出为紧凑 ASCII JSON，顶层键序 version,ops，
-    version 为 1，末尾单换行。expected 为 None 时仅记录；为 str 时与
-    输出整体比较，不一致抛 ReplayError。
+    与 result 取报告值，serial 为入参原值。cache_stats 键序
+    ok,snapshot：调用 Resolver.cache_stats(now,reset)，snapshot 为返回
+    原文（含末尾换行），reset=True 清零对后续操作可见。操作抛出的异常
+    记为 out 键序 ok,error（false 与异常类名）并继续后续操作，状态语义
+    沿用各操作（失败不改变任何状态）。输出为紧凑 ASCII JSON，顶层键序
+    version,ops，version 为 1，末尾单换行。结果上限 16777216 字节，
+    超限抛 ReplayError 且不比较 expected；expected 为 None 时仅记录；
+    为 str 时与输出整体逐字节比较，不一致抛 ReplayError。
     """
     if expected is not None and not isinstance(expected, str):
         raise TypeError("expected must be str or None")
@@ -3505,6 +3523,12 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
                        "serial": report["serial"]}
             except Exception as exc:
                 out = {"ok": False, "error": type(exc).__name__}
+        elif kind == "cache_stats":
+            try:
+                snapshot = resolver.cache_stats(op["now"], op["reset"])
+                out = {"ok": True, "snapshot": snapshot}
+            except Exception as exc:
+                out = {"ok": False, "error": type(exc).__name__}
         else:
             try:
                 response, source, end, hit = resolver.resolve_recursive(
@@ -3517,6 +3541,8 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
         items.append({"in": op, "out": out, "stats": resolver.stats()})
     result = json.dumps({"version": 1, "ops": items},
                         ensure_ascii=True, separators=(",", ":")) + "\n"
+    if len(result) > _MAX_REPLAY_RESULT_BYTES:
+        raise ReplayError("replay result exceeds 16777216 bytes")
     if expected is not None and result != expected:
         raise ReplayError("output does not match expected")
     return result
