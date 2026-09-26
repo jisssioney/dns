@@ -61,6 +61,9 @@
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
 - RateLimiter(rules): 确定性固定窗查询/响应限流器，
   allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)；
+  respond(query, response, client, now, truncate=True) 按响应配额
+  限流，放行返回 (response, 余量)，拒绝返回 (None, 0) 或仅含问题
+  段的截断应答 (tc, 0)；
   stats(reset=False) -> str 返回键序 query,response,expired,evicted,
   keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数。
 - replay_rate(rules, ops, expected=None) -> str: 在 RateLimiter 上
@@ -3075,6 +3078,16 @@ class RateLimiter:
     QR 置位抛 EncodeError。规则在构造时一次性校验；任何失败都不
     改变计数状态与入参。
 
+    respond(query, response, client, now, truncate=True) 按响应配额
+    限流：query、client、now 的校验与异常沿用 allow，response 非
+    bytes 或 truncate 非 bool 抛 TypeError，response 不符合 forward
+    的合格应答判定抛 EncodeError；全部校验先于计数完成，随后仅调用
+    一次 allow(query, client, now, "response")。放行返回
+    (response, 余量)；拒绝且 truncate 为 False 返回 (None, 0)；
+    拒绝且 truncate 为 True 返回 (tc, 0)，tc 的 ID 取 query、flags
+    取 response 并置 TC、QDCOUNT=1、其余计数为 0、问题段逐字节取
+    query[12:]。
+
     stats(reset=False) 返回固定键序 query,response,expired,evicted,
     keys 的紧凑 ASCII JSON（末尾一个换行）：query/response 各为键序
     allow,deny,unmatched 的对象，值为非负十进制整数。统计仅在 allow
@@ -3192,6 +3205,59 @@ class RateLimiter:
         self._stat["evicted"] += evicted
         self._last_now = now
         return True, remaining
+
+    def respond(self, query: bytes, response: bytes, client: str, now: int,
+                truncate: bool = True) -> tuple[bytes | None, int]:
+        """按响应配额限流并给出应答报文。
+
+        query、client、now 的校验与异常沿用 allow（kind 固定为
+        "response"）；response 非 bytes 或 truncate 非 bool 抛
+        TypeError；response 不符合 forward 的合格应答判定抛
+        EncodeError。全部校验先于计数完成，任何失败都不改变计数、
+        时钟与统计。校验通过后仅调用一次
+        allow(query, client, now, "response")，首项匹配、固定窗、
+        容量淘汰与统计提交均沿用 allow：放行返回 (response, 余量)；
+        拒绝且 truncate 为 False 返回 (None, 0)；拒绝且 truncate 为
+        True 返回 (tc, 0)，tc 的 ID 取 query，flags 取 response 并
+        置 TC，QDCOUNT=1，ANCOUNT、NSCOUNT、ARCOUNT 均为 0，问题段
+        逐字节取 query[12:]，不含 RR 或 OPT。同一状态和输入逐字节
+        一致；一次 respond 仅提交一次 response 统计。
+        """
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        if not isinstance(truncate, bool):
+            raise TypeError("truncate must be bool")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # client 与 query 的校验顺序同 allow：先地址、后解码。
+        try:
+            ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        msg = decode_query(query)
+        if msg["flags"] & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if len(msg["questions"]) != 1:
+            raise EncodeError("query must contain exactly one question")
+        if not _matching_reply(query, response):
+            raise EncodeError("response is not a valid reply to query")
+        # 全部校验已通过：仅调用一次 allow，统计随其成功返回提交一次。
+        allowed, remaining = self.allow(query, client, now, "response")
+        if allowed:
+            return response, remaining
+        if not truncate:
+            return None, 0
+        flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
+        tc = (query[0:2] + flags.to_bytes(2, "big")
+              + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
+              + query[12:])
+        return tc, 0
 
     def stats(self, reset: bool = False) -> str:
         """返回统计的固定键序紧凑 ASCII JSON（末尾一个换行）。
