@@ -125,7 +125,21 @@
   bool）/负分别抛 TypeError/ConfigError，冲突不读文件，文件缺失、
   I/O 错、超 16777216 字节或非 ASCII 分别抛 FileNotFoundError、
   OSError、ConfigError，内容不同时文件 version 须更大，result 为
-  "applied"、"unchanged" 或 "conflict"。
+  "applied"、"unchanged" 或 "conflict"；
+  dump_state(now) 导出区域历史、递归缓存与统计的整解析器快照
+  （顶层键序仅 v,zones,rec,stats，v=1，后三者分别为 dump_zones()、
+  dump_rec(now)、stats() 的解码对象，stats.c[1] 固定等于
+  rec.items 长度；紧凑 ASCII JSON、末尾单换行，最多 16777216 字节，
+  超限抛 ConfigError），now 异常沿用 dump_rec 且只读；
+  load_state(text, plan, now, timeout=5) 类方法先校验全部内容再恢复
+  实例（zones 沿用 load_zones，rec 沿用 load_rec 并按 now-rec.clock
+  衰减，stats 键序 h,m,x,u,c,l,r、c[2]=256、c[1] 等于 rec.items
+  长度且加载后重算、r 等于按 h,m 重算的 6 位小数比值），恢复区域
+  历史、修订号、stats 计数、递归正负缓存、FIFO 与最后成功时刻，
+  权威缓存为空，plan/timeout 取参数；text 非 str 或 now 非 int（含
+  bool）抛 TypeError，text 超 16777216 码点、JSON、重复键、键序、v
+  或交叉约束错抛 ConfigError，余错沿用 load_zones、load_rec 及构造
+  器，失败无实例。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -343,6 +357,14 @@ _REC_ITEM_KEYS = ["k", "q", "t", "c", "rr"]
 _REC_RR_KEYS = ["n", "t", "c", "ttl", "d"]
 _REC_ITEM_KINDS = frozenset(("p", "nx", "nd"))
 _MAX_REC_TEXT_LEN = 1048576
+# dump_state/load_state 整解析器快照：顶层键序仅 v,zones,rec,stats
+# （v 恒为 1，后三者分别为 dump_zones()、dump_rec(now)、stats() 的
+# 解码对象）；文本上限 16777216 码点（同区域文件上限）。
+_STATE_DUMP_KEYS = ["v", "zones", "rec", "stats"]
+_MAX_STATE_TEXT_LEN = 16777216
+# stats() JSON 的固定键序 h,m,x,u,c,l,r；加载时 c[1] 以 rec.items
+# 长度重算，r 以 h、m 重算，仅核对键序与字段形态。
+_STATS_KEYS = ["h", "m", "x", "u", "c", "l", "r"]
 
 
 def _read_name(data, offset, boundaries):
@@ -2271,6 +2293,109 @@ def _validate_rec_item(kind, rrs):
     return checked
 
 
+def _validate_rec_load(config, now, last_end):
+    """load_rec/load_state 共用的配置对象后半段校验。
+
+    入参为 JSON 解析（重复键已拒）后的配置对象：先做结构校验
+    （ConfigError），再做时钟校验（now 为负或早于上次成功结束时刻、
+    早于 clock 抛 CacheError），最后做 RR 值域与 SOA 校验，并要求
+    p 项 RR 的 ttl 在衰减前为正（RecordError）。返回
+    (clock, [(kind,key,规范化rr)], elapsed)；不改变任何状态。
+    """
+    clock, items = _check_rec_config(config)
+    # 时钟校验在全部结构校验之后、RR 值域校验之前；失败均无副作用。
+    if now < 0 or (last_end is not None and now < last_end):
+        raise CacheError("now must be non-negative and monotonic")
+    if now < clock:
+        raise CacheError("now must not be earlier than clock")
+    entries = [(kind, key, _validate_rec_item(kind, rrs))
+               for kind, key, rrs in items]
+    # p 项 RR 的 ttl 必须为正：ttl<=0 属非法记录，须在按 now-clock
+    # 衰减之前抛 RecordError（此时尚未触碰缓存、FIFO 与时钟）。
+    for kind, _key, rrs in entries:
+        if kind == "p" and any(rr[3] <= 0 for rr in rrs):
+            raise RecordError("p rr ttl must be positive")
+    return clock, entries, now - clock
+
+
+def _age_rec_entries(entries, elapsed, now):
+    """按 elapsed 衰减已校验的递归缓存条目并丢弃到期项。
+
+    返回 (正缓存dict, 负缓存dict, FIFO deque)；正条目插入时刻记 now、
+    TTL 为衰减后的正整数；负条目 SOA 与负 TTL 同算，剩余 <=0 丢弃。
+    """
+    new_pos = {}
+    new_neg = {}
+    new_order = deque()
+    for kind, key, rrs in entries:
+        if kind == "p":
+            aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                    for labels, rrtype, rrclass, ttl, rdata in rrs]
+            if min(rr[3] for rr in aged) <= 0:
+                continue  # 衰减后到期项丢弃（原始 ttl 均为正）
+            new_pos[key] = (now, aged)
+            new_order.append(("pos", key))
+        else:
+            labels, rrtype, rrclass, ttl, rdata = rrs[0]
+            remaining = ttl - elapsed
+            if remaining <= 0:
+                continue  # 到期项丢弃
+            soa = (labels, rrtype, rrclass, remaining, rdata)
+            rcode = _RCODE_NXDOMAIN if kind == "nx" else 0
+            new_neg[key] = (now, rcode, soa, remaining)
+            new_order.append(("neg", key))
+    return new_pos, new_neg, new_order
+
+
+def _check_state_stats(obj, rec_items):
+    """结构与交叉校验 dump_state 内嵌 stats 的解码对象，返回计数六元组。
+
+    键序须恰为 h,m,x,u,c,l,r：h/u/c/l 各为定长（4/3/3/4）非负非 bool
+    整数组，m、x 为非负非 bool 整数；r 为 0..1 的有限数值（bool 除外）
+    且等于按 h、m 重算的 6 位小数比值；c[2] 固定为 256，c[1] 固定
+    等于 rec.items 长度。形态或交叉约束错误统一抛 ConfigError。返回
+    (h, m, x, u, c, l)（均为拷贝/原始不可变整数值）。
+    """
+    if not isinstance(obj, dict) or list(obj.keys()) != _STATS_KEYS:
+        raise ConfigError("stats keys must be h,m,x,u,c,l,r")
+
+    def counts(value, size, field):
+        if not isinstance(value, list) or len(value) != size:
+            raise ConfigError(
+                field + " must be a list of " + str(size) + " ints")
+        for item in value:
+            if (not isinstance(item, int) or isinstance(item, bool)
+                    or item < 0):
+                raise ConfigError(
+                    field + " items must be non-negative ints")
+        return list(value)
+
+    h = counts(obj["h"], 4, "h")
+    u = counts(obj["u"], 3, "u")
+    c = counts(obj["c"], 3, "c")
+    l = counts(obj["l"], 4, "l")
+    for field in ("m", "x"):
+        value = obj[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError(field + " must be a non-negative int")
+    m, x = obj["m"], obj["x"]
+    r = obj["r"]
+    if isinstance(r, bool) or not isinstance(r, (int, float)):
+        raise ConfigError("r must be a number")
+    # json 默认解析接受 NaN/Infinity，须显式拒绝。
+    if r != r or r == float("inf") or r == float("-inf"):
+        raise ConfigError("r must be finite")
+    if not 0 <= r <= 1:
+        raise ConfigError("r out of range")
+    if c[2] != _CACHE_CAPACITY:
+        raise ConfigError("c[2] must be 256")
+    if c[1] != rec_items:
+        raise ConfigError("c[1] must equal rec items length")
+    if float(r) != float(_ratio_six(sum(h), sum(h) + m)):
+        raise ConfigError("r must equal the hits ratio of h and m")
+    return h, m, x, u, c, l
+
+
 class Resolver:
     """权威缓存与上游转发组合的解析器。
 
@@ -2378,11 +2503,12 @@ class Resolver:
     TypeError；text 超 1048576 码点、JSON 解析、重复键、键序、非
     RR 字段（v/clock/items/k/q/t/c 与 rr 数组形态）或重复缓存键
     错误抛 ConfigError；now 为负、回退（早于上次成功结束时刻）或
-    小于 clock 抛 CacheError；RR 字段值或 SOA 错误抛 RecordError。
-    全部结构校验先于时钟校验，时钟校验先于 RR 值域校验。全部通过
-    后按 now-clock 衰减各 ttl、丢弃到期项，原子替换递归正负缓存与
-    FIFO 并置成功时刻为 now；权威缓存、统计与清理计数不变。任何
-    失败都无副作用；同初态同参逐字节一致。
+    小于 clock 抛 CacheError；RR 字段值或 SOA 错误抛 RecordError，
+    p 项 RR 的 ttl<=0 在衰减前即抛 RecordError。全部结构校验先于
+    时钟校验，时钟校验先于 RR 值域校验。全部通过后按 now-clock
+    衰减各 ttl、丢弃到期项，原子替换递归正负缓存与 FIFO 并置成功
+    时刻为 now；权威缓存、统计与清理计数不变。任何失败都无副
+    作用；同初态同参逐字节一致。
 
     reload_zone(text)：导入 v0/v1/v2 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
@@ -2495,6 +2621,25 @@ class Resolver:
     修订号，保留递归缓存、时钟、plan 与统计（提交当下 stats() 逐字节
     不变）；version 为操作后修订号，result 为 "applied"、"unchanged"
     或 "conflict"。
+
+    dump_state(now)：导出区域历史、递归缓存与统计的整解析器快照，
+    只读。顶层键序仅 v,zones,rec,stats：v 恒为 1，zones、rec、stats
+    分别为 dump_zones()、dump_rec(now)、stats() 的解码对象（stats 的
+    c[1] 固定等于 rec.items 长度）。紧凑 ASCII JSON、末尾单换行，
+    最多 16777216 字节，超限抛 ConfigError。now 异常沿用 dump_rec
+    （TypeError/CacheError）且只读；同状态同参逐字节相同。
+
+    load_state(text, plan, now, timeout=5)：类方法，先校验全部内容再
+    恢复实例。zones 沿用 load_zones（schema 0/1），rec 沿用 load_rec
+    （结构校验先于时钟、先于 RR 值域，按 now-rec.clock 衰减并丢弃
+    到期项），stats 为 stats() 解码对象：键序 h,m,x,u,c,l,r，c[2]
+    固定 256、c[1] 固定等于 rec.items 长度且加载后按实际恢复条目数
+    重算，r 须等于按 h、m 重算的 6 位小数比值，其余沿用各自契约。
+    恢复区域修订历史与修订号、stats 计数、递归正负缓存、FIFO 及最后
+    成功时刻（now）；权威缓存为空，plan/timeout 取参数。text 非 str
+    或 now 非 int（含 bool）抛 TypeError；text 超 16777216 码点、JSON、
+    重复键、键序、v 或交叉约束错抛 ConfigError；余错沿用 load_zones、
+    load_rec 及构造器。任何失败都不产生实例；同态同参逐字节一致。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -3699,7 +3844,9 @@ class Resolver:
         k,q,t,c,rr，rr 元素键序 n,t,c,ttl,d。校验顺序为：text/now 类型
         （TypeError）；文本长度、JSON 解析、重复键、键序、非 RR 字段与
         重复缓存键（ConfigError）；now 为负、回退或小于 clock
-        （CacheError）；RR 字段值与 SOA（RecordError）。全部通过后按
+        （CacheError）；RR 字段值与 SOA（RecordError）。p 项 RR 的
+        ttl 必须为正，ttl<=0 在按 now-clock 衰减之前即抛 RecordError；
+        nx/nd 的负 TTL 允许衰减后为零，到期丢弃。全部通过后按
         now-clock 衰减各 ttl、丢弃到期项，原子替换递归正负缓存与
         FIFO 并置成功时刻为 now；权威缓存、统计与清理计数不变。任何
         失败都无副作用；同初态同参逐字节一致。
@@ -3714,42 +3861,135 @@ class Resolver:
             config = json.loads(text, object_pairs_hook=_config_pairs)
         except json.JSONDecodeError:
             raise ConfigError("invalid JSON") from None
-        clock, items = _check_rec_config(config)
-        # 时钟校验在全部结构校验之后、RR 值域校验之前；失败均无副作用。
-        if now < 0 or (self._last_end is not None and now < self._last_end):
-            raise CacheError("now must be non-negative and monotonic")
-        if now < clock:
-            raise CacheError("now must not be earlier than clock")
-        entries = [(kind, key, _validate_rec_item(kind, rrs))
-                   for kind, key, rrs in items]
-        # 按 now-clock 衰减并丢弃到期项；全部校验完成后原子提交：整体
+        clock, entries, elapsed = _validate_rec_load(
+            config, now, self._last_end)
+        # 全部校验完成后按 now-clock 衰减、丢弃到期项并原子提交：整体
         # 替换递归正负缓存与 FIFO，成功时刻置为 now。
-        elapsed = now - clock
-        new_pos = {}
-        new_neg = {}
-        new_order = deque()
-        for kind, key, rrs in entries:
-            if kind == "p":
-                aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
-                        for labels, rrtype, rrclass, ttl, rdata in rrs]
-                if min(rr[3] for rr in aged) <= 0:
-                    continue  # 到期项丢弃
-                new_pos[key] = (now, aged)
-                new_order.append(("pos", key))
-            else:
-                labels, rrtype, rrclass, ttl, rdata = rrs[0]
-                remaining = ttl - elapsed
-                if remaining <= 0:
-                    continue  # 到期项丢弃
-                soa = (labels, rrtype, rrclass, remaining, rdata)
-                rcode = _RCODE_NXDOMAIN if kind == "nx" else 0
-                new_neg[key] = (now, rcode, soa, remaining)
-                new_order.append(("neg", key))
+        new_pos, new_neg, new_order = _age_rec_entries(entries, elapsed, now)
         self._rec_pos = new_pos
         self._rec_neg = new_neg
         self._rec_order = new_order
         self._last_end = now
         return len(new_order)
+
+    def dump_state(self, now: int) -> str:
+        """导出区域历史、递归缓存与统计的整解析器快照（只读）。
+
+        顶层键序仅 v,zones,rec,stats：v 恒为 1；zones、rec、stats 分别
+        为 dump_zones()、dump_rec(now)、stats() 文本的解码对象（stats
+        的 c[1] 固定等于 rec.items 长度）。输出为紧凑 ASCII JSON、整数
+        十进制、末尾单换行，最多 16777216 字节，超限抛 ConfigError。
+        now 非 int 或为 bool 抛 TypeError；now<0 或早于上次成功结束
+        时刻抛 CacheError（沿用 dump_rec 的 now 异常），均无副作用。
+        只读：不改变任何状态，同状态同参逐字节相同；load_state 用同参
+        plan、timeout 与同一 now 加载得到等价实例，且再次导出逐字节一致。
+        """
+        # now 异常沿用 dump_rec：先经其完成类型与时钟校验（只读）。
+        rec_text = self.dump_rec(now)
+        zones_obj = json.loads(self.dump_zones())
+        rec_obj = json.loads(rec_text)
+        stats_obj = json.loads(self.stats())
+        # stats 的 c[1] 固定等于 rec.items 长度：dump_rec 跳过期项但不
+        # 删除（stats() 的 c[1] 仍计全部 FIFO 条目），故内嵌对象以此
+        # 为准改写；加载时该值再按实际恢复条目数重算。
+        stats_obj["c"][1] = len(rec_obj["items"])
+        config = {"v": 1, "zones": zones_obj, "rec": rec_obj,
+                  "stats": stats_obj}
+        text = json.dumps(config, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+        # 紧凑 ASCII 文本字节数与码点数一致；整快照超 16MiB 拒绝导出。
+        if len(text.encode("ascii")) > _MAX_STATE_TEXT_LEN:
+            raise ConfigError("state text exceeds 16777216 bytes")
+        return text
+
+    @classmethod
+    def load_state(cls, text: str, plan: list, now: int,
+                   timeout: int = 5) -> "Resolver":
+        """从 dump_state 快照校验全部内容后恢复等价解析器实例。
+
+        顶层键序仅 v,zones,rec,stats，v=1；zones 为 dump_zones() 形态
+        （schema 0/1，沿用 load_zones 契约），rec 为 dump_rec(now) 形态
+        （沿用 load_rec：结构校验先于时钟校验、先于 RR 值域校验，按
+        now-rec.clock 衰减并丢弃到期项），stats 为 stats() 解码对象
+        （键序 h,m,x,u,c,l,r；c[2]=256、c[1] 固定等于 rec.items 长度，
+        r 须等于按 h、m 重算的 6 位小数比值；加载后 c[1] 按实际恢复的
+        递归条目数重算）。先校验全部内容再构造实例：恢复区域修订历史与
+        修订号、stats 各计数及递归正负缓存、FIFO 与最后成功时刻（按
+        now 恢复）；权威缓存为空，plan、timeout 取参数，rated 与清理
+        计数清零。text 非 str 或 now 非 int（含 bool）抛 TypeError；
+        text 超 16777216 码点、JSON 解析、重复键、键序、v 或交叉约束
+        错误抛 ConfigError；其余错误沿用 load_zones、load_rec 及构造
+        器（ConfigError、RecordError、ZoneError、CacheError 与构造器
+        的 TypeError/ValueError）。任何失败都不产生实例；同态同参逐字节
+        一致。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if len(text) > _MAX_STATE_TEXT_LEN:
+            raise ConfigError("text exceeds 16777216 code points")
+        try:
+            config = json.loads(text, object_pairs_hook=_config_pairs)
+        except json.JSONDecodeError:
+            raise ConfigError("invalid JSON") from None
+        if not isinstance(config, dict) or list(config.keys()) != _STATE_DUMP_KEYS:
+            raise ConfigError("state keys must be v,zones,rec,stats")
+        version = config["v"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ConfigError("v must be int")
+        if version != 1:
+            raise ConfigError("unsupported v")
+        zones_obj, rec_obj, stats_obj = (
+            config["zones"], config["rec"], config["stats"])
+        if not isinstance(zones_obj, dict) or not isinstance(rec_obj, dict):
+            raise ConfigError("zones and rec must be objects")
+        # 三段结构层校验全部先于任何语义校验：zones 的 JSON 结构、rec 的
+        # 配置结构与 stats 的形态及交叉约束错误统一为 ConfigError。
+        zones_text = json.dumps(zones_obj, ensure_ascii=True,
+                                separators=(",", ":"))
+        schema, _zversion, history = _parse_zones_config(zones_text)
+        clock, rec_items = _check_rec_config(rec_obj)
+        h, m, x, u, c, l_buckets = _check_state_stats(
+            stats_obj, len(rec_items))
+        # zones 快照语义沿用 load_zones：先校验全部快照再恢复（结构错误
+        # 已在上一步排除，语义错误沿用 RecordError、ZoneError）。
+        snapshot_loader = (_load_zone_snapshot if schema == 1
+                           else _load_zone_snapshot_any)
+        snapshots = [(item["revision"], snapshot_loader(item["zone"]))
+                     for item in history]
+        kept = snapshots[-_ZONE_HISTORY_CAPACITY:]
+        # 时钟校验（CacheError）先于 rec RR 值域校验（RecordError）：新
+        # 实例时钟未设，仅要求 now 非负且不早于 rec.clock。
+        if now < 0:
+            raise CacheError("now must be non-negative")
+        if now < clock:
+            raise CacheError("now must not be earlier than clock")
+        entries = [(kind, key, _validate_rec_item(kind, rrs))
+                   for kind, key, rrs in rec_items]
+        for kind, _key, rrs in entries:
+            if kind == "p" and any(rr[3] <= 0 for rr in rrs):
+                raise RecordError("p rr ttl must be positive")
+        # 全部校验通过后才构造实例（plan、timeout 异常沿用构造器）并提交。
+        instance = cls(kept[-1][1], plan, timeout)
+        instance._revision = _zversion
+        instance._zone_history = {
+            revision: copy.deepcopy(zone) for revision, zone in kept}
+        new_pos, new_neg, new_order = _age_rec_entries(
+            entries, now - clock, now)
+        instance._rec_pos = new_pos
+        instance._rec_neg = new_neg
+        instance._rec_order = new_order
+        instance._last_end = now
+        # stats 计数恢复；c[0] 沿用快照（权威缓存为空，待下次解析提交时
+        # 同步），c[1] 不赋值而由 stats() 按实际递归条目数重算。
+        instance._stats_h = h
+        instance._stats_m = m
+        instance._stats_x = x
+        instance._stats_u = u
+        instance._stats_l = l_buckets
+        instance._stats_c0 = c[0]
+        return instance
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
