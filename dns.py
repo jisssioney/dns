@@ -48,6 +48,11 @@
   的原子区域更新事务，返回键序 version,result,serial 的紧凑 ASCII
   JSON 报告（末尾换行），result 为 "applied"、"unchanged"、"stale"
   或 "conflict"，修订号与 reload_zone 共用；
+  reload_zone_serial_tx(text, expected, force=False) 带修订号检查
+  与 SOA 序列号比较的原子换区事务，返回键序 version,result,serial
+  的紧凑 ASCII JSON 报告（末尾换行），result 为 "applied"、
+  "unchanged"、"stale"、"ambiguous" 或 "conflict"，conflict 时
+  serial 为 null，修订号与 reload_zone 共用；
   transfer_zone(from_serial, limit=65535) 只读返回键序
   version,serial,mode,delete,add 的紧凑 ASCII JSON（末尾换行），
   mode 为 "none"、"ixfr" 或 "axfr"，超限或序列号比较歧义抛
@@ -1792,6 +1797,26 @@ class Resolver:
     操作后修订号，serial 原样；非 applied 或任何异常均不改变任何
     状态。
 
+    reload_zone_serial_tx(text, expected, force=False)：带修订号检查
+    与 SOA 序列号比较的原子换区事务，返回键序 version,result,serial
+    的紧凑 ASCII JSON 报告（末尾换行）。text 非 str、expected 非
+    int（含 bool）或 force 非 bool 抛 TypeError，expected<0 抛
+    ConfigError。验参后先比 expected：不等于当前修订号时不解析
+    text，报告 conflict（version 为当前修订号，serial 为 null）且
+    不改变任何状态。相等时经 import_zone 导入并以候选 zone 构造
+    PositiveCache，失败沿用 ConfigError、RecordError、ZoneError；
+    当前与候选区域 SOA 的 rdata 均须完整为两个未压缩绝对名与五个
+    网络序 uint32 且无尾随，否则抛 ZoneError。候选与当前区域规范化
+    后等价报告 unchanged（版本、缓存不变）；否则按 compare_serial
+    比较候选与当前序列号：force 为 False 时仅 newer 提交，
+    equal/older 报告 stale，ambiguous 报告 ambiguous；force 为
+    True 时一律提交。提交为原子换区（清空权威缓存，保留递归缓存、
+    时钟、plan 与统计），修订号加 1 并按新修订号归档（容量 32），
+    报告 applied（version 为新修订号，提交当下 stats() 逐字节不
+    变）。serial 为候选区域的 SOA 序列号（uint32）；非 applied
+    结果或任何异常均不改变任何状态。result 为 "applied"、
+    "unchanged"、"stale"、"ambiguous" 或 "conflict"。
+
     transfer_zone(from_serial, limit=65535)：只读区域传送，返回键序
     version,serial,mode,delete,add 的紧凑 ASCII JSON（末尾单换行）。
     version 为当前修订号，serial 为当前 SOA 序列号，delete/add 为 RR
@@ -2276,6 +2301,69 @@ class Resolver:
         self._revision += 1
         self._archive_revision(self._revision, cache)
         return self._update_report(self._revision, "applied", serial)
+
+    def reload_zone_serial_tx(self, text: str, expected: int,
+                              force: bool = False) -> str:
+        """带修订号检查与 SOA 序列号比较的原子换区事务。
+
+        text 非 str、expected 非 int（含 bool）或 force 非 bool 抛
+        TypeError；expected<0 抛 ConfigError。验参后先比 expected：
+        不等于当前修订号时不解析 text，报告 conflict（version 为当前
+        修订号，serial 为 null）且不改变任何状态。相等时经 import_zone
+        导入并以候选 zone 构造 PositiveCache，失败沿用 ConfigError、
+        RecordError、ZoneError 且状态不变。当前与候选区域 SOA 的
+        rdata 均须完整为两个未压缩绝对名与五个网络序 uint32 且无尾随，
+        否则抛 ZoneError。候选的 export_zone 文本等于当前区域时报告
+        unchanged（版本、缓存不变）；否则按 compare_serial 比较候选与
+        当前序列号：force 为 False 时仅 newer 提交，equal/older 报告
+        stale，ambiguous 报告 ambiguous；force 为 True 时一律提交。
+        提交为原子换区（清空权威缓存，保留递归缓存、时钟、plan 与
+        统计），修订号加 1 并按新修订号归档，报告 applied（version 为
+        新修订号，提交当下 stats() 逐字节不变）。serial 为候选区域的
+        SOA 序列号（uint32），conflict 时为 null；非 applied 结果或
+        任何异常均不改变任何状态。报告为键序 version,result,serial 的
+        紧凑 ASCII JSON（十进制整数、末尾单换行），result 为
+        "applied"、"unchanged"、"stale"、"ambiguous" 或 "conflict"。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if not isinstance(force, bool):
+            raise TypeError("force must be bool")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if expected != self._revision:
+            # 修订号不匹配：不得解析 text，冲突本身不改变任何状态。
+            return self._update_report(self._revision, "conflict", None)
+        zone = import_zone(text)
+        cache = PositiveCache(zone)
+        # 两区 SOA rdata 均须完整为两个未压缩绝对名与五个 uint32。
+        current_serial = _zone_soa_serial(
+            self._cache._records, self._cache._origin)
+        if current_serial is None:
+            raise ZoneError("soa rdata must be two names and five uint32")
+        candidate_serial = _zone_soa_serial(cache._records, cache._origin)
+        if candidate_serial is None:
+            raise ZoneError("soa rdata must be two names and five uint32")
+        candidate_text = export_zone(zone)
+        current_text = export_zone(self._zone_model(self._cache))
+        if candidate_text == current_text:
+            # 候选与当前区域规范化后等价：不换区、不加修订号、不归档。
+            return self._update_report(
+                self._revision, "unchanged", candidate_serial)
+        relation = compare_serial(candidate_serial, current_serial)
+        if not force and relation != "newer":
+            # equal/older 报 stale，ambiguous 报 ambiguous；均不改状态。
+            result = "ambiguous" if relation == "ambiguous" else "stale"
+            return self._update_report(
+                self._revision, result, candidate_serial)
+        # 全部成功后原子提交：换区、修订号加 1，并按新当前修订号归档。
+        self._cache = cache
+        self._revision += 1
+        self._archive_revision(self._revision, cache)
+        return self._update_report(self._revision, "applied",
+                                   candidate_serial)
 
     def transfer_zone(self, from_serial: int,
                       limit: int = 65535) -> str:
