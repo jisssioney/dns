@@ -94,6 +94,17 @@
   的直转在成功或耗尽（UpstreamTimeout/UpstreamError）时原子提交，
   权威、缓存与 resolve_recursive 的 levels 不计；reset=True 先返回
   旧快照再清零上述计数；
+  dump_forward() 导出当前上游转发配置，返回顶层键序仅 version,config
+  的紧凑 ASCII JSON（末尾单换行）：version 为从 0 起的热加载版本号，
+  config 为 migrate_forward 的 v1 对象（初始 attempts=2，plan 按
+  原序、每上游仅取前 attempts 个事件），只读且同状态逐字节相同；
+  reload_forward(text, expected) 上游配置热加载事务，返回键序
+  version,result 的紧凑 ASCII JSON 报告（末尾换行）：expected 非
+  int（含 bool）抛 TypeError、负值抛 ConfigError，不等于当前版本时
+  不解析 text 报告 conflict；相符时复用 migrate_forward 校验规范化，
+  等价报告 unchanged，否则原子替换 timeout、attempts 与 plan、逐上游
+  统计按新 plan 清零、版本加 1 报告 applied（缓存、时钟与其他统计
+  保留）；result 仅 "applied"、"unchanged" 或 "conflict"；
   cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
   （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
   p,nx,nd,total,capacity,ttl，ttl 为同顺序三类最小剩余 TTL（无条目
@@ -2976,6 +2987,23 @@ class Resolver:
     False 只读，True 先返回旧快照再清零上述计数，plan、缓存、时钟
     及其他统计不变。
 
+    dump_forward()：导出当前上游转发配置，返回顶层键序仅 version,config
+    的紧凑 ASCII JSON（末尾单换行）。version 为从 0 起的热加载版本号；
+    config 为 migrate_forward 的 v1 对象（初始 attempts=2，plan 按
+    原序、每上游仅取前 attempts 个事件）。只读，同状态逐字节一致。
+
+    reload_forward(text, expected)：上游配置热加载事务，返回键序
+    version,result 的紧凑 ASCII JSON 报告（末尾换行）。expected 非
+    int（含 bool）抛 TypeError，负值抛 ConfigError；expected 不等于
+    当前版本时不解析 text，报告 conflict 且状态不变。相符时复用
+    migrate_forward 校验并规范化 text（text 非 str 抛 TypeError，
+    其余错误抛 ConfigError，上界同 migrate_forward）；候选与当前
+    配置等价报告 unchanged，否则原子替换 timeout、attempts 与 plan、
+    逐上游统计按新 plan 清零、版本加 1 并报告 applied；缓存、时钟与
+    其他统计保留。result 仅 "applied"、"unchanged" 或 "conflict"。
+    applied 后域外 resolve 依 plan 原序、每上游取前 attempts 个事件
+    并用新 timeout。
+
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
     p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
@@ -3178,6 +3206,11 @@ class Resolver:
         self._plan = copy.deepcopy(plan)  # 仅保存深拷贝，与外部改动隔离
         self._cache = PositiveCache(zone)
         self._timeout = timeout
+        # 上游热加载状态：每上游实际取用的事件数（初始同 forward 的前 2
+        # 个事件）与从 0 起的配置版本号；reload_forward 成功 applied 时
+        # 随 timeout、plan 原子替换并加一。
+        self._attempts = _FORWARD_DEFAULT_ATTEMPTS
+        self._forward_version = 0
         self._last_end = None  # 上次成功 resolve 的结束时刻
         # 域外递归结果缓存：与权威正/负缓存独立，共用键与正/负 TTL 规则，
         # 同一容量 256、同一 FIFO 淘汰。
@@ -3238,15 +3271,17 @@ class Resolver:
             return response, "authority", now, hit
         # 直转的逐上游事件计数与 forward 共用同一确定性模拟，仅在成功
         # 返回或耗尽（UpstreamTimeout/UpstreamError）时随统计原子提交。
+        # 生效计划按 plan 原序、每上游仅取前 attempts 个事件。
+        plan = self._effective_plan()
         upstream_counts = _upstream_forward_counts(
-            self._plan, query, self._timeout)
+            plan, query, self._timeout)
         try:
-            reply, name, end = forward(query, self._plan, now, self._timeout)
+            reply, name, end = forward(query, plan, now, self._timeout)
         except UpstreamTimeout:
             self._commit_upstream_counts(upstream_counts)
             self._stats_u[1] += 1
             self._stats_l[_duration_bucket(
-                _plan_total_elapsed(self._plan, self._timeout),
+                _plan_total_elapsed(plan, self._timeout),
                 self._timeout)] += 1
             self._sync_stats_c0()
             raise
@@ -3254,7 +3289,7 @@ class Resolver:
             self._commit_upstream_counts(upstream_counts)
             self._stats_u[2] += 1
             self._stats_l[_duration_bucket(
-                _plan_total_elapsed(self._plan, self._timeout),
+                _plan_total_elapsed(plan, self._timeout),
                 self._timeout)] += 1
             self._sync_stats_c0()
             raise
@@ -4311,6 +4346,83 @@ class Resolver:
             # 先返回旧快照再清零；plan、缓存、时钟与其他统计均保留。
             self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
         return text
+
+    def _effective_plan(self):
+        """域外直转实际生效的计划：plan 保持原序，每上游仅取前 attempts 个事件。"""
+        return [(name, events[:self._attempts])
+                for name, events in self._plan]
+
+    def _forward_config(self):
+        """当前上游配置的 migrate_forward v1 对象（键序 v,timeout,attempts,plan）。
+
+        plan 按原序、每上游仅取前 attempts 个事件；项键序 name,events，
+        事件键序 delay,reply，reply 为 null 或小写十六进制。
+        """
+        plan = []
+        for name, events in self._effective_plan():
+            plan.append({
+                "name": name,
+                "events": [{"delay": delay,
+                            "reply": None if reply is None else reply.hex()}
+                           for delay, reply in events]})
+        return {"v": 1, "timeout": self._timeout,
+                "attempts": self._attempts, "plan": plan}
+
+    def dump_forward(self) -> str:
+        """导出当前上游转发配置（顶层键序仅 version,config，末尾单换行）。
+
+        输出为紧凑 ASCII JSON。version 为从 0 起的热加载版本号；config
+        为 migrate_forward 的 v1 对象（键序 v,timeout,attempts,plan；
+        初始 attempts=2，plan 按原序、每上游仅取前 attempts 个事件，
+        reply 为 null 或小写十六进制）。只读，同状态逐字节一致。
+        """
+        payload = {"version": self._forward_version,
+                   "config": self._forward_config()}
+        return json.dumps(payload, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+
+    def reload_forward(self, text: str, expected: int) -> str:
+        """上游配置热加载事务，返回键序 version,result 的报告（末尾换行）。
+
+        expected 非 int（含 bool）抛 TypeError，负值抛 ConfigError；
+        expected 不等于当前版本时不解析 text，报告 conflict（version
+        为当前版本），不改变任何状态。相符时复用 migrate_forward 完整
+        校验并规范化 text（text 非 str 抛 TypeError，其余结构、范围与
+        上界错误抛 ConfigError）；候选与当前配置等价报告 unchanged
+        （版本与状态不变），否则原子替换 timeout、attempts 与 plan、
+        逐上游统计按新 plan 清零、版本加 1 并报告 applied；缓存、时钟
+        与其他统计保留，此外无副作用。applied 后域外 resolve 依 plan
+        原序、每上游取前 attempts 个事件并用新 timeout。报告为紧凑
+        ASCII JSON、十进制数字、末尾单换行，result 仅 "applied"、
+        "unchanged" 或 "conflict"。
+        """
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected version must be non-negative")
+        if expected != self._forward_version:
+            # 版本不匹配：不解析 text，冲突本身不改变任何状态。
+            return self._tx_report(self._forward_version, "conflict")
+        # 复用 migrate_forward：text 非 str 抛 TypeError，超长、JSON、
+        # 键序、版本、范围与十六进制错误抛 ConfigError；输出即规范 v1。
+        candidate = json.loads(migrate_forward(text))
+        if candidate == self._forward_config():
+            # 候选与当前配置等价：不替换、不加版本。
+            return self._tx_report(self._forward_version, "unchanged")
+        # 全部校验通过后原子提交：替换 timeout、attempts 与 plan，逐上游
+        # 统计按新 plan 清零，版本加 1；缓存、时钟与其他统计均保留。
+        self._timeout = candidate["timeout"]
+        self._attempts = candidate["attempts"]
+        self._plan = [
+            (item["name"],
+             [(event["delay"],
+               None if event["reply"] is None
+               else bytes.fromhex(event["reply"]))
+              for event in item["events"]])
+            for item in candidate["plan"]]
+        self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
+        self._forward_version += 1
+        return self._tx_report(self._forward_version, "applied")
 
     def cache_stats(self, now: int, reset: bool = False) -> str:
         """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
