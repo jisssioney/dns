@@ -79,6 +79,13 @@
   resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
   递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
+  upstream_stats(reset=False) 返回构造 plan 直转的逐上游统计，为顶层
+  键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
+  i,n,a,s,to,e,bad,ms 的对象（重名不合并，i 为从 0 起的序号，n 为
+  原上游名，其余为非负整数），t 省略 i、n 并为逐项和；仅经 resolve
+  的直转在成功或耗尽（UpstreamTimeout/UpstreamError）时原子提交，
+  权威、缓存与 resolve_recursive 的 levels 不计；reset=True 先返回
+  旧快照再清零上述计数；
   cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
   （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
   p,nx,nd,total,capacity,ttl，ttl 为同顺序三类最小剩余 TTL（无条目
@@ -2313,6 +2320,35 @@ def _plan_total_elapsed(plan, timeout):
     return elapsed
 
 
+def _upstream_forward_counts(plan, query, timeout):
+    """按 forward 语义对 plan 逐上游统计一次直转的事件计数。
+
+    返回与 plan 等长的 [a, s, to, e, bad, ms] 列表：每个上游仅取前 2
+    个事件，尝试即 a 加 1；delay > timeout 时 to 加 1、ms 加 timeout，
+    否则 ms 加 delay，reply 为 None 则 e 加 1，非空但未通过
+    _matching_reply 则 bad 加 1，通过则 s 加 1 并停止。无事件的上游
+    不计。与 forward 的时钟推进与停止点一致，本身不产生异常。
+    """
+    counts = [[0, 0, 0, 0, 0, 0] for _ in plan]
+    for index, (_name, events) in enumerate(plan):
+        entry = counts[index]
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            entry[0] += 1  # a：尝试
+            if delay > timeout:
+                entry[2] += 1  # to：超时
+                entry[5] += timeout
+                continue
+            entry[5] += delay
+            if reply is None:
+                entry[3] += 1  # e：无应答
+            elif not _matching_reply(query, reply):
+                entry[4] += 1  # bad：应答未通过匹配
+            else:
+                entry[1] += 1  # s：成功并停止
+                return counts
+    return counts
+
+
 def _duration_bucket(elapsed, timeout):
     """模拟时长分桶下标：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
     if elapsed <= 0:
@@ -2785,6 +2821,18 @@ class Resolver:
     换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
     同步），参数/计划/编码/时钟异常不更新，耗尽不改缓存与最后时刻。
 
+    upstream_stats(reset=False)：构造 plan 直转的逐上游统计，返回顶层
+    键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）。p 按 plan 位置列对象
+    （重名不合并），键序仅 i,n,a,s,to,e,bad,ms：i 为从 0 起的位置
+    序号，n 为原上游名，其余为非负整数（a 尝试、s 成功、to 超时、
+    e 无应答、bad 应答未通过匹配、ms 模拟耗时累计；每个上游仅取前
+    2 个事件，无事件不计）。t 省略 i、n，余键同序并为逐项和。仅经
+    resolve 进入该 plan 的直转计数（权威、缓存与 resolve_recursive
+    的 levels 不计），直转成功或耗尽抛 UpstreamTimeout/UpstreamError
+    时原子提交，其他异常不提交。reset 非 bool 抛 TypeError 且无变化；
+    False 只读，True 先返回旧快照再清零上述计数，plan、缓存、时钟
+    及其他统计不变。
+
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
     p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
@@ -3006,6 +3054,10 @@ class Resolver:
         self._rated_o = [0, 0, 0, 0]
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
+        # upstream_stats 的逐上游计数：与 plan 位置一一对应（重名不合并），
+        # 每项为 [a, s, to, e, bad, ms]，仅经 resolve 的直转在成功返回或
+        # 耗尽（UpstreamTimeout/UpstreamError）时原子提交。
+        self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -3041,9 +3093,14 @@ class Resolver:
             self._sync_stats_c0()
             self._last_end = now
             return response, "authority", now, hit
+        # 直转的逐上游事件计数与 forward 共用同一确定性模拟，仅在成功
+        # 返回或耗尽（UpstreamTimeout/UpstreamError）时随统计原子提交。
+        upstream_counts = _upstream_forward_counts(
+            self._plan, query, self._timeout)
         try:
             reply, name, end = forward(query, self._plan, now, self._timeout)
         except UpstreamTimeout:
+            self._commit_upstream_counts(upstream_counts)
             self._stats_u[1] += 1
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
@@ -3051,12 +3108,14 @@ class Resolver:
             self._sync_stats_c0()
             raise
         except UpstreamError:
+            self._commit_upstream_counts(upstream_counts)
             self._stats_u[2] += 1
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
                 self._timeout)] += 1
             self._sync_stats_c0()
             raise
+        self._commit_upstream_counts(upstream_counts)
         self._stats_u[0] += 1
         self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
         self._sync_stats_c0()
@@ -3244,6 +3303,13 @@ class Resolver:
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
         self._stats_c0 = len(self._cache._order)
+
+    def _commit_upstream_counts(self, counts):
+        """把一次直转的逐上游事件计数原子并入 upstream_stats 累计。"""
+        for index, entry in enumerate(counts):
+            acc = self._upstream_stats[index]
+            for kind in range(6):
+                acc[kind] += entry[kind]
 
     def _fold_authority_cleanup(self):
         """把权威缓存自上次折叠以来的清理事件并入解析器累计。
@@ -4065,6 +4131,44 @@ class Resolver:
         elapsed_buckets = list(self._stats_l)
         return _state_stats_text(h, m, x, u, c, elapsed_buckets) + "\n"
 
+    def upstream_stats(self, reset: bool = False) -> str:
+        """返回构造 plan 直转的逐上游统计（顶层键序仅 p,t，末尾单换行）。
+
+        输出为紧凑 ASCII JSON。p 按 plan 位置列对象（重名不合并），键序
+        仅 i,n,a,s,to,e,bad,ms：i 为从 0 起的位置序号，n 为原上游名，
+        其余为非负整数——a 尝试次数、s 成功、to 超时、e 无应答、bad
+        应答未通过匹配、ms 模拟耗时累计；每个上游仅取前 2 个事件，尝试
+        即 a 加 1，delay>timeout 时 to 加 1、ms 加 timeout，否则 ms 加
+        delay 后按 reply 为 None/未通过匹配/通过分别计 e/bad/s（通过即
+        停），无事件的上游不计。t 省略 i、n，余键同序并为逐项和。
+        仅经 resolve 进入该 plan 的直转计数（权威、缓存与
+        resolve_recursive 的 levels 不计），直转成功或耗尽抛
+        UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
+        reset 非 bool 抛 TypeError 且无变化；False 只读，重复调用逐
+        字节相同；True 先返回旧快照再清零上述计数，plan、缓存、时钟
+        及其他统计不变。同初态同调用序列逐字节一致。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        per = []
+        totals = [0, 0, 0, 0, 0, 0]
+        for index, (name, _events) in enumerate(self._plan):
+            acc = self._upstream_stats[index]
+            for kind in range(6):
+                totals[kind] += acc[kind]
+            per.append({"i": index, "n": name, "a": acc[0], "s": acc[1],
+                        "to": acc[2], "e": acc[3], "bad": acc[4],
+                        "ms": acc[5]})
+        payload = {"p": per,
+                   "t": {"a": totals[0], "s": totals[1], "to": totals[2],
+                         "e": totals[3], "bad": totals[4], "ms": totals[5]}}
+        text = json.dumps(payload, ensure_ascii=True,
+                          separators=(",", ":")) + "\n"
+        if reset:
+            # 先返回旧快照再清零；plan、缓存、时钟与其他统计均保留。
+            self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
+        return text
+
     def cache_stats(self, now: int, reset: bool = False) -> str:
         """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
 
@@ -4448,8 +4552,8 @@ class Resolver:
             # 规范化后内容一致：不替换、不改版本与任何状态。
             return self._tx_report(self._revision, "unchanged")
         # 全部校验成功后原子提交：区域历史、修订号、递归正负缓存、FIFO、
-        # 最后成功时刻与统计随候选一并替换；权威缓存随候选为空；rated 与
-        # 清理计数归零；plan 与 timeout 保留。
+        # 最后成功时刻与统计随候选一并替换；权威缓存随候选为空；rated、
+        # 逐上游与清理计数归零；plan 与 timeout 保留。
         self._cache = candidate._cache
         self._revision = candidate._revision
         self._zone_history = candidate._zone_history
@@ -4466,6 +4570,7 @@ class Resolver:
         self._rated_o = [0, 0, 0, 0]
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
+        self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
         self._clean_expired = [0, 0]
         self._clean_evicted = [0, 0]
         return self._tx_report(self._revision, "applied")
