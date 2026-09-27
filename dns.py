@@ -42,6 +42,14 @@
 - TransferError: 区传送差异或全量记录超过 limit（ValueError 子类）。
 - forward(query, plan, now, timeout=5): 按 plan 顺序模拟上游转发，
   成功返回 (应答报文, 上游名, 结束时刻)。
+- migrate_forward(text: str) -> str: 把 v0/v1 上游配置文本完整校验、
+  规范化并迁移为 v1 配置文本（v0 顶层键序 v,timeout,plan，迁移补
+  attempts=2；v1 键序 v,timeout,attempts,plan；timeout 1..60、
+  attempts 1..2，均为非 bool 整数；plan 含 1..16 项，项键序
+  name,events，events 含 0..2 项，项键序 delay,reply，reply 为 null
+  或解码后不超 65535 字节的偶长小写十六进制，events 多于 attempts
+  抛 ConfigError；紧凑 ASCII JSON、整数十进制、十六进制小写、末尾
+  单换行；输入限 1048576 码点；规范 v1 再次迁移逐字节不变）。
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
   resolve_authorized(query, client, rules, now, limit=512, default="deny")
@@ -367,6 +375,17 @@ _MAX_PLAN_ITEMS = 16
 _PLAN_EVENTS_USED = 2
 _MIN_TIMEOUT = 1
 _MAX_TIMEOUT = 60
+# migrate_forward 的 v0/v1 上游配置：v0 顶层键序仅 v,timeout,plan，
+# 迁移补 attempts=2；v1 顶层键序仅 v,timeout,attempts,plan。timeout 为
+# 1..60、attempts 为 1..2 的非 bool 整数；plan 项键序仅 name,events，
+# events 项键序仅 delay,reply，每上游 events 限 0..2 且不得多于 attempts。
+_FORWARD_CONFIG_KEYS_V0 = ["v", "timeout", "plan"]
+_FORWARD_CONFIG_KEYS_V1 = ["v", "timeout", "attempts", "plan"]
+_FORWARD_PLAN_ITEM_KEYS = ["name", "events"]
+_FORWARD_EVENT_KEYS = ["delay", "reply"]
+_FORWARD_MIN_ATTEMPTS = 1
+_FORWARD_MAX_ATTEMPTS = 2
+_FORWARD_DEFAULT_ATTEMPTS = 2
 _MAX_REPLY_LEN = 65535
 _FLAG_QR = 0x8000
 _MAX_RECURSION_LEVELS = 16
@@ -2203,6 +2222,130 @@ def forward(query, plan, now, timeout=5):
     if saw_timeout and not saw_other:
         raise UpstreamTimeout("all upstream attempts timed out")
     raise UpstreamError("no usable upstream reply")
+
+
+def _check_forward_config(config):
+    """对已解析的 v0/v1 上游配置对象做完整结构校验，返回 (version, plan list)。
+
+    v0 顶层键序仅 v,timeout,plan（v=0）；v1 顶层键序仅
+    v,timeout,attempts,plan（v=1）。timeout 为 1..60、attempts 为 1..2
+    的非 bool 整数（v0 迁移补 attempts=2，仅用于交叉约束）；plan 含
+    1..16 项，项键序仅 name,events，name 为非空 str；events 含 0..2
+    项，项键序仅 delay,reply，delay 为非负非 bool 整数，reply 为 null
+    或解码后不超 65535 字节的偶长小写十六进制。某上游 events 多于
+    attempts 抛 ConfigError。容器或字段类型、键序、版本、范围、十六
+    进制错误统一抛 ConfigError；返回的 plan 为两层保持原序的配置列表
+    （reply 保留原始 None/小写十六进制字符串）。
+    """
+    if not isinstance(config, dict):
+        raise ConfigError("config must be an object")
+    keys = list(config.keys())
+    if keys == _FORWARD_CONFIG_KEYS_V0:
+        version = 0
+    elif keys == _FORWARD_CONFIG_KEYS_V1:
+        version = 1
+    else:
+        raise ConfigError("invalid config key order")
+    value = config["v"]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError("v must be int")
+    if value != version:
+        raise ConfigError("unsupported v")
+    timeout = config["timeout"]
+    if not isinstance(timeout, int) or isinstance(timeout, bool):
+        raise ConfigError("timeout must be int")
+    if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
+        raise ConfigError("timeout out of range")
+    if version == 1:
+        attempts = config["attempts"]
+        if not isinstance(attempts, int) or isinstance(attempts, bool):
+            raise ConfigError("attempts must be int")
+        if not _FORWARD_MIN_ATTEMPTS <= attempts <= _FORWARD_MAX_ATTEMPTS:
+            raise ConfigError("attempts out of range")
+    else:
+        attempts = _FORWARD_DEFAULT_ATTEMPTS
+    plan = config["plan"]
+    if not isinstance(plan, list):
+        raise ConfigError("plan must be list")
+    if not 1 <= len(plan) <= _MAX_PLAN_ITEMS:
+        raise ConfigError("plan must contain 1..16 items")
+    checked_plan = []
+    for item in plan:
+        if not isinstance(item, dict):
+            raise ConfigError("plan item must be an object")
+        if list(item.keys()) != _FORWARD_PLAN_ITEM_KEYS:
+            raise ConfigError("plan item keys must be name,events")
+        name = item["name"]
+        if not isinstance(name, str):
+            raise ConfigError("name must be str")
+        if not name:
+            raise ConfigError("name must be non-empty")
+        events = item["events"]
+        if not isinstance(events, list):
+            raise ConfigError("events must be list")
+        if not 0 <= len(events) <= _PLAN_EVENTS_USED:
+            raise ConfigError("events must contain 0..2 items")
+        if len(events) > attempts:
+            raise ConfigError("events must not exceed attempts")
+        checked_events = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise ConfigError("event must be an object")
+            if list(event.keys()) != _FORWARD_EVENT_KEYS:
+                raise ConfigError("event keys must be delay,reply")
+            delay = event["delay"]
+            if not isinstance(delay, int) or isinstance(delay, bool):
+                raise ConfigError("delay must be int")
+            if delay < 0:
+                raise ConfigError("delay must be non-negative")
+            reply = event["reply"]
+            if reply is not None:
+                if not isinstance(reply, str):
+                    raise ConfigError("reply must be null or str")
+                if (len(reply) % 2
+                        or any(c not in _LOWER_HEXDIGITS for c in reply)):
+                    raise ConfigError(
+                        "reply must be even-length lowercase hex")
+                if len(reply) // 2 > _MAX_REPLY_LEN:
+                    raise ConfigError("reply exceeds 65535 bytes")
+            checked_events.append({"delay": delay, "reply": reply})
+        checked_plan.append({"name": name, "events": checked_events})
+    return version, timeout, attempts, checked_plan
+
+
+def migrate_forward(text: str) -> str:
+    """把 v0/v1 上游配置文本完整校验、规范化并迁移为 v1 配置文本。
+
+    v0 顶层键序仅 v,timeout,plan（v=0），迁移补 attempts=2；v1 顶层
+    键序仅 v,timeout,attempts,plan（v=1）。timeout 为 1..60、attempts
+    为 1..2 的非 bool 整数；plan 含 1..16 项，项键序仅 name,events，
+    name 为非空 str；events 含 0..2 项，项键序仅 delay,reply，delay
+    为非负非 bool 整数，reply 为 null 或解码后不超 65535 字节的偶长
+    小写十六进制。先完整校验内容，再保持 plan 与 events 两层原序
+    输出 v1；某上游 events 多于 attempts 抛 ConfigError。输出为固定
+    键序（v,timeout,attempts,plan；项 name,events；事件 delay,reply）
+    的紧凑 ASCII JSON，整数十进制、十六进制小写、末尾单换行。同输入
+    逐字节一致，规范 v1 再次迁移逐字节不变。text 非 str 抛 TypeError；
+    JSON 解析、重复键、键序、版本、容器或字段类型、范围、十六进制
+    错误均抛 ConfigError（不泄漏 json 异常）。输入限 1048576 码点。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    if len(text) > _MAX_MIGRATE_TEXT_LEN:
+        raise ConfigError("text exceeds 1048576 code points")
+    try:
+        config = json.loads(text, object_pairs_hook=_config_pairs)
+    except ConfigError:
+        # 重复键由 _config_pairs 抛 ConfigError，原样传播。
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        # json 对超长整数抛非 JSONDecodeError 的 ValueError、对超深
+        # 嵌套抛 RecursionError，统一归为 ConfigError，不泄漏 json 异常。
+        raise ConfigError("invalid JSON") from None
+    _version, timeout, attempts, plan = _check_forward_config(config)
+    out = {"v": 1, "timeout": timeout, "attempts": attempts, "plan": plan}
+    return json.dumps(out, ensure_ascii=True,
+                      separators=(",", ":")) + "\n"
 
 
 def _check_resolve_inputs(query, now, limit, last_end):
