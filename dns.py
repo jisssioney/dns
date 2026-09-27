@@ -101,10 +101,17 @@
   返回键序 version,result 的紧凑 ASCII JSON 报告（末尾换行），
   result 为 "applied"、"unchanged" 或 "conflict"；applied 原子替换
   timeout、attempts 与 plan 并加一版本，upstream_stats 按新 plan
-  清零，缓存、时钟与其他统计保留；
+  清零，缓存、时钟与其他统计保留；仅 expected 匹配且未抛异常的
+  applied/unchanged 按提交序记入 forward_audit；
   初始上游配置为版本 0，applied 时按新版本号归档快照，历史容量
   32、超量淘汰最小版本号且版本号不复用；
   forward_versions() 只读返回保留的上游配置版本号（严格升序元组）；
+  forward_audit() 只读导出已提交变更的提交序审计（紧凑 ASCII JSON、
+  末尾换行）：顶层键序仅 v,o（v=1），o 至多 4096 项、项键序仅
+  k,x,e,r,a（k 取 l/r，x 为规范化配置文本或非负目标版本，e、a 为
+  前后版本，r 取 applied/unchanged）；仅匹配且无异常的 reload/
+  rollback 及成功 replay 内各步入账，冲突、异常与整批失败不入账；
+  输出超 16777216 字节时淘汰最早项，其文本可直接重放；
   rollback_forward(target, expected) 带版本检查的原子上游配置回滚，
   返回键序 version,result,target 的紧凑 ASCII JSON 报告（末尾
   换行），result 为 "applied"、"unchanged" 或 "conflict"；target
@@ -112,14 +119,16 @@
   加一版本，upstream_stats 按恢复 plan 清零，其余状态保留；
   replay_forward(log, expected) 原子重放上游配置操作序列，返回键序
   v,r 的紧凑 ASCII JSON 报告（末尾换行）：log 限 1048576 码点
-  ASCII JSON，顶层键序 v,o（v=1），o 含 1..4096 个键序仅 k,x,e 的
-  项（k="l" 时 x 为 migrate_forward 配置文本，k="r" 时 x 为非负
-  非 bool 目标版本，e 为非负非 bool 步骤前预期版本）；版本不符不
-  解析 log 并报告 conflict，相符时完整预检（错误抛 ReplayError）、
-  深拷贝上隔离调用 reload_forward/rollback_forward（目标缺失等
-  异常原样传播），任一失败不提交，全部成功后一次提交，r 为出现
-  applied 则 "applied" 否则 "unchanged"，提交后配置、版本、32 项
-  历史与直转统计等同逐步调用，其余状态不变，同态同 log 逐字节
+  ASCII JSON，顶层键序 v,o（v=1），o 含 0..4096 项（空 o 合法），
+  兼容键序仅 k,x,e 的旧三键项与键序仅 k,x,e,r,a 的五键审计项
+  （可混用：k="l" 时 x 为 migrate_forward 配置文本，k="r" 时 x 为
+  非负非 bool 目标版本，e 为非负非 bool 步骤前预期版本，r 为该步
+  实际结果、a 为步骤后版本）；版本不符不解析 log 并报告 conflict，
+  相符时先规范化全部项，再以副本推演配置、历史与版本，每步调用前
+  核对 e、调用后核对五键项 r、a（不符抛 ReplayError），目标缺失等
+  异常原样传播，任一失败不提交、不入账，全部成功后一次原子提交
+  配置、版本、32 项历史、直转统计与审计队列，r 为出现 applied 则
+  "applied" 否则 "unchanged"，其余状态不变，同初态同序列逐字节
   一致；
   cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
   （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
@@ -346,11 +355,24 @@ _MAX_REPLAY_LOG_TEXT_LEN = 1048576
 # 逐字节一致。
 _REPLAY_LOG_CONFLICT = '{"v":1,"result":"conflict","ops":[],"state":null}\n'
 # replay_forward 的上游配置重放日志：顶层键序仅 v,o（v 恒为 1），o 含
-# 1..4096 项，项键序仅 k,x,e：k="l" 时 x 为 migrate_forward 配置文本，
-# k="r" 时 x 为非负非 bool 目标版本；e 为非负非 bool 的步骤前预期版本。
+# 0..4096 项。项有两种形态，同一日志内可混用：旧三键项键序仅
+# k,x,e；forward_audit 导出的五键项键序仅 k,x,e,r,a。k="l" 时 x
+# 为 migrate_forward 配置文本，k="r" 时 x 为非负非 bool 目标版本；
+# e 为非负非 bool 的步骤前预期版本；五键项另含 r（仅
+# "applied"/"unchanged"，即该步实际结果）与 a（非负非 bool 的步骤
+# 后版本号）。
 _REPLAY_FORWARD_KEYS = ["v", "o"]
 _REPLAY_FORWARD_ITEM_KEYS = ["k", "x", "e"]
+_REPLAY_FORWARD_AUDIT_ITEM_KEYS = ["k", "x", "e", "r", "a"]
 _REPLAY_FORWARD_OPS = frozenset(("l", "r"))
+_REPLAY_FORWARD_RESULTS = frozenset(("applied", "unchanged"))
+# forward_audit 的入账上限：o 至多 4096 项；完整输出（{"v":1,"o":[...]}
+# 加末尾换行）超过 16777216 字节时淘汰最早项。
+_MAX_FORWARD_AUDIT_OPS = 4096
+_MAX_FORWARD_AUDIT_BYTES = 16777216
+# 非空审计输出长度对各项 (len(项文本)+1) 之和的固定增量：
+# len('{"v":1,"o":[')=12、len(']}\n')=3、末项无逗号再减 1，共 14。
+_FORWARD_AUDIT_FIXED_BYTES = 14
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -1426,13 +1448,16 @@ def _parse_replay_forward_log(text):
     """解析并结构预检 replay_forward 的日志文本，返回项列表（不执行）。
 
     text 已由调用方限定为不超过 1048576 码点的 ASCII str。日志须为
-    ASCII JSON 对象：顶层键序仅 v,o，v 恒为 1；o 为含 1..4096 项的
-    数组，项为键序仅 k,x,e 的对象：k 仅 "l"/"r"，k="l" 时 x 为 str
-    （migrate_forward 配置文本，其内容与长度由执行时预检收口），
-    k="r" 时 x 为非负非 bool 整数（rollback 目标版本）；e 为非负
-    非 bool 整数（步骤前暂存预期版本）。JSON 解析（含超长整数、超
-    深嵌套）、重复键、顶层/项键序、v、容器与字段类型、项数量或
-    取值错误统一抛 ReplayError，不泄漏 json 异常。
+    ASCII JSON 对象：顶层键序仅 v,o，v 恒为 1；o 为含 0..4096 项的
+    数组（空 o 为合法空操作），同一日志内旧三键项（键序仅 k,x,e）与
+    forward_audit 五键项（键序仅 k,x,e,r,a）可混用。k 仅 "l"/"r"：
+    k="l" 时 x 为 str（migrate_forward 配置文本，其内容与长度由配置
+    预检阶段收口），k="r" 时 x 为非负非 bool 整数（rollback 目标
+    版本）；e 为非负非 bool 整数（步骤前暂存预期版本）。五键项另须
+    r 为 "applied"/"unchanged"、a 为非负非 bool 整数（声明的步骤后
+    版本），由执行预检阶段与隔离推演结果逐项核对。JSON 解析（含超长
+    整数、超深嵌套）、重复键、顶层/项键序、v、容器与字段类型、项
+    数量或取值错误统一抛 ReplayError，不泄漏 json 异常。
     """
     try:
         log = json.loads(text, object_pairs_hook=_replay_log_pairs)
@@ -1454,14 +1479,19 @@ def _parse_replay_forward_log(text):
     items = log["o"]
     if not isinstance(items, list):
         raise ReplayError("o must be list")
-    if not 1 <= len(items) <= _MAX_REPLAY_OPS:
-        raise ReplayError("o must contain 1..4096 items")
+    if not 0 <= len(items) <= _MAX_FORWARD_AUDIT_OPS:
+        raise ReplayError("o must contain 0..4096 items")
     checked = []
     for item in items:
         if not isinstance(item, dict):
             raise ReplayError("item must be dict")
-        if list(item.keys()) != _REPLAY_FORWARD_ITEM_KEYS:
-            raise ReplayError("item keys must be k,x,e")
+        keys = list(item.keys())
+        if keys == _REPLAY_FORWARD_ITEM_KEYS:
+            audited = False
+        elif keys == _REPLAY_FORWARD_AUDIT_ITEM_KEYS:
+            audited = True
+        else:
+            raise ReplayError("item keys must be k,x,e or k,x,e,r,a")
         kind = item["k"]
         if not isinstance(kind, str) or kind not in _REPLAY_FORWARD_OPS:
             raise ReplayError('k must be "l" or "r"')
@@ -1475,7 +1505,19 @@ def _parse_replay_forward_log(text):
         if (not isinstance(expected, int) or isinstance(expected, bool)
                 or expected < 0):
             raise ReplayError("e must be a non-negative int")
-        checked.append((kind, value, expected))
+        if audited:
+            result = item["r"]
+            if (not isinstance(result, str)
+                    or result not in _REPLAY_FORWARD_RESULTS):
+                raise ReplayError('r must be "applied" or "unchanged"')
+            after = item["a"]
+            if (not isinstance(after, int) or isinstance(after, bool)
+                    or after < 0):
+                raise ReplayError("a must be a non-negative int")
+        else:
+            result = None
+            after = None
+        checked.append((kind, value, expected, result, after))
     return checked
 
 
@@ -3079,14 +3121,16 @@ class Resolver:
     返回键序仅 version,result 的紧凑 ASCII JSON 报告（末尾单换行）。
     expected 非 int（含 bool）抛 TypeError，负值抛 ConfigError；
     expected 不等于当前版本号时不解析 text，报告 conflict 且状态
-    不变。相符时 text 非 str 抛 TypeError，否则复用 migrate_forward
-    完整校验并规范化（输入限 1048576 码点）。候选与当前生效配置
-    相同报告 unchanged（版本号不变）；否则原子替换 timeout、
-    attempts 与 plan，版本号加 1 并报告 applied。applied 后域外
-    resolve 依新 plan 原序、每上游取前 attempts 个事件并用新
+    不变（不入审计）。相符时 text 非 str 抛 TypeError，否则复用
+    migrate_forward 完整校验并规范化（输入限 1048576 码点）。候选与
+    当前生效配置相同报告 unchanged（版本号不变）；否则原子替换
+    timeout、attempts 与 plan，版本号加 1 并报告 applied。applied 后
+    域外 resolve 依新 plan 原序、每上游取前 attempts 个事件并用新
     timeout；upstream_stats 按新 plan 清零，缓存、时钟与其他统计
     保留，除此之外无副作用。result 仅 "applied"、"unchanged" 或
-    "conflict"；unchanged、conflict 与任何异常均不改变任何状态。
+    "conflict"；unchanged 与 applied 在 expected 匹配且无异常时按
+    提交序记入 forward_audit（x 为规范化配置文本），conflict 与任何
+    异常均不改变任何状态且不入账。
 
     构造时初始上游配置存为版本 0；reload_forward 或 rollback_forward
     报告 applied 时按新版本号归档规范化快照，历史容量 32、超量淘汰
@@ -3095,31 +3139,46 @@ class Resolver:
     forward_versions()：只读返回保留的上游配置版本号，为严格升序
     元组；不改变任何状态。
 
+    forward_audit()：只读导出已提交上游配置变更的提交序审计，输出
+    紧凑 ASCII JSON、末尾单换行，顶层键序仅 v,o（v 恒为 1），o 至多
+    4096 项、项键序仅 k,x,e,r,a：k 取 "l"/"r"，k="l" 时 x 为
+    migrate_forward 规范化文本、k="r" 时 x 为非负目标版本，e、a 为
+    该步前、后版本号，r 取 "applied"/"unchanged"。仅 expected 匹配
+    且未抛异常的 reload_forward、rollback_forward 及成功
+    replay_forward 内的各步入账；conflict、异常与整批失败不入账。
+    完整输出超 16777216 字节或项数超 4096 时淘汰最早项；空队列输出
+    {"v":1,"o":[]} 加换行。只读：同状态重复调用逐字节一致，其文本可
+    直接作为 replay_forward 的 log 重放。
+
     rollback_forward(target, expected)：带版本检查的原子上游配置
     回滚，返回键序 version,result,target 的紧凑 ASCII JSON 报告
     （末尾单换行）。target/expected 非 int（含 bool）抛 TypeError，
     负值抛 ConfigError；expected 不等于当前版本号时不查 target，
-    报告 conflict；相等且 target 未保留抛 ConfigError；目标为当前
-    版本或与当前配置等价报告 unchanged；否则恢复 timeout、attempts
-    与 plan，版本号加 1 并按新版本号归档，报告 applied。applied 后
-    upstream_stats 按恢复 plan 清零，缓存、时钟、区域、递归状态与
-    其他统计不变；非 applied 与任何异常均不改变任何状态。
+    报告 conflict（不入审计）；相等且 target 未保留抛 ConfigError；
+    目标为当前版本或与当前配置等价报告 unchanged；否则恢复
+    timeout、attempts 与 plan，版本号加 1 并按新版本号归档，报告
+    applied。applied 后 upstream_stats 按恢复 plan 清零，缓存、时钟、
+    区域、递归状态与其他统计不变；unchanged 与 applied 在 expected
+    匹配且无异常时按提交序记入 forward_audit（x 为目标版本号），
+    conflict 与任何异常均不改变任何状态且不入账。
 
     replay_forward(log, expected)：确定性原子重放上游配置操作序列，
     返回键序 v,r 的紧凑 ASCII JSON 报告（末尾单换行）。log 限
-    1048576 码点 ASCII JSON，顶层键序 v,o（v=1），o 含 1..4096
-    项，项键序仅 k,x,e：k="l" 时 x 为 migrate_forward 配置文本，
-    k="r" 时 x 为非负非 bool 目标版本；e 为非负非 bool 的步骤前
-    预期版本。log/expected 类型错抛 TypeError，expected<0 抛
-    ConfigError；expected 不等于当前版本号时不解析 log，报告
-    conflict（v 为当前版本号）且状态不变。相符时完整预检：解析、
-    重复键、键序、版本、数量、字段、非 ASCII、配置错误或 e 不等于
-    步骤前暂存版本号均抛 ReplayError；随后在深拷贝上隔离调用
-    reload_forward/rollback_forward，rollback 目标未保留等异常原样
-    传播，任一失败不提交。全部成功后一次原子提交配置、直转统计、
-    版本号与 32 项历史（其余状态不变）；v 为提交后版本号，r 为出现
-    applied 则 "applied"，否则 "unchanged"。提交后状态等同逐步
-    调用，同态同 log 逐字节一致。
+    1048576 码点 ASCII JSON，顶层键序 v,o（v=1），o 含 0..4096 项
+    （空 o 合法、结果恒 unchanged），兼容旧三键项 k,x,e 与
+    forward_audit 五键项 k,x,e,r,a（同一日志可混用）：k="l" 时 x
+    为 migrate_forward 配置文本，k="r" 时 x 为非负非 bool 目标
+    版本；e 为非负非 bool 的步骤前预期版本，五键项的 r 须为该步实际
+    结果、a 须为步骤后版本。log/expected 类型错抛 TypeError，
+    expected<0 抛 ConfigError；expected 不等于当前版本号时不解析
+    log，报告 conflict（v 为当前版本号）且状态不变。相符时先规范化
+    全部项，再在深拷贝上推演配置、历史与版本：每步调用前核对 e、
+    调用后核对五键项 r、a，不符均抛 ReplayError；rollback 目标未
+    保留等异常原样传播，任一失败不提交、不入账。全部成功后一次原子
+    提交配置、直转统计、版本号、32 项历史与 forward_audit 队列（成功
+    序列各步按提交序入账），其余状态不变；v 为提交后版本号，r 为出现
+    applied 则 "applied"，否则 "unchanged"。提交后状态等同逐步调用，
+    同初态同序列逐字节一致。
 
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
@@ -3358,6 +3417,15 @@ class Resolver:
         # 且列表不原地改，与生效配置及外部改动隔离。
         self._forward_history = {}
         self._archive_forward(0)
+        # forward_audit 的提交序入账队列：元素为已渲染的五键审计项文本
+        # （键序 k,x,e,r,a），_forward_audit_bytes 为各项 len(文本)+1
+        # 之和（项间逗号预算），非空完整输出长度 = 该值 + 14（空队列
+        # 固定输出 {"v":1,"o":[]} 加换行）。仅成功的 reload_forward、
+        # rollback_forward 与成功 replay_forward 的各步入账；与对应配置
+        # 变更在同一原子步骤增减，副本推演时随之隔离演化，整批失败不
+        # 影响真实解析器。
+        self._forward_audit = deque()
+        self._forward_audit_bytes = 0
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -4539,7 +4607,11 @@ class Resolver:
         current = json.dumps(self._forward_config(), ensure_ascii=True,
                              separators=(",", ":")) + "\n"
         if migrated == current:
-            # 候选与当前生效配置等价：不替换、不加版本号。
+            # 候选与当前生效配置等价：不替换、不加版本号；版本匹配且
+            # 校验全过，按提交序记一笔 unchanged 审计。
+            self._append_forward_audit(
+                "l", migrated, self._forward_version,
+                "unchanged", self._forward_version)
             return self._tx_report(self._forward_version, "unchanged")
         # migrate_forward 已完整校验，其输出可安全解析并直转内部 plan。
         config = json.loads(migrated)
@@ -4553,12 +4625,16 @@ class Resolver:
         # 全部成功后原子提交：替换 timeout、attempts 与 plan，版本号
         # 加 1 并按新版本号归档快照，upstream_stats 按新 plan 清零；
         # 缓存、时钟与其他统计保留。
+        before = self._forward_version
         self._timeout = config["timeout"]
         self._attempts = config["attempts"]
         self._plan = plan
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in plan]
         self._forward_version += 1
         self._archive_forward(self._forward_version)
+        # 审计与配置同一原子步骤入账（x 为规范化 v1 文本）。
+        self._append_forward_audit("l", migrated, before,
+                                   "applied", self._forward_version)
         return self._tx_report(self._forward_version, "applied")
 
     def _forward_snapshot(self):
@@ -4586,6 +4662,50 @@ class Resolver:
         版本号单调递增不复用。只读：不改变任何状态，同状态结果相同。
         """
         return tuple(sorted(self._forward_history))
+
+    def _append_forward_audit(self, kind, value, before, result, after):
+        """把一笔已提交的上游配置变更按提交序入 forward_audit 队列。
+
+        渲染为键序仅 k,x,e,r,a 的紧凑 ASCII JSON 项文本后入队，并按
+        FIFO 淘汰最早项直至项数不超过 4096 且完整 forward_audit 输出
+        不超过 16777216 字节（新项自身远小于上限，循环必终止）。调用
+        仅限已原子提交成功的变更（applied/unchanged），与状态变更在
+        同一原子步骤执行；副本推演时本队列随之隔离演化。
+        """
+        item = json.dumps(
+            {"k": kind, "x": value, "e": before, "r": result, "a": after},
+            ensure_ascii=True, separators=(",", ":"))
+        self._forward_audit.append(item)
+        self._forward_audit_bytes += len(item) + 1
+        while (len(self._forward_audit) > _MAX_FORWARD_AUDIT_OPS
+               or (self._forward_audit
+                   and self._forward_audit_bytes
+                   + _FORWARD_AUDIT_FIXED_BYTES
+                   > _MAX_FORWARD_AUDIT_BYTES)):
+            oldest = self._forward_audit.popleft()
+            self._forward_audit_bytes -= len(oldest) + 1
+
+    def forward_audit(self) -> str:
+        """只读导出自构造以来已提交上游配置变更的提交序审计文本。
+
+        输出为紧凑 ASCII JSON、末尾单换行，顶层键序仅 "v","o"：
+        v 恒为 1；o 按提交序列出至多 4096 个审计项，项键序仅
+        "k","x","e","r","a"——k 取 "l"（reload_forward）或 "r"
+        （rollback_forward）；k="l" 时 x 为 migrate_forward 规范化
+        后的配置文本，k="r" 时 x 为非负目标版本；e、a 为该步执行
+        前、后的版本号；r 取 "applied" 或 "unchanged"。仅
+        expected 匹配且未抛异常的 reload_forward、rollback_forward
+        以及成功 replay_forward 内的各步入账；conflict、任何异常与
+        整批失败的 replay_forward 均不入账。完整输出超过 16777216
+        字节（或项数超过 4096）时在入账时淘汰最早项；本方法只读，
+        不改变任何状态，同状态重复调用逐字节一致。空队列输出
+        {"v":1,"o":[]} 加换行。审计文本可直接作为 replay_forward 的
+        log 重放：其 r、a 与各步实际结果一致，故核对通过。
+        """
+        if not self._forward_audit:
+            return '{"v":1,"o":[]}\n'
+        return ('{"v":1,"o":['
+                + ",".join(self._forward_audit) + "]}\n")
 
     def rollback_forward(self, target: int, expected: int) -> str:
         """带版本检查的原子上游配置回滚，返回键序 version,result,target。
@@ -4620,13 +4740,18 @@ class Resolver:
         if snapshot is None:
             raise ConfigError("target version not retained")
         if snapshot == self._forward_snapshot():
-            # 目标为当前版本或与当前生效配置等价：不替换、不加版本号。
+            # 目标为当前版本或与当前生效配置等价：不替换、不加版本号；
+            # 版本匹配且校验全过，按提交序记一笔 unchanged 审计。
+            self._append_forward_audit(
+                "r", target, self._forward_version,
+                "unchanged", self._forward_version)
             return self._rollback_report(self._forward_version, "unchanged",
                                          target)
         # 全部校验通过后原子提交：恢复 timeout、attempts 与 plan（重建
         # 列表以与快照隔离），upstream_stats 按恢复 plan 清零，版本号
         # 加 1 并按新版本号归档；缓存、时钟、区域、递归状态与其他统计
         # 均保留。
+        before = self._forward_version
         timeout, attempts, plan = snapshot
         self._timeout = timeout
         self._attempts = attempts
@@ -4634,38 +4759,46 @@ class Resolver:
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in plan]
         self._forward_version += 1
         self._archive_forward(self._forward_version)
+        # 审计与配置同一原子步骤入账（x 为目标版本号）。
+        self._append_forward_audit("r", target, before,
+                                   "applied", self._forward_version)
         return self._rollback_report(self._forward_version, "applied",
                                      target)
 
     def replay_forward(self, log: str, expected: int) -> str:
-        """确定性原子重放上游配置操作序列：整体预检、隔离执行、一次提交。
+        """确定性原子重放上游配置操作序列：整体预检、隔离推演、一次提交。
 
         log 为不超过 1048576 码点的 ASCII JSON：顶层键序仅 v,o，v 恒为
-        1；o 含 1..4096 项，项键序仅 k,x,e：k 仅 "l"/"r"，k="l" 时 x
-        为 migrate_forward 配置文本（预检阶段对其运行 migrate_forward
-        完整校验，含 1048576 码点长度限制，规范化文本供隔离执行复用），
-        k="r" 时 x 为非负非 bool 的 rollback 目标版本；e 为非负非 bool
-        整数，须等于该步骤执行前暂存版本号。log 非 str 或 expected 非
-        int（含 bool）抛 TypeError；expected<0 抛 ConfigError；expected
-        不等于当前版本号时不解析 log，返回键序 v,r 的报告（v 为当前
-        版本号、r="conflict"），不改变任何状态。
+        1；o 含 0..4096 项（空 o 为合法空操作，结果恒 unchanged）。项
+        有两种形态且可混用：旧三键项键序仅 k,x,e；forward_audit 导出的
+        五键项键序仅 k,x,e,r,a。k 仅 "l"/"r"，k="l" 时 x 为
+        migrate_forward 配置文本（预检阶段先对全部 "l" 项运行
+        migrate_forward 完整校验，含 1048576 码点长度限制，规范化文本
+        供隔离推演复用），k="r" 时 x 为非负非 bool 的 rollback 目标
+        版本；e 为非负非 bool 整数，须等于该步骤执行前暂存版本号；
+        五键项的 r 须为该步实际结果（"applied"/"unchanged"），a 须为
+        该步执行后的暂存版本号。log 非 str 或 expected 非 int（含
+        bool）抛 TypeError；expected<0 抛 ConfigError；expected 不等于
+        当前版本号时不解析 log，返回键序 v,r 的报告（v 为当前版本号、
+        r="conflict"），不改变任何状态。
 
-        相符时先完整预检（先于一切隔离执行）：超长、非 ASCII、JSON
-        解析、重复键、键序、v、版本（数量、字段、非 bool、非负）、项
-        数量、字段类型、非 ASCII 或任一 k="l" 配置错误均抛 ReplayError。
-        随后在解析器深拷贝上按序隔离执行：逐步核对 e 等于步骤前暂存
-        版本号（不符抛 ReplayError），k="l" 隔离调用 reload_forward、
-        k="r" 隔离调用 rollback_forward；rollback 目标未保留等异常原样
-        传播（不转 ReplayError）。任一预检或执行失败均不提交，真实
-        解析器不变。
+        相符时先规范化全部项，再在解析器深拷贝上按序推演配置、历史与
+        版本：每步先核对 e 等于步骤前暂存版本号（不符抛 ReplayError），
+        再在副本上隔离调用 reload_forward（入参为规范化 v1 文本）或
+        rollback_forward，随后五键项核对 r、a 与推演结果一致（不符抛
+        ReplayError），使 forward_audit 文本可直接重放；rollback 目标
+        未保留等异常原样传播（不转 ReplayError）。任一预检或推演失败
+        均不提交，真实解析器（含审计队列）不变，整批失败不入账。
 
-        全部成功后一次原子提交仅替换 timeout、attempts、plan、
-        upstream_stats、版本号与 32 项历史（取自暂存副本），其余状态
-        不变。返回键序 v,r 的紧凑 ASCII JSON（末尾单换行）：v 为提交
-        后版本号，r 为序列中出现 applied 则 "applied"，否则
-        "unchanged"。提交后配置、版本号、32 项历史及直转统计须等同
-        以同一版本序列逐步调用 reload_forward/rollback_forward，其余
-        状态不变。同态同 log 逐字节一致。
+        全部成功后一次原子提交：timeout、attempts、plan、
+        upstream_stats、版本号、32 项历史与 forward_audit 队列均取自
+        暂存副本（成功序列的各步按提交序入账，受 4096 项与 16777216
+        字节淘汰），其余状态不变。返回键序 v,r 的紧凑 ASCII JSON（末尾
+        单换行）：v 为提交后版本号，r 为序列中出现 applied 则
+        "applied"，否则 "unchanged"。提交后配置、版本号、32 项历史及
+        直转统计须等同以同一版本序列逐步调用
+        reload_forward/rollback_forward，其余状态不变。同初态同序列逐
+        字节一致。
         """
         if not isinstance(log, str):
             raise TypeError("log must be str")
@@ -4682,28 +4815,31 @@ class Resolver:
             raise ReplayError("log exceeds 1048576 code points")
         if not log.isascii():
             raise ReplayError("log must be ASCII")
-        # 结构预检：仅校验日志形态与字段类型，不触碰任何配置内容；
-        # k="l" 的配置内容随后由独立的完整预检阶段收口。
+        # 结构预检：仅校验日志形态与字段类型（兼容旧三键项与五键审计项、
+        # 空 o），不触碰任何配置内容；k="l" 的配置内容随后由规范化阶段
+        # 收口。
         checked = _parse_replay_forward_log(log)
-        # 完整预检（先于一切隔离执行）：对每个 k="l" 项的配置文本运行
-        # 纯函数 migrate_forward，长度、解析、结构等配置错误统一为
+        # 规范化全部项（先于一切副本推演）：对每个 k="l" 项的配置文本
+        # 运行纯函数 migrate_forward，长度、解析、结构等配置错误统一为
         # ReplayError；规范 v1 文本再次迁移逐字节不变，规范化结果直接
-        # 供隔离执行复用，使执行阶段不可能再冒出配置类 ConfigError。
+        # 供隔离推演复用，使推演阶段不可能再冒出配置类 ConfigError。
         migrated = {}
-        for index, (kind, value, _step_expected) in enumerate(checked):
+        for index, (kind, value, _e, _r, _a) in enumerate(checked):
             if kind == "l":
                 try:
                     migrated[index] = migrate_forward(value)
                 except ConfigError:
                     raise ReplayError("forward config is invalid") from None
-        # 隔离执行：全部步骤在深拷贝上执行，任何失败放弃全部暂存
-        # 状态，真实解析器（配置、版本、历史、直转统计、缓存、时钟与
-        # 其他统计）均不受影响。
+        # 隔离推演：全部步骤在深拷贝上执行，逐步先核对 e 再调用、调用后
+        # 核对五键项的 r、a；副本的审计队列随各步真实入账并自行淘汰。
+        # 任何失败放弃全部暂存状态，真实解析器（配置、版本、历史、审计、
+        # 直转统计、缓存、时钟与其他统计）均不受影响。
         candidate = copy.deepcopy(self)
         applied = False
-        for index, (kind, value, step_expected) in enumerate(checked):
+        for index, (kind, value, step_expected,
+                    claim_result, claim_after) in enumerate(checked):
+            # 调用前核对 e：与结构错误同级，整序列拒绝、不入账。
             if step_expected != candidate._forward_version:
-                # e 不等于步骤前暂存版本号：与结构错误同级，整序列拒绝。
                 raise ReplayError("e must equal the staged version")
             staged = candidate._forward_version
             if kind == "l":
@@ -4713,16 +4849,27 @@ class Resolver:
                 # 目标未保留等 ConfigError 原样传播，不转 ReplayError；
                 # expected 恒为暂存当前号，故无 conflict。
                 report = candidate.rollback_forward(value, staged)
-            if json.loads(report)["result"] == "applied":
+            result = json.loads(report)["result"]
+            # 五键审计项：r、a 必须与副本推演结果逐项一致，整批核对通过
+            # 后提交，保证审计文本可直接重放。
+            if claim_result is not None and claim_result != result:
+                raise ReplayError("r must match the replayed result")
+            if claim_after is not None and (
+                    claim_after != candidate._forward_version):
+                raise ReplayError("a must match the replayed version")
+            if result == "applied":
                 applied = True
-        # 全部成功后原子提交：仅替换上游配置、直转统计、版本号与历史，
-        # 缓存、时钟、区域、递归状态与其他统计全部保留。
+        # 全部成功后原子提交：仅替换上游配置、直转统计、版本号、历史与
+        # 审计队列（含本序列各步入账及淘汰结果），缓存、时钟、区域、递归
+        # 状态与其他统计全部保留。
         self._timeout = candidate._timeout
         self._attempts = candidate._attempts
         self._plan = candidate._plan
         self._upstream_stats = candidate._upstream_stats
         self._forward_version = candidate._forward_version
         self._forward_history = candidate._forward_history
+        self._forward_audit = candidate._forward_audit
+        self._forward_audit_bytes = candidate._forward_audit_bytes
         return json.dumps(
             {"v": self._forward_version,
              "r": "applied" if applied else "unchanged"},
