@@ -15,7 +15,8 @@
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
 - edns(query: bytes, model: dict, rcode: int = 0, options: list | None = None)
-  -> bytes: 编码可含 OPT（查询 RDATA 按选项 TLV 解析）的 EDNS 应答报文。
+  -> bytes: 编码可含 OPT（查询 RDATA 按选项 TLV 解析）的 EDNS 应答报文；
+  OPT 版本 1..255 时返回 BADVERS 版本协商应答。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -32,7 +33,8 @@
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
-  应答末项回显 OPT；stats(reset=False) 返回键序 h,m,x,k 的
+  应答末项回显 OPT（OPT 版本非 0 时直接返回 BADVERS 且不触缓存）；
+  stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
 - UpstreamTimeout: 上游转发全部超时（UpstreamError 子类）。
@@ -336,6 +338,7 @@ _MAX_EDNS_RCODE = 0xFFF
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
+_RCODE_BADVERS = 16
 _CACHE_CAPACITY = 256
 # 区域修订历史容量：每个成功换区修订保存一份规范化区域深拷贝，
 # 超量淘汰最小修订号；修订号单调递增、不复用。
@@ -475,15 +478,16 @@ def decode_query(data: bytes) -> dict:
 
 
 def _decode_edns_query(data):
-    """解码可含单个 OPT 的查询报文，返回 (msg, (opt_class, do, opts) 或 None)。
+    """解码可含单个 OPT 的查询报文。
 
-    问题段解码契约同 decode_query，但查询截断（问题区越界）、非法名字
-    （含压缩问题）、AN/NS 非空、非法 AR/OPT 与尾随字节一律抛
-    EDNSError；报文长度与问题数等其余错误仍抛 MessageError。AR 限 0 或
-    1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、扩展码/
-    版本 0、flags 仅 DO 的 OPT。OPT 的 RDATA 按选项 TLV 解析：每项为
-    网络序 uint16 code、uint16 length、length 字节 data，重复项保序；
-    头或数据截断、RDLENGTH 内残缺抛 EDNSError。
+    返回 (msg, (opt_class, version, do, opts) 或 None)。问题段解码契约
+    同 decode_query，但查询截断（问题区越界）、非法名字（含压缩问题）、
+    AN/NS 非空、非法 AR/OPT 与尾随字节一律抛 EDNSError；报文长度与
+    问题数等其余错误仍抛 MessageError。AR 限 0 或 1 条，有则须为未压缩
+    根 owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags
+    仅 DO 的 OPT。OPT 的 RDATA 按选项 TLV 解析：每项为网络序
+    uint16 code、uint16 length、length 字节 data，重复项保序；头或
+    数据截断、RDLENGTH 内残缺抛 EDNSError。
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -534,8 +538,8 @@ def _decode_edns_query(data):
             raise EDNSError("additional record must be OPT")
         if rrclass < _MIN_OPT_CLASS:
             raise EDNSError("opt class out of range")
-        if ttl >> 24 or (ttl >> 16) & 0xFF:
-            raise EDNSError("opt extended rcode and version must be 0")
+        if ttl >> 24:
+            raise EDNSError("opt extended rcode must be 0")
         if ttl & 0xFFFF & ~_FLAG_DO:
             raise EDNSError("opt flags must be DO only")
         if pos + rdlength > len(data):
@@ -552,7 +556,7 @@ def _decode_edns_query(data):
                 raise EDNSError("opt option data truncated")
             opts.append((code, bytes(data[pos:pos + opt_len])))
             pos += opt_len
-        opt = (rrclass, bool(ttl & _FLAG_DO), opts)
+        opt = (rrclass, (ttl >> 16) & 0xFF, bool(ttl & _FLAG_DO), opts)
     if pos != len(data):
         raise EDNSError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}, opt
@@ -979,26 +983,64 @@ def encode_response(query: bytes, model: dict) -> bytes:
     return _encode_response(query, model, 0)
 
 
+def _encode_badvers(msg, opt, limit):
+    """把已解码查询编码为 BADVERS 版本协商应答（OPT 版本 1..255）。
+
+    flags=0x8400|(查询 flags&0x7910)，问题按规范化重编码，AN=NS=0、
+    AR=1；OPT 为未压缩根 owner、TYPE41、回显 CLASS 与 DO，TTL 为
+    DO?0x01008000:0x01000000（扩展码取 BADVERS>>4、版本 0），
+    RDLENGTH=0。上限 min(limit, CLASS)，超限抛 EncodeError 且不置 TC。
+    """
+    opt_class, _version, do, _opts = opt
+    limit = min(limit, opt_class)
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+    out += flags.to_bytes(2, "big")
+    out += len(msg["questions"]).to_bytes(2, "big")
+    out += (0).to_bytes(4)  # ANCOUNT/NSCOUNT 均为 0
+    out += (1).to_bytes(2)  # ARCOUNT=1（末项 OPT）
+    offsets = {}
+    for question in msg["questions"]:
+        _write_name(out, _normalize_name(question["name"]), offsets)
+        out += question["type"].to_bytes(2, "big")
+        out += question["class"].to_bytes(2, "big")
+    ttl = ((_RCODE_BADVERS >> 4) << 24) | (_FLAG_DO if do else 0)
+    out += (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+            + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
+            + (0).to_bytes(2, "big"))
+    if len(out) > limit:
+        raise EncodeError("header, question and OPT exceed limit")
+    return bytes(out)
+
+
 def edns(query: bytes, model: dict, rcode: int = 0,
          options: list | None = None) -> bytes:
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
     query/model 的解码与编码契约同 decode_query/encode_response；查询
     AR 限 0 或 1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、
-    扩展码/版本 0、flags 仅 DO 的 OPT，其 RDATA 按选项 TLV 解析（重复
-    项保序，头或数据截断、RDLENGTH 内残缺抛 EDNSError）。非法 AR/OPT、
-    截断、尾随或 model 含 OPT 抛 EDNSError。rcode 须非 bool 整数（类型
-    错 TypeError）：有 OPT 限 0..4095、无 OPT 限 0..15，越界 EncodeError。
-    options 为应答 OPT 的 TLV 选项表，None 表示空列表：每项为键序
-    "code"、"data" 的 dict，code 为 0..65535 非 bool 整数，data 为
-    bytes，原序编码且不合并重复 code，RDLENGTH 精确；容器或字段类型
-    错抛 TypeError，键序错、code 越界、单项 data 或总 RDATA 超 65535
-    字节抛 EncodeError。查询无 OPT 时 options 必须为 None，否则
-    EncodeError。无 OPT 时上限 min(model.limit, 512) 且不回 OPT；有
-    OPT 时上限 min(model.limit, CLASS)，应答 ar 末项为同 CLASS 根 OPT，
-    TTL=(rcode>>4)<<24|DO，头部低 4 位为 rcode&15。编码其余同
-    encode_response：超限普通 RR 按 ar、ns、an 尾删并置 TC，OPT 固定
-    不删不截；问题与 OPT 超限抛 EncodeError。
+    扩展码 0、版本 0..255、flags 仅 DO 的 OPT，其 RDATA 按选项 TLV
+    解析（重复项保序，头或数据截断、RDLENGTH 内残缺抛 EDNSError）。
+    非法 AR/OPT、截断、尾随或 model 含 OPT 抛 EDNSError。rcode 须非
+    bool 整数（类型错 TypeError）：有 OPT 限 0..4095、无 OPT 限
+    0..15，越界 EncodeError。options 为应答 OPT 的 TLV 选项表，None
+    表示空列表：每项为键序 "code"、"data" 的 dict，code 为 0..65535
+    非 bool 整数，data 为 bytes，原序编码且不合并重复 code，RDLENGTH
+    精确；容器或字段类型错抛 TypeError，键序错、code 越界、单项 data
+    或总 RDATA 超 65535 字节抛 EncodeError。查询无 OPT 时 options
+    必须为 None，否则 EncodeError。无 OPT 时上限 min(model.limit,
+    512) 且不回 OPT；有 OPT 时上限 min(model.limit, CLASS)，应答 ar
+    末项为同 CLASS 根 OPT，TTL=(rcode>>4)<<24|DO，头部低 4 位为
+    rcode&15。OPT 版本 1..255 触发版本协商：既有参数校验不变，此外
+    model 的 an/ns/ar 须全空、rcode 须为 0、options 须为 None，否则
+    EncodeError；通过则返回 BADVERS 应答（flags=0x8400|(查询
+    flags&0x7910)，问题重编码，AN=NS=0、AR=1，OPT 为根 owner、
+    TYPE41、回显 CLASS 与 DO，TTL=DO?0x01008000:0x01000000，
+    RDLENGTH=0），上限 min(model.limit, CLASS)，超限抛 EncodeError
+    且不置 TC。版本 0 时编码其余同 encode_response：超限普通 RR 按
+    ar、ns、an 尾删并置 TC，OPT 固定不删不截；问题与 OPT 超限抛
+    EncodeError。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1012,6 +1054,17 @@ def edns(query: bytes, model: dict, rcode: int = 0,
         raise EncodeError("query has QR set")
     if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
         raise EncodeError("limit out of range")
+    if opt is not None and opt[1] != 0:
+        # 版本协商：仅支持 EDNS 版本 0；1..255 以 BADVERS 拒绝，应答不
+        # 携带任何 RR 与选项，故要求 model 三段为空、rcode 为 0 且
+        # options 为 None。
+        if an or ns or ar:
+            raise EncodeError("badvers response must have empty sections")
+        if rcode:
+            raise EncodeError("badvers requires rcode 0")
+        if options is not None:
+            raise EncodeError("badvers response carries no options")
+        return _encode_badvers(msg, opt, limit)
     opt_wire = b""
     if opt is None:
         if options is not None:
@@ -1023,7 +1076,7 @@ def edns(query: bytes, model: dict, rcode: int = 0,
         if not 0 <= rcode <= _MAX_EDNS_RCODE:
             raise EncodeError("rcode out of range")
         opt_rdata = _validate_edns_options(options)
-        opt_class, do, _query_opts = opt
+        opt_class, _opt_version, do, _query_opts = opt
         limit = min(limit, opt_class)
         ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
         opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
@@ -1682,15 +1735,17 @@ class PositiveCache:
     resolve_edns(query, now, limit=65535) 处理恰含一个合法 OPT 的单问题
     查询：查缓存前须恰有一个合法 OPT，OPT 缺失（ARCOUNT=0）、非法或
     尾随字节均抛 EDNSError；报文解码与 OPT 校验沿用 edns 契约（未压缩
-    根 owner、TYPE41、CLASS512..65535、扩展码与版本 0、flags 仅 DO、
-    选项 TLV 校验），QDCOUNT 非 1 或 QR 置位抛 EncodeError，其余报文
-    非法抛 EDNSError。缓存键、正负缓存、TTL 衰减、FIFO、命中与统计和
-    resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；应答按同一
-    权威计划以 edns 语义编码：上限为 min(limit, OPT CLASS)，RCODE 取
-    计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本及 RDLENGTH 为
-    0），普通 RR 超限按既有顺序整条尾删并置 TC、OPT 不删，头部、
-    问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计或最后时刻，
-    成功原子提交；同样调用序列逐字节一致。
+    根 owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags
+    仅 DO、选项 TLV 校验），QDCOUNT 非 1 或 QR 置位抛 EncodeError，
+    其余报文非法抛 EDNSError。OPT 版本 1..255 时按版本协商直接返回
+    (BADVERS 应答, False)，上限 min(limit, OPT CLASS)，不读写缓存、
+    FIFO、统计或时钟。版本 0 时缓存键、正负缓存、TTL 衰减、FIFO、
+    命中与统计和 resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；
+    应答按同一权威计划以 edns 语义编码：上限为 min(limit, OPT
+    CLASS)，RCODE 取计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本
+    及 RDLENGTH 为 0），普通 RR 超限按既有顺序整条尾删并置 TC、OPT
+    不删，头部、问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计
+    或最后时刻，成功原子提交；同样调用序列逐字节一致。
 
     stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
     h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
@@ -1773,7 +1828,10 @@ class PositiveCache:
         CacheError；limit 不在 12..65535 抛 EncodeError。缓存键、正负
         缓存、TTL 衰减、FIFO、命中与统计和 resolve 完全共享（键忽略
         OPT、ID、flags 与 limit）；应答按同一权威计划以 edns 语义编码，
-        异常不改变缓存、统计或最后时刻，成功原子提交。
+        异常不改变缓存、统计或最后时刻，成功原子提交。OPT 版本 1..255
+        时按版本协商直接返回 (BADVERS 应答, False)：应答同 edns 的
+        BADVERS 契约（上限 min(limit, CLASS)，超限抛 EncodeError 且
+        不置 TC），不读写缓存、FIFO、统计或时钟。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
@@ -1794,6 +1852,10 @@ class PositiveCache:
         msg, opt = _decode_edns_query(query)
         if opt is None:
             raise EDNSError("query must contain exactly one OPT")
+        if opt[1] != 0:
+            # 版本协商：OPT 版本 1..255 直接以 BADVERS 拒绝，不读写
+            # 缓存、FIFO、统计或时钟。
+            return _encode_badvers(msg, opt, limit), False
         return self._resolve_cached(msg, query, now, limit,
                                     _encode_plan_edns)
 
