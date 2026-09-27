@@ -293,6 +293,8 @@ _MAX_REPLAY_CACHE_OPS = 4096
 _REPLAY_RESOLVER_CACHE_STATS_KEYS = ["op", "now", "reset"]
 _MAX_REPLAY_OPS = 4096
 _MAX_REPLAY_RESULT_BYTES = 16777216
+_REPLAY_LOG_KEYS = ["v", "now", "ops"]
+_MAX_REPLAY_LOG_TEXT_LEN = 1048576
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -1285,6 +1287,16 @@ def _config_pairs(pairs):
     for key, value in pairs:
         if key in obj:
             raise ConfigError("duplicate key")
+        obj[key] = value
+    return obj
+
+
+def _replay_log_pairs(pairs):
+    """json object_pairs_hook：保序构造 dict，重复键抛 ReplayError。"""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ReplayError("duplicate key")
         obj[key] = value
     return obj
 
@@ -4285,6 +4297,91 @@ class Resolver:
         self._clean_evicted = [0, 0]
         return self._tx_report(self._revision, "applied")
 
+    def replay_log(self, text: str, expected: int) -> str:
+        """确定性原子日志重放：整体预检、隔离执行、全部成功后一次提交。
+
+        text 为不超过 1048576 码点的 ASCII JSON：顶层键序仅 v,now,ops，
+        v 恒为 1，now 为非负非 bool 整数，ops 为 1..4096 项并沿用
+        replay 的输入协议（reload/reload_tx/migrate/migrate_tx/
+        restore_zones/resolve/recursive/rollback/rollback_batch/
+        update/cache_stats，全部操作在隔离执行前完成预检）。text 非
+        str 或 expected 非 int（含 bool）抛 TypeError；expected<0、
+        text 超长或非 ASCII、JSON 解析、重复键、键序、v 或操作非法抛
+        ReplayError。expected 不等于当前修订号时不解析 text，报告
+        conflict（ops 为空、state 为 null），不改变任何状态。相符时
+        在解析器深拷贝上依次执行各操作：任一步抛出的异常原样传播并
+        放弃全部暂存状态（真实解析器不变）。全部成功后 now 沿用
+        dump_state 的时钟契约且不得早于各步 end（违反抛 CacheError，
+        同样不提交），state 取候选 dump_state(now) 的解码对象；输出
+        超过 16777216 字节抛 ReplayError 且不提交。仅全部通过后才把
+        候选状态整体原子提交到本解析器。输出为紧凑 ASCII JSON、末尾
+        单换行，顶层键序仅 v,result,ops,state：v 恒为 1，result 为
+        "applied" 或 "conflict"；applied 的 ops 项沿用 replay 的
+        in,out,stats 记录（in 为操作原文，stats 为该操作后的 stats()
+        原文），conflict 时 ops 为空、state 为 null。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ReplayError("expected revision must be non-negative")
+        # 冲突不解析 text：任何解析都必须在修订号检查之后。
+        if expected != self._revision:
+            return json.dumps({"v": 1, "result": "conflict", "ops": [],
+                               "state": None},
+                              ensure_ascii=True, separators=(",", ":")) + "\n"
+        if len(text) > _MAX_REPLAY_LOG_TEXT_LEN:
+            raise ReplayError("text exceeds 1048576 code points")
+        if not text.isascii():
+            raise ReplayError("text must be ASCII")
+        try:
+            log = json.loads(text, object_pairs_hook=_replay_log_pairs)
+        except json.JSONDecodeError:
+            raise ReplayError("invalid JSON") from None
+        if not isinstance(log, dict):
+            raise ReplayError("log must be an object")
+        if list(log.keys()) != _REPLAY_LOG_KEYS:
+            raise ReplayError("log keys must be v,now,ops")
+        version = log["v"]
+        if (not isinstance(version, int) or isinstance(version, bool)
+                or version != 1):
+            raise ReplayError("unsupported v")
+        now = log["now"]
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise ReplayError("now must be int")
+        ops = log["ops"]
+        if not isinstance(ops, list):
+            raise ReplayError("ops must be list")
+        if not 1 <= len(ops) <= _MAX_REPLAY_OPS:
+            raise ReplayError("ops must contain 1..4096 items")
+        # 预检：全部操作（含 recursive 的 levels）在隔离执行前完成校验。
+        checked = _validate_ops(ops)
+        # 隔离执行：全部操作在深拷贝上执行，任何异常放弃全部暂存状态，
+        # 真实解析器（区域、版本、历史、缓存、时钟、统计）均不受影响。
+        candidate = copy.deepcopy(self)
+        items = []
+        for kind, op, plans in checked:
+            out = _execute_replay_op(candidate, kind, op, plans)
+            items.append({"in": op, "out": out, "stats": candidate.stats()})
+        # now 的时钟契约（非负、不早于上次成功结束时刻与各步 end）由
+        # dump_state 一并校验，CacheError 原样传播且不提交；dump_state
+        # 自身的超限 ConfigError 即输出超限，归为 ReplayError。
+        try:
+            state_obj = json.loads(candidate.dump_state(now))
+        except ConfigError:
+            raise ReplayError(
+                "replay log result exceeds 16777216 bytes") from None
+        result = json.dumps({"v": 1, "result": "applied", "ops": items,
+                             "state": state_obj},
+                            ensure_ascii=True, separators=(",", ":")) + "\n"
+        # 紧凑 ASCII 文本字节数与码点数一致；整结果超 16MiB 拒绝提交。
+        if len(result) > _MAX_REPLAY_RESULT_BYTES:
+            raise ReplayError("replay log result exceeds 16777216 bytes")
+        # 全部成功后原子提交：候选状态整体替换本解析器状态。
+        self.__dict__.update(candidate.__dict__)
+        return result
+
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
 
@@ -4606,6 +4703,93 @@ def _validate_ops(ops):
     return checked
 
 
+def _execute_replay_op(resolver, kind, op, plans):
+    """在 resolver 上执行单个已预检的回放操作，返回 out 记录。
+
+    异常原样传播（调用方决定记录或放弃）；out 各形态的键序与
+    replay/replay_log 的记录契约一致。
+    """
+    if kind == "reload":
+        revision = resolver.reload_zone(op["text"])
+        return {"ok": True, "revision": revision}
+    if kind == "reload_tx":
+        report = json.loads(
+            resolver.reload_zone_tx(op["text"], op["expected"]))
+        return {"ok": True, "version": report["version"],
+                "result": report["result"]}
+    if kind == "migrate":
+        return {"ok": True, "text": migrate_zone(op["text"])}
+    if kind == "migrate_tx":
+        if op["expected"] != resolver._revision:
+            # 冲突：不解析 text，version 为当前修订号，text 为 null。
+            return {"ok": True, "version": resolver._revision,
+                    "result": "conflict", "text": None}
+        # 相等：先迁移校验，再按 reload_zone_tx 原子换区；
+        # 迁移失败或换区失败都不产生状态副作用。
+        migrated = migrate_zone(op["text"])
+        report = json.loads(
+            resolver.reload_zone_tx(migrated, op["expected"]))
+        return {"ok": True, "version": report["version"],
+                "result": report["result"], "text": migrated}
+    if kind == "restore_zones":
+        if op["expected"] != resolver._revision:
+            # 冲突：不解析 text，version 为当前修订号。
+            return {"ok": True, "version": resolver._revision,
+                    "result": "conflict"}
+        # 相等：按 load_zones（schema 0/1 历史）校验整份
+        # 快照并构造候选；失败原样抛异常且无任何状态副作用。
+        candidate = Resolver.load_zones(
+            op["text"], resolver._plan, resolver._timeout)
+        if candidate.dump_zones() == resolver.dump_zones():
+            # 规范化结果与当前一致：不换区、不改版本。
+            return {"ok": True, "version": resolver._revision,
+                    "result": "unchanged"}
+        if candidate._revision <= resolver._revision:
+            raise ConfigError(
+                "text version must be greater than current")
+        # 原子提交：区域、历史与修订号一并替换，权威缓存
+        # 随候选清空；递归缓存、时钟、plan 与统计保留。
+        resolver._cache = candidate._cache
+        resolver._revision = candidate._revision
+        resolver._zone_history = candidate._zone_history
+        return {"ok": True, "version": resolver._revision,
+                "result": "applied"}
+    if kind == "resolve":
+        response, source, end, hit = resolver.resolve(
+            bytes.fromhex(op["query"]), op["now"], op["limit"])
+        return {"ok": True, "response": response.hex(),
+                "source": source, "end": end, "hit": hit}
+    if kind == "rollback":
+        report = json.loads(
+            resolver.rollback_zone_tx(op["target"], op["expected"]))
+        return {"ok": True, "version": report["version"],
+                "result": report["result"], "target": report["target"]}
+    if kind == "rollback_batch":
+        steps = [("reload", step["text"])
+                 if step["op"] == "reload"
+                 else ("rollback", step["target"])
+                 for step in op["steps"]]
+        result_name, version, index = resolver._rollback_batch(
+            op["expected"], steps)
+        return {"ok": True, "version": version,
+                "result": result_name, "index": index}
+    if kind == "update":
+        report = json.loads(
+            resolver.update_zone_tx(plans, op["serial"],
+                                    op["expected"]))
+        return {"ok": True, "version": report["version"],
+                "result": report["result"],
+                "serial": report["serial"]}
+    if kind == "cache_stats":
+        snapshot = resolver.cache_stats(op["now"], op["reset"])
+        return {"ok": True, "snapshot": snapshot}
+    response, source, end, hit = resolver.resolve_recursive(
+        bytes.fromhex(op["query"]), plans,
+        op["now"], op["limit"])
+    return {"ok": True, "response": response.hex(),
+            "source": source, "end": end, "hit": hit}
+
+
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
@@ -4666,122 +4850,10 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     resolver = Resolver(zone, plan, timeout)
     items = []
     for kind, op, plans in checked:
-        if kind == "reload":
-            try:
-                revision = resolver.reload_zone(op["text"])
-                out = {"ok": True, "revision": revision}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "reload_tx":
-            try:
-                report = json.loads(
-                    resolver.reload_zone_tx(op["text"], op["expected"]))
-                out = {"ok": True, "version": report["version"],
-                       "result": report["result"]}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "migrate":
-            try:
-                out = {"ok": True, "text": migrate_zone(op["text"])}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "migrate_tx":
-            try:
-                if op["expected"] != resolver._revision:
-                    # 冲突：不解析 text，version 为当前修订号，text 为 null。
-                    out = {"ok": True, "version": resolver._revision,
-                           "result": "conflict", "text": None}
-                else:
-                    # 相等：先迁移校验，再按 reload_zone_tx 原子换区；
-                    # 迁移失败或换区失败都不产生状态副作用。
-                    migrated = migrate_zone(op["text"])
-                    report = json.loads(
-                        resolver.reload_zone_tx(migrated, op["expected"]))
-                    out = {"ok": True, "version": report["version"],
-                           "result": report["result"], "text": migrated}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "restore_zones":
-            try:
-                if op["expected"] != resolver._revision:
-                    # 冲突：不解析 text，version 为当前修订号。
-                    out = {"ok": True, "version": resolver._revision,
-                           "result": "conflict"}
-                else:
-                    # 相等：按 load_zones（schema 0/1 历史）校验整份
-                    # 快照并构造候选；失败原样记异常且无任何状态副作用。
-                    candidate = Resolver.load_zones(
-                        op["text"], resolver._plan, resolver._timeout)
-                    if candidate.dump_zones() == resolver.dump_zones():
-                        # 规范化结果与当前一致：不换区、不改版本。
-                        out = {"ok": True, "version": resolver._revision,
-                               "result": "unchanged"}
-                    else:
-                        if candidate._revision <= resolver._revision:
-                            raise ConfigError(
-                                "text version must be greater than current")
-                        # 原子提交：区域、历史与修订号一并替换，权威缓存
-                        # 随候选清空；递归缓存、时钟、plan 与统计保留。
-                        resolver._cache = candidate._cache
-                        resolver._revision = candidate._revision
-                        resolver._zone_history = candidate._zone_history
-                        out = {"ok": True, "version": resolver._revision,
-                               "result": "applied"}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "resolve":
-            try:
-                response, source, end, hit = resolver.resolve(
-                    bytes.fromhex(op["query"]), op["now"], op["limit"])
-                out = {"ok": True, "response": response.hex(),
-                       "source": source, "end": end, "hit": hit}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "rollback":
-            try:
-                report = json.loads(
-                    resolver.rollback_zone_tx(op["target"], op["expected"]))
-                out = {"ok": True, "version": report["version"],
-                       "result": report["result"], "target": report["target"]}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "rollback_batch":
-            try:
-                steps = [("reload", step["text"])
-                         if step["op"] == "reload"
-                         else ("rollback", step["target"])
-                         for step in op["steps"]]
-                result_name, version, index = resolver._rollback_batch(
-                    op["expected"], steps)
-                out = {"ok": True, "version": version,
-                       "result": result_name, "index": index}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "update":
-            try:
-                report = json.loads(
-                    resolver.update_zone_tx(plans, op["serial"],
-                                            op["expected"]))
-                out = {"ok": True, "version": report["version"],
-                       "result": report["result"],
-                       "serial": report["serial"]}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        elif kind == "cache_stats":
-            try:
-                snapshot = resolver.cache_stats(op["now"], op["reset"])
-                out = {"ok": True, "snapshot": snapshot}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
-        else:
-            try:
-                response, source, end, hit = resolver.resolve_recursive(
-                    bytes.fromhex(op["query"]), plans,
-                    op["now"], op["limit"])
-                out = {"ok": True, "response": response.hex(),
-                       "source": source, "end": end, "hit": hit}
-            except Exception as exc:
-                out = {"ok": False, "error": type(exc).__name__}
+        try:
+            out = _execute_replay_op(resolver, kind, op, plans)
+        except Exception as exc:
+            out = {"ok": False, "error": type(exc).__name__}
         items.append({"in": op, "out": out, "stats": resolver.stats()})
     result = json.dumps({"version": 1, "ops": items},
                         ensure_ascii=True, separators=(",", ":")) + "\n"
