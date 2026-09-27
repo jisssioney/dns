@@ -25,6 +25,14 @@
   完整校验并迁移为 schema=1 文本（旧格式历史限 1..256 项，先校验全部
   快照再仅留 revision 最大的 32 项并把 zone 转成 v2，version 不变；
   紧凑 ASCII JSON，末尾单换行）。
+- migrate_state(text: str) -> str: 把 v0/v1 整解析器快照完整校验
+  并迁移为 v1 文本。v0 顶层键序 "v","zones","rec"，v=0，后二者
+  沿用 v1 契约；迁移补 stats，键序 "h","m","x","u","c","l","r"，
+  值依次为 [0,0,0,0]、0、0、[0,0,0]、[0,items数,256]、
+  [0,0,0,0]、0.000000。v1 统计不变。输出键序 v,zones,rec,stats，
+  紧凑 ASCII JSON、r 六位小数、末尾换行，上限 16777216 字节。
+  text 非 str 抛 TypeError；超限、解析、重复键、键序、未知版本或
+  结构错抛 ConfigError；区域或 RR 语义错沿用 ZoneError、RecordError。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
@@ -131,15 +139,16 @@
   dump_rec(now)、stats() 的解码对象，stats.c[1] 固定等于
   rec.items 长度；紧凑 ASCII JSON、末尾单换行，最多 16777216 字节，
   超限抛 ConfigError），now 异常沿用 dump_rec 且只读；
-  load_state(text, plan, now, timeout=5) 类方法先校验全部内容再恢复
-  实例（zones 沿用 load_zones，rec 沿用 load_rec 并按 now-rec.clock
-  衰减，stats 键序 h,m,x,u,c,l,r、c[2]=256、c[1] 等于 rec.items
-  长度且加载后重算、r 等于按 h,m 重算的 6 位小数比值），恢复区域
-  历史、修订号、stats 计数、递归正负缓存、FIFO 与最后成功时刻，
-  权威缓存为空，plan/timeout 取参数；text 非 str 或 now 非 int（含
-  bool）抛 TypeError，text 超 16777216 码点、JSON、重复键、键序、v
-  或交叉约束错抛 ConfigError，余错沿用 load_zones、load_rec 及构造
-  器，失败无实例。
+  load_state(text, plan, now, timeout=5) 类方法先经 migrate_state
+  迁移再按 now 规则恢复（接受 v0 键序 v,zones,rec：补默认 stats，
+  v1 统计不变；zones 沿用 load_zones，rec 沿用 load_rec 并按
+  now-rec.clock 衰减，stats 键序 h,m,x,u,c,l,r、c[2]=256、c[1]
+  等于 rec.items 长度且加载后重算、r 等于按 h,m 重算的 6 位小数
+  比值），恢复区域历史、修订号、stats 计数、递归正负缓存、FIFO 与
+  最后成功时刻，权威缓存为空，plan/timeout 取参数；text 非 str 或
+  now 非 int（含 bool）抛 TypeError，text 超 16777216 码点、JSON、
+  重复键、键序、v 或交叉约束错抛 ConfigError，余错沿用 load_zones、
+  load_rec 及构造器，失败无实例。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -362,9 +371,15 @@ _MAX_REC_TEXT_LEN = 1048576
 # 解码对象）；文本上限 16777216 码点（同区域文件上限）。
 _STATE_DUMP_KEYS = ["v", "zones", "rec", "stats"]
 _MAX_STATE_TEXT_LEN = 16777216
-# stats() JSON 的固定键序 h,m,x,u,c,l,r；加载时 c[1] 以 rec.items
+# stats() JSON 的固定键序 h,m,x,u,c,l,r；加载与迁移时 c[1] 以 rec.items
 # 长度重算，r 以 h、m 重算，仅核对键序与字段形态。
 _STATS_KEYS = ["h", "m", "x", "u", "c", "l", "r"]
+# v0 整解析器快照（键序仅 v,zones,rec）迁移补入的默认 stats：h/u/l
+# 全零、m/x 为 0、c 为 [0,items数,256]、r 为 0.000000。
+_STATE_DUMP_KEYS_V0 = ["v", "zones", "rec"]
+_DEFAULT_STATS_H = [0, 0, 0, 0]
+_DEFAULT_STATS_U = [0, 0, 0]
+_DEFAULT_STATS_L = [0, 0, 0, 0]
 
 
 def _read_name(data, offset, boundaries):
@@ -2347,13 +2362,13 @@ def _age_rec_entries(entries, elapsed, now):
     return new_pos, new_neg, new_order
 
 
-def _check_state_stats(obj, rec_items):
-    """结构与交叉校验 dump_state 内嵌 stats 的解码对象，返回计数六元组。
+def _check_state_stats_shape(obj):
+    """结构校验 dump_state 内嵌 stats 的解码对象，返回计数六元组。
 
     键序须恰为 h,m,x,u,c,l,r：h/u/c/l 各为定长（4/3/3/4）非负非 bool
-    整数组，m、x 为非负非 bool 整数；r 为 0..1 的有限数值（bool 除外）
-    且等于按 h、m 重算的 6 位小数比值；c[2] 固定为 256，c[1] 固定
-    等于 rec.items 长度。形态或交叉约束错误统一抛 ConfigError。返回
+    整数组，m、x 为非负非 bool 整数；r 为 0..1 的有限数值（bool 除外）。
+    c[2] 固定为 256；c[1] 与 r 的交叉约束由调用方（迁移/恢复）在
+    rec.items 上下文中完成。形态错误统一抛 ConfigError。返回
     (h, m, x, u, c, l)（均为拷贝/原始不可变整数值）。
     """
     if not isinstance(obj, dict) or list(obj.keys()) != _STATS_KEYS:
@@ -2389,11 +2404,166 @@ def _check_state_stats(obj, rec_items):
         raise ConfigError("r out of range")
     if c[2] != _CACHE_CAPACITY:
         raise ConfigError("c[2] must be 256")
+    return h, m, x, u, c, l
+
+
+def _check_state_stats(obj, rec_items):
+    """结构与交叉校验 dump_state 内嵌 stats，返回计数六元组。
+
+    在 _check_state_stats_shape 的形态校验之外追加交叉约束：c[1] 固定
+    等于 rec_items 长度，r 等于按 h、m 重算的 6 位小数比值；不符统一
+    抛 ConfigError。
+    """
+    h, m, x, u, c, l_buckets = _check_state_stats_shape(obj)
     if c[1] != rec_items:
         raise ConfigError("c[1] must equal rec items length")
-    if float(r) != float(_ratio_six(sum(h), sum(h) + m)):
+    if float(obj["r"]) != float(_ratio_six(sum(h), sum(h) + m)):
         raise ConfigError("r must equal the hits ratio of h and m")
-    return h, m, x, u, c, l
+    return h, m, x, u, c, l_buckets
+
+
+def _parse_state_config(text):
+    """解析 v0/v1 整解析器快照文本并完成全部结构层校验。
+
+    返回 (version, zones_obj, schema, zversion, history, rec_obj,
+    clock, rec_items, stats_obj, h, m, x, u, c, l)。v0 键序仅
+    v,zones,rec（v=0），stats 取迁移默认值；v1 键序 v,zones,rec,stats
+    （v=1），stats 经形态校验，且 c[1] 等于 rec.items 长度、r 等于按
+    h,m 重算的比值。zones 的结构层（schema 0/1）与 rec 配置结构均已
+    校验；zone 快照语义、rec 时钟与 RR 值域由调用方完成（顺序沿用
+    load_state）。text 非 str 抛 TypeError；超长、JSON、重复键、键序、
+    未知版本或结构错抛 ConfigError。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    if len(text) > _MAX_STATE_TEXT_LEN:
+        raise ConfigError("text exceeds 16777216 code points")
+    try:
+        config = json.loads(text, object_pairs_hook=_config_pairs)
+    except json.JSONDecodeError:
+        raise ConfigError("invalid JSON") from None
+    if not isinstance(config, dict):
+        raise ConfigError("config must be an object")
+    keys = list(config.keys())
+    if keys == _STATE_DUMP_KEYS_V0:
+        version = 0
+    elif keys == _STATE_DUMP_KEYS:
+        version = 1
+    else:
+        raise ConfigError("state keys must be v,zones,rec[,stats]")
+    value = config["v"]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError("v must be int")
+    if value != version:
+        raise ConfigError("v must match the state format")
+    zones_obj, rec_obj = config["zones"], config["rec"]
+    if not isinstance(zones_obj, dict) or not isinstance(rec_obj, dict):
+        raise ConfigError("zones and rec must be objects")
+    # zones 的 JSON 结构与 rec 配置结构（ConfigError）先于 stats 形态
+    # 及任何语义校验。
+    zones_text = json.dumps(zones_obj, ensure_ascii=True,
+                            separators=(",", ":"))
+    schema, _zversion, history = _parse_zones_config(zones_text)
+    clock, rec_items = _check_rec_config(rec_obj)
+    if version == 0:
+        # v0 无 stats：补入迁移默认计数，c[1] 固定为 items 数、r 为零。
+        h, m, x = list(_DEFAULT_STATS_H), 0, 0
+        u, l_buckets = list(_DEFAULT_STATS_U), list(_DEFAULT_STATS_L)
+        c = [0, len(rec_items), _CACHE_CAPACITY]
+        stats_obj = {"h": h, "m": m, "x": x, "u": u, "c": c,
+                     "l": l_buckets, "r": 0.0}
+    else:
+        stats_obj = config["stats"]
+        h, m, x, u, c, l_buckets = _check_state_stats(
+            stats_obj, len(rec_items))
+    return (version, zones_obj, schema, _zversion, history, rec_obj,
+            clock, rec_items, stats_obj, h, m, x, u, c, l_buckets)
+
+
+def _state_stats_text(h, m, x, u, c, l_buckets):
+    """按计数组装 stats JSON 片段（键序 h,m,x,u,c,l,r，r 六位小数）。
+
+    r 以 _ratio_six 的原始数值片段写出，保证迁移文本恰为六位小数；
+    格式与 Resolver.stats() 逐字节一致。
+    """
+    return (
+        '{"h":[' + ",".join(map(str, h)) + "]"
+        + ',"m":' + str(m)
+        + ',"x":' + str(x)
+        + ',"u":[' + ",".join(map(str, u)) + "]"
+        + ',"c":[' + ",".join(map(str, c)) + "]"
+        + ',"l":[' + ",".join(map(str, l_buckets)) + "]"
+        + ',"r":' + _ratio_six(sum(h), sum(h) + m) + "}"
+    )
+
+
+def migrate_state(text: str) -> str:
+    """把 v0/v1 整解析器快照完整校验并迁移为 v1 配置文本。
+
+    v0 顶层键序仅 v,zones,rec（v=0），zones、rec 沿用 v1 契约；迁移补
+    stats，键序 h,m,x,u,c,l,r，值依次为 [0,0,0,0]、0、0、[0,0,0]、
+    [0,items数,256]、[0,0,0,0]、0.000000。v1 输入统计不变（c[1]、r
+    交叉约束须成立）。输出为键序 v,zones,rec,stats 的 v1：zones 沿用
+    migrate_zones 规范化（schema=1、仅留 revision 最大的 32 项、zone
+    转 v2，version 不变），rec 逐字段规范化（q/n 规范化小写绝对名、
+    d 偶长小写十六进制），stats 为 h,m,x,u,c,l,r 的计数形态且 r 为按
+    h,m 重算的 6 位小数。紧凑 ASCII JSON、整数十进制、末尾单换行，
+    上限 16777216 字节。text 非 str 抛 TypeError；超限、解析、重复键、
+    键序、未知版本或结构错抛 ConfigError；区域或 RR 语义错沿用
+    ZoneError、RecordError。
+    """
+    (_version, _zones_obj, schema, _zversion, history, _rec_obj,
+     clock, rec_items, _stats_obj, h, m, x, u, c,
+     l_buckets) = _parse_state_config(text)
+    # zones 语义校验先于 rec RR 值域（与 migrate_zones/load_state 的
+    # 顺序一致）：结构错误已在解析阶段排除，语义错误沿用
+    # RecordError、ZoneError；全部快照先校验再截断。
+    snapshot_loader = (_load_zone_snapshot if schema == 1
+                       else _load_zone_snapshot_any)
+    snapshots = [(item["revision"], snapshot_loader(item["zone"]))
+                 for item in history]
+    kept = snapshots[-_ZONE_HISTORY_CAPACITY:]
+    # rec RR 值域与 SOA 校验（RecordError）；v0 无时钟上下文，结构层
+    # 已保证 clock 非负，这里仅做字段值校验，不衰减。
+    entries = [(kind, key, _validate_rec_item(kind, rrs))
+               for kind, key, rrs in rec_items]
+    for kind, _key, rrs in entries:
+        if kind == "p" and any(rr[3] <= 0 for rr in rrs):
+            raise RecordError("p rr ttl must be positive")
+    migrated_zones = {"schema": 1, "version": _zversion, "history": [
+        {"revision": revision, "zone": _zone_model_to_v2(zone)}
+        for revision, zone in kept]}
+    items_out = []
+    for kind, key, rrs in entries:
+        if kind == "nx":
+            _tag, qname, qclass = key
+            qtype = None
+        elif kind == "nd":
+            _tag, qname, qtype, qclass = key
+        else:
+            qname, qtype, qclass = key
+        items_out.append({
+            "k": kind, "q": qname, "t": qtype, "c": qclass,
+            "rr": [
+                {"n": _labels_to_name(labels), "t": rrtype, "c": rrclass,
+                 "ttl": ttl, "d": rdata.hex()}
+                for labels, rrtype, rrclass, ttl, rdata in rrs
+            ],
+        })
+    migrated_rec = {"v": 1, "clock": clock, "items": items_out}
+    c_out = list(c)
+    # stats 的 c[1] 固定为 rec.items 长度。
+    c_out[1] = len(items_out)
+    stats_text = _state_stats_text(h, m, x, u, c_out, l_buckets)
+    # 前三段用紧凑 dumps，stats 以原始数值片段追加，保证 r 恰为六位
+    # 小数且整体键序为 v,zones,rec,stats。
+    prefix = json.dumps(
+        {"v": 1, "zones": migrated_zones, "rec": migrated_rec},
+        ensure_ascii=True, separators=(",", ":"))
+    out_text = prefix[:-1] + ',"stats":' + stats_text + "}\n"
+    if len(out_text.encode("ascii")) > _MAX_STATE_TEXT_LEN:
+        raise ConfigError("state text exceeds 16777216 bytes")
+    return out_text
 
 
 class Resolver:
@@ -2629,34 +2799,39 @@ class Resolver:
     最多 16777216 字节，超限抛 ConfigError。now 异常沿用 dump_rec
     （TypeError/CacheError）且只读；同状态同参逐字节相同。
 
-    load_state(text, plan, now, timeout=5)：类方法，先校验全部内容再
-    恢复实例。zones 沿用 load_zones（schema 0/1），rec 沿用 load_rec
-    （结构校验先于时钟、先于 RR 值域，按 now-rec.clock 衰减并丢弃
-    到期项），stats 为 stats() 解码对象：键序 h,m,x,u,c,l,r，c[2]
-    固定 256、c[1] 固定等于 rec.items 长度且加载后按实际恢复条目数
-    重算，r 须等于按 h、m 重算的 6 位小数比值，其余沿用各自契约。
-    恢复区域修订历史与修订号、stats 计数、递归正负缓存、FIFO 及最后
-    成功时刻（now）；权威缓存为空，plan/timeout 取参数。text 非 str
-    或 now 非 int（含 bool）抛 TypeError；text 超 16777216 码点、JSON、
-    重复键、键序、v 或交叉约束错抛 ConfigError；余错沿用 load_zones、
-    load_rec 及构造器。任何失败都不产生实例；同态同参逐字节一致。
+    load_state(text, plan, now, timeout=5)：类方法，先经 migrate_state
+    迁移再校验全部内容后恢复实例（接受 v0 键序 v,zones,rec：补默认
+    stats，v1 统计不变）。zones 沿用 load_zones（schema 0/1），rec
+    沿用 load_rec（结构校验先于时钟、先于 RR 值域，按 now-rec.clock
+    衰减并丢弃到期项），stats 为 stats() 解码对象：键序
+    h,m,x,u,c,l,r，c[2] 固定 256、c[1] 固定等于 rec.items 长度且
+    加载后按实际恢复条目数重算，r 须等于按 h、m 重算的 6 位小数比值，
+    其余沿用各自契约。恢复区域修订历史与修订号、stats 计数、递归正负
+    缓存、FIFO 及最后成功时刻（now）；权威缓存为空，plan/timeout 取
+    参数。text 非 str 或 now 非 int（含 bool）抛 TypeError；text 超
+    16777216 码点、JSON、重复键、键序、v 或交叉约束错抛 ConfigError；
+    余错沿用 load_zones、load_rec 及构造器。任何失败都不产生实例；
+    同态同参逐字节一致。
 
-    save_state(path, now)：把 dump_state(now) 字节逐字节原子落盘，
-    返回写入字节数。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
-    ConfigError；now 异常沿用 dump_state（TypeError/CacheError）。在
-    目标同目录建唯一临时文件，写入并 flush、fsync 后 os.replace 原子
-    替换目标；任一步 I/O 失败抛 OSError，删除本次临时项、保留旧目标，
-    解析器状态不变。成功也不改变任何状态，同态同参重复保存逐字节
-    相同。
+    save_state(path, now)：把 dump_state(now) 的 ASCII 字节循环写入
+    同目录唯一临时文件，全部字节写完并 flush、fsync 后 os.replace 原子
+    替换目标，返回写入字节数。path 非 str 抛 TypeError；path 为空串或
+    含 NUL 抛 ConfigError；now 异常沿用 dump_state
+    （TypeError/CacheError）。write 返回 None、非 int 或非正数视为短写
+    抛 OSError；write、flush、fsync、replace 任一步失败都删除本次临时
+    项、保留旧目标，解析器状态不变。成功也不改变任何状态，同态同参
+    重复保存逐字节相同。
 
     load_state_file(path, plan, now, timeout=5)：类方法，从状态文件
-    恢复等价解析器。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
-    ConfigError。最多读 16777217 字节：文件缺失抛 FileNotFoundError，
-    其余 I/O 错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
-    ConfigError。解码后完全复用 load_state 的协议（截断 JSON、重复
-    键或状态结构错抛 ConfigError）、plan/timeout 校验、时钟衰减与
-    其余异常；任何失败都不产生实例，成功恢复区域历史与修订号、递归
-    正负缓存、FIFO、统计与最后成功时刻（now），权威缓存为空。
+    恢复等价解析器（读入后经 migrate_state/load_state 同一迁移恢复
+    路径，同样接受 v0 与 v1）。path 非 str 抛 TypeError；path 为空串
+    或含 NUL 抛 ConfigError。最多读 16777217 字节：文件缺失抛
+    FileNotFoundError，其余 I/O 错抛 OSError；内容超过 16777216 字节
+    或含非 ASCII 字节抛 ConfigError。解码后完全复用 load_state 的协议
+    （截断 JSON、重复键或状态结构错抛 ConfigError）、plan/timeout
+    校验、时钟衰减与其余异常；任何失败都不产生实例，成功恢复区域历史
+    与修订号、递归正负缓存、FIFO、统计与最后成功时刻（now），权威
+    缓存为空。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -3922,9 +4097,12 @@ class Resolver:
     @classmethod
     def load_state(cls, text: str, plan: list, now: int,
                    timeout: int = 5) -> "Resolver":
-        """从 dump_state 快照校验全部内容后恢复等价解析器实例。
+        """从 v0/v1 快照校验全部内容后恢复等价解析器实例（先迁移再恢复）。
 
-        顶层键序仅 v,zones,rec,stats，v=1；zones 为 dump_zones() 形态
+        v1 顶层键序 v,zones,rec,stats（v=1）；v0 顶层键序 v,zones,rec
+        （v=0），zones、rec 沿用 v1 契约，stats 取 migrate_state 的迁移
+        默认值（h/u/l 全零、m/x 为 0、c 为 [0,items数,256]、r 为
+        0.000000），v1 统计保持不变。zones 为 dump_zones() 形态
         （schema 0/1，沿用 load_zones 契约），rec 为 dump_rec(now) 形态
         （沿用 load_rec：结构校验先于时钟校验、先于 RR 值域校验，按
         now-rec.clock 衰减并丢弃到期项），stats 为 stats() 解码对象
@@ -3935,40 +4113,21 @@ class Resolver:
         now 恢复）；权威缓存为空，plan、timeout 取参数，rated 与清理
         计数清零。text 非 str 或 now 非 int（含 bool）抛 TypeError；
         text 超 16777216 码点、JSON 解析、重复键、键序、v 或交叉约束
-        错误抛 ConfigError；其余错误沿用 load_zones、load_rec 及构造
-        器（ConfigError、RecordError、ZoneError、CacheError 与构造器
-        的 TypeError/ValueError）。任何失败都不产生实例；同态同参逐字节
-        一致。
+        错误抛 ConfigError；时钟错误抛 CacheError（先于 rec RR 值域
+        校验）；其余错误沿用 load_zones、load_rec 及构造器（RecordError、
+        ZoneError 与构造器的 TypeError/ValueError）。任何失败都不产生
+        实例；同态同参逐字节一致。
         """
+        # TypeError 次序与原协议一致：text 先于 now；随后由迁移入口完成
+        # v0/v1 解析与全部结构层校验（超长、JSON、重复键、键序、未知
+        # 版本与结构错均为 ConfigError，先于时钟与 RR 语义校验）。
         if not isinstance(text, str):
             raise TypeError("text must be str")
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
-        if len(text) > _MAX_STATE_TEXT_LEN:
-            raise ConfigError("text exceeds 16777216 code points")
-        try:
-            config = json.loads(text, object_pairs_hook=_config_pairs)
-        except json.JSONDecodeError:
-            raise ConfigError("invalid JSON") from None
-        if not isinstance(config, dict) or list(config.keys()) != _STATE_DUMP_KEYS:
-            raise ConfigError("state keys must be v,zones,rec,stats")
-        version = config["v"]
-        if not isinstance(version, int) or isinstance(version, bool):
-            raise ConfigError("v must be int")
-        if version != 1:
-            raise ConfigError("unsupported v")
-        zones_obj, rec_obj, stats_obj = (
-            config["zones"], config["rec"], config["stats"])
-        if not isinstance(zones_obj, dict) or not isinstance(rec_obj, dict):
-            raise ConfigError("zones and rec must be objects")
-        # 三段结构层校验全部先于任何语义校验：zones 的 JSON 结构、rec 的
-        # 配置结构与 stats 的形态及交叉约束错误统一为 ConfigError。
-        zones_text = json.dumps(zones_obj, ensure_ascii=True,
-                                separators=(",", ":"))
-        schema, _zversion, history = _parse_zones_config(zones_text)
-        clock, rec_items = _check_rec_config(rec_obj)
-        h, m, x, u, c, l_buckets = _check_state_stats(
-            stats_obj, len(rec_items))
+        (_version, _zones_obj, schema, _zversion, history, _rec_obj,
+         clock, rec_items, _stats_obj, h, m, x, u, c,
+         l_buckets) = _parse_state_config(text)
         # zones 快照语义沿用 load_zones：先校验全部快照再恢复（结构错误
         # 已在上一步排除，语义错误沿用 RecordError、ZoneError）。
         snapshot_loader = (_load_zone_snapshot if schema == 1
@@ -3998,8 +4157,8 @@ class Resolver:
         instance._rec_neg = new_neg
         instance._rec_order = new_order
         instance._last_end = now
-        # stats 计数恢复；c[0] 沿用快照（权威缓存为空，待下次解析提交时
-        # 同步），c[1] 不赋值而由 stats() 按实际递归条目数重算。
+        # stats 计数恢复；c[0] 沿用快照（v0 为 0；权威缓存为空，待下次
+        # 解析提交时同步），c[1] 不赋值而由 stats() 按实际条目数重算。
         instance._stats_h = h
         instance._stats_m = m
         instance._stats_x = x
@@ -4009,14 +4168,16 @@ class Resolver:
         return instance
 
     def save_state(self, path: str, now: int) -> int:
-        """把 dump_state(now) 字节逐字节原子落盘，返回写入字节数。
+        """把 dump_state(now) 的 ASCII 字节循环写入并原子落盘，返回字节数。
 
         path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError；
         now 异常沿用 dump_state（TypeError/CacheError）。落盘内容与
-        dump_state(now) 逐字节相同：在目标同目录创建唯一临时文件，写完
-        并 flush、fsync 后以 os.replace 原子替换目标。任一步 I/O 失败
-        抛 OSError，删除本次临时文件、保留旧目标文件；dump_state 只读，
-        任何失败与成功都不改变解析器状态，同态同参重复保存逐字节相同。
+        dump_state(now) 逐字节相同：在目标同目录创建唯一临时文件，循环
+        write 至全部字节写完，再 flush、fsync 后以 os.replace 原子替换
+        目标。write 返回 None、非 int 或非正数视为短写抛 OSError；
+        write、flush、fsync、replace 任一步失败都删除本次临时文件、
+        保留旧目标文件；dump_state 只读，任何失败与成功都不改变解析器
+        状态，同态同参重复保存逐字节相同。
         """
         if not isinstance(path, str):
             raise TypeError("path must be str")
@@ -4032,7 +4193,16 @@ class Resolver:
                                         suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
+                # 循环 write 至全部字节写完：返回 None、非 int 或非正数
+                # 一律按短写抛 OSError（由外层兜底清理临时项）。
+                view = memoryview(data)
+                offset = 0
+                while offset < len(view):
+                    written = stream.write(view[offset:])
+                    if (written is None or not isinstance(written, int)
+                            or written <= 0):
+                        raise OSError("short write")
+                    offset += int(written)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp_path, path)
