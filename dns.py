@@ -4306,8 +4306,9 @@ class Resolver:
         restore_zones/resolve/recursive/rollback/rollback_batch/
         update/cache_stats，全部操作在隔离执行前完成预检）。text 非
         str 或 expected 非 int（含 bool）抛 TypeError；expected<0、
-        text 超长或非 ASCII、JSON 解析、重复键、键序、v 或操作非法抛
-        ReplayError。expected 不等于当前修订号时不解析 text，报告
+        now<0、text 超长或非 ASCII、JSON 解析、重复键、键序、v 或操作
+        非法抛 ReplayError（now<0 在预检 ops 与隔离执行之前即抛）。
+        expected 不等于当前修订号时不解析 text，报告
         conflict（ops 为空、state 为 null），不改变任何状态。相符时
         在解析器深拷贝上依次执行各操作：任一步抛出的异常原样传播并
         放弃全部暂存状态（真实解析器不变）。全部成功后 now 沿用
@@ -4350,6 +4351,10 @@ class Resolver:
         now = log["now"]
         if not isinstance(now, int) or isinstance(now, bool):
             raise ReplayError("now must be int")
+        if now < 0:
+            # now<0 在预检 ops 与隔离执行之前即拒绝：不校验、不执行任何
+            # 操作，真实解析器不变。
+            raise ReplayError("now must be non-negative")
         ops = log["ops"]
         if not isinstance(ops, list):
             raise ReplayError("ops must be list")
@@ -4381,6 +4386,127 @@ class Resolver:
         # 全部成功后原子提交：候选状态整体替换本解析器状态。
         self.__dict__.update(candidate.__dict__)
         return result
+
+    def export_log(self, ops: list, now: int,
+                   path: str | None = None) -> str | int:
+        """按 replay_log 协议序列化操作日志，并在副本验证后返回或落盘。
+
+        ops 沿用 replay 的输入协议（reload/reload_tx/migrate/
+        migrate_tx/restore_zones/resolve/recursive/rollback/
+        rollback_batch/update/cache_stats），限 1..4096 项；now 为非负
+        非 bool 整数。ops 非 list 或 now 非 int（含 bool）抛
+        TypeError；ops 空/超 4096 项或项、键序、op 名、字段类型/内容
+        非法（含 now<0）抛 ReplayError（全部项经 _validate_ops 在执行
+        前预检）。日志文本以当前修订号在解析器深拷贝上调用 replay_log
+        完成验证（隔离执行各操作、校验 now 时钟契约），其异常原样
+        传播，真实解析器不发生任何改变。
+        日志顶层键序仅 "v","now","ops"：v 恒为 1，ops 各项保留原键
+        序；紧凑 ASCII JSON、末尾单换行，超过 1048576 字节抛
+        ReplayError。
+        path 为 None 时返回日志文本（str）；否则完全沿用 save_state 的
+        路径校验、原子写入与 I/O 异常协议：path 非 str 抛 TypeError，
+        path 为空串或含 NUL 抛 ConfigError；在目标同目录创建唯一临时
+        文件，循环 write 至全部字节写完（write 返回 None、非 int 或非
+        正数抛 OSError），flush、fsync 后 os.replace 原子替换目标，
+        任一步 I/O 失败抛 OSError、删除本次临时文件并保留旧目标文件，
+        成功返回写入字节数（int）。只读：成功与失败都不改变解析器
+        状态，同态同参逐字节一致。
+        """
+        if not isinstance(ops, list):
+            raise TypeError("ops must be list")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        # path 校验次序同 save_state：路径校验先于内容生成与写盘。
+        if path is not None:
+            if not isinstance(path, str):
+                raise TypeError("path must be str")
+            if path == "" or "\x00" in path:
+                raise ConfigError(
+                    "path must be non-empty and without NUL")
+        # 项数与全部项的结构/语义预检在执行前完成，非法抛 ReplayError。
+        if not 1 <= len(ops) <= _MAX_REPLAY_OPS:
+            raise ReplayError("ops must contain 1..4096 items")
+        _validate_ops(ops)
+        if now < 0:
+            raise ReplayError("now must be non-negative")
+        # 预检已排除全部不可序列化与非规范值；ops 各项按原键序嵌入。
+        text = json.dumps({"v": 1, "now": now, "ops": ops},
+                          ensure_ascii=True, separators=(",", ":")) + "\n"
+        # 紧凑 ASCII 文本字节数与码点数一致。
+        if len(text) > _MAX_REPLAY_LOG_TEXT_LEN:
+            raise ReplayError("replay log exceeds 1048576 bytes")
+        # 以当前修订号在深拷贝上经 replay_log 完整验证（隔离执行各操作、
+        # 校验 now 时钟契约）；副本修订号恒等于当前修订号，不会冲突。
+        copy.deepcopy(self).replay_log(text, self._revision)
+        if path is None:
+            return text
+        data = text.encode("ascii")
+        # 原子写入协议同 save_state：同目录临时文件、循环写、fsync、
+        # os.replace；失败删除临时文件、保留旧目标文件。
+        directory = os.path.dirname(path) or os.curdir
+        fd, tmp_path = tempfile.mkstemp(prefix=".dns-replay-log-",
+                                        suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                offset = 0
+                while offset < len(data):
+                    written = stream.write(data[offset:])
+                    if (not isinstance(written, int)
+                            or isinstance(written, bool) or written <= 0):
+                        raise OSError("write returned no progress")
+                    offset += written
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return len(data)
+
+    def replay_log_file(self, path: str, expected: int) -> str:
+        """从日志文件确定性原子重放（协议完全复用 replay_log）。
+
+        path 非 str 或 expected 非 int（含 bool）抛 TypeError；
+        expected<0、path 为空串或含 NUL 抛 ReplayError（均为先于修订号
+        比较的参数校验，同 reload_state_file）。expected 不等于当前
+        修订号时不读文件，直接返回 replay_log 的 conflict 报告（ops 为
+        空、state 为 null），不改变任何状态。相符时最多读取 1048577
+        字节：文件缺失抛 FileNotFoundError，其余 I/O 错抛 OSError；内容
+        超过 1048576 字节或含非 ASCII 字节抛 ReplayError。解码为 ASCII
+        文本后完全复用 replay_log：JSON、重复键、键序、v、now、ops 或
+        执行非法均抛 ReplayError，时钟错误抛 CacheError，全部成功后候选
+        状态才原子提交。任何失败都无副作用；同态同参与 replay_log 逐字节
+        一致。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ReplayError("expected revision must be non-negative")
+        # 路径内容校验同 reload_state_file，先于修订号比较；冲突仅意味着
+        # 不读文件，不豁免非法路径。
+        if path == "" or "\x00" in path:
+            raise ReplayError("path must be non-empty and without NUL")
+        # 冲突不读文件：任何文件访问都在修订号检查之后。
+        if expected != self._revision:
+            return json.dumps({"v": 1, "result": "conflict", "ops": [],
+                               "state": None},
+                              ensure_ascii=True, separators=(",", ":")) + "\n"
+        # 缺失与 I/O 错原样传播（FileNotFoundError/OSError）；仅多读一字节
+        # 即可判定超限，避免把超限文件整体读入内存。
+        with open(path, "rb") as stream:
+            data = stream.read(_MAX_REPLAY_LOG_TEXT_LEN + 1)
+        if len(data) > _MAX_REPLAY_LOG_TEXT_LEN:
+            raise ReplayError("replay log file exceeds 1048576 bytes")
+        if not data.isascii():
+            raise ReplayError("replay log file must be ASCII")
+        text = data.decode("ascii")
+        # 解码后的全部校验、隔离执行、时钟契约与原子提交均复用 replay_log。
+        return self.replay_log(text, expected)
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
