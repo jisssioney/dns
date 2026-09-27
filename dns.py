@@ -4182,6 +4182,109 @@ class Resolver:
         # 解码后的全部协议、plan/timeout、时钟衰减与异常均复用 load_state。
         return cls.load_state(text, plan, now, timeout)
 
+    def reload_state(self, text: str, now: int, expected: int) -> str:
+        """从状态文本校验整份快照并原子热加载，返回 version,result 报告。
+
+        text 非 str 或 now、expected 非 int（含 bool）抛 TypeError；
+        expected 为负抛 ConfigError；now 为负或早于上次成功结束时刻抛
+        CacheError。验参后 expected 不等于当前修订号时不解析 text，
+        报告 conflict（version 为当前修订号），不改变任何状态。相符时
+        完全沿用 load_state 的契约与异常（迁移、结构、区域与 RR 语义、
+        时钟衰减等）以当前 plan、timeout 与入参 now 构造候选实例，异常
+        原样传播且解析器不变。候选提交与 reload_state_file 共用同一路径：
+        候选修订号小于当前修订号抛 ConfigError；候选 dump_state(now) 与
+        当前 dump_state(now) 相同报告 unchanged（版本与状态不变）；不同
+        则原子替换区域修订历史、修订号、递归正负缓存、FIFO、最后成功
+        时刻与统计，权威缓存清空（随候选为空），rated 与清理计数归零，
+        保留 plan 与 timeout，报告 applied。报告键序仅 version,result
+        （version 为操作后修订号，result 为 "applied"、"unchanged" 或
+        "conflict"），紧凑 ASCII JSON、十进制整数、末尾单换行。异常与
+        非 applied 结果均不改变任何状态。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        # 冲突不解析 text：任何解析都必须在修订号检查之后。
+        if expected != self._revision:
+            return self._tx_report(self._revision, "conflict")
+        candidate = Resolver.load_state(text, self._plan, now, self._timeout)
+        return self._commit_state_candidate(candidate, now)
+
+    def reload_state_file(self, path: str, now: int, expected: int) -> str:
+        """从状态文件校验整份快照并原子热加载（协议复用 reload_state）。
+
+        path 非 str 或 now、expected 非 int（含 bool）抛 TypeError；
+        expected 为负、path 为空串或含 NUL 抛 ConfigError；now 为负或
+        早于上次成功结束时刻抛 CacheError。验参后 expected 不等于当前
+        修订号时不读文件，报告 conflict（version 为当前修订号），不改
+        变任何状态。相符时完全沿用 load_state_file 的契约与异常（缺失
+        抛 FileNotFoundError，其余 I/O 错抛 OSError，超限或非 ASCII 抛
+        ConfigError，余同 load_state）以当前 plan、timeout 与入参 now
+        构造候选实例；候选提交与 reload_state 共用同一路径：候选修订号
+        小于当前修订号抛 ConfigError，候选 dump_state(now) 与当前相同
+        报告 unchanged，否则原子替换区域修订历史、修订号、递归正负
+        缓存、FIFO、最后成功时刻与统计，清空权威缓存，rated 与清理
+        计数归零，保留 plan 与 timeout，报告 applied。报告键序仅
+        version,result，紧凑 ASCII JSON、末尾单换行；异常与非 applied
+        结果均不改变任何状态。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        if now < 0 or (self._last_end is not None and now < self._last_end):
+            raise CacheError("now must be non-negative and monotonic")
+        # 冲突不读文件：任何文件访问都必须在修订号检查之后。
+        if expected != self._revision:
+            return self._tx_report(self._revision, "conflict")
+        candidate = Resolver.load_state_file(path, self._plan, now,
+                                             self._timeout)
+        return self._commit_state_candidate(candidate, now)
+
+    def _commit_state_candidate(self, candidate, now):
+        """共用候选提交路径：校验候选修订号、比较快照并原子提交或报 unchanged。"""
+        # 只允许不回退的修订号；候选号更旧一律拒绝（同号允许）。
+        if candidate._revision < self._revision:
+            raise ConfigError("state revision must not be less than current")
+        if candidate.dump_state(now) == self.dump_state(now):
+            # 规范化后内容一致：不替换、不改版本与任何状态。
+            return self._tx_report(self._revision, "unchanged")
+        # 全部校验成功后原子提交：区域历史、修订号、递归正负缓存、FIFO、
+        # 最后成功时刻与统计随候选一并替换；权威缓存随候选为空；rated 与
+        # 清理计数归零；plan 与 timeout 保留。
+        self._cache = candidate._cache
+        self._revision = candidate._revision
+        self._zone_history = candidate._zone_history
+        self._rec_pos = candidate._rec_pos
+        self._rec_neg = candidate._rec_neg
+        self._rec_order = candidate._rec_order
+        self._last_end = candidate._last_end
+        self._stats_h = candidate._stats_h
+        self._stats_m = candidate._stats_m
+        self._stats_x = candidate._stats_x
+        self._stats_u = candidate._stats_u
+        self._stats_l = candidate._stats_l
+        self._stats_c0 = candidate._stats_c0
+        self._rated_o = [0, 0, 0, 0]
+        self._rated_e = [0, 0]
+        self._rated_l = [0, 0, 0, 0]
+        self._clean_expired = [0, 0]
+        self._clean_evicted = [0, 0]
+        return self._tx_report(self._revision, "applied")
+
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
 
