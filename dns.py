@@ -33,7 +33,8 @@
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
-  应答末项回显 OPT（OPT 版本非 0 时直接返回 BADVERS 且不触缓存）；
+  应答末项回显 OPT（OPT 版本非 0 时直接返回 BADVERS，先于时钟回退
+  判断且不触缓存）；
   stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
@@ -161,7 +162,9 @@
   allow(query, client, now, kind="query") -> (是否放行, 余量或 -1)；
   respond(query, response, client, now, truncate=True) 按响应配额
   限流，放行返回 (response, 余量)，拒绝返回 (None, 0) 或仅含问题
-  段的截断应答 (tc, 0)；
+  段的截断应答 (tc, 0)；respond_edns 为 EDNS 变体（查询与应答均须
+  恰含一个合法 OPT，应答的 OPT 为附加段末项），截断应答末项回显
+  应答 OPT 的 CLASS 与 TTL；
   stats(reset=False) -> str 返回键序 query,response,expired,evicted,
   keys 的紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零计数；
   reload_rules(rules, expected) 带版本检查的原子规则热加载，版本初始
@@ -1738,8 +1741,9 @@ class PositiveCache:
     根 owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags
     仅 DO、选项 TLV 校验），QDCOUNT 非 1 或 QR 置位抛 EncodeError，
     其余报文非法抛 EDNSError。OPT 版本 1..255 时按版本协商直接返回
-    (BADVERS 应答, False)，上限 min(limit, OPT CLASS)，不读写缓存、
-    FIFO、统计或时钟。版本 0 时缓存键、正负缓存、TTL 衰减、FIFO、
+    (BADVERS 应答, False)，上限 min(limit, OPT CLASS)，先于时钟回退
+    判断返回，不读写缓存、FIFO、统计或时钟。版本 0 时缓存键、正负
+    缓存、TTL 衰减、FIFO、
     命中与统计和 resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；
     应答按同一权威计划以 edns 语义编码：上限为 min(limit, OPT
     CLASS)，RCODE 取计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本
@@ -1831,11 +1835,12 @@ class PositiveCache:
         异常不改变缓存、统计或最后时刻，成功原子提交。OPT 版本 1..255
         时按版本协商直接返回 (BADVERS 应答, False)：应答同 edns 的
         BADVERS 契约（上限 min(limit, CLASS)，超限抛 EncodeError 且
-        不置 TC），不读写缓存、FIFO、统计或时钟。
+        不置 TC），先于时钟回退判断返回，不读写缓存、FIFO、统计或
+        时钟；版本 0 时 now 回退仍抛 CacheError。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
-        if now < 0 or (self._last_now is not None and now < self._last_now):
+        if now < 0:
             raise CacheError("now must be non-negative and monotonic")
         if not isinstance(query, bytes):
             raise TypeError("query must be bytes")
@@ -1853,9 +1858,11 @@ class PositiveCache:
         if opt is None:
             raise EDNSError("query must contain exactly one OPT")
         if opt[1] != 0:
-            # 版本协商：OPT 版本 1..255 直接以 BADVERS 拒绝，不读写
-            # 缓存、FIFO、统计或时钟。
+            # 版本协商：OPT 版本 1..255 直接以 BADVERS 拒绝，先于时钟
+            # 回退判断返回，不读写缓存、FIFO、统计或时钟。
             return _encode_badvers(msg, opt, limit), False
+        if self._last_now is not None and now < self._last_now:
+            raise CacheError("now must be non-negative and monotonic")
         return self._resolve_cached(msg, query, now, limit,
                                     _encode_plan_edns)
 
@@ -2066,6 +2073,95 @@ def _matching_reply(query, reply):
     if end is None:
         return False
     return reply[_MIN_MESSAGE_LEN:end] == query[_MIN_MESSAGE_LEN:]
+
+
+def _decode_edns_response(query, response):
+    """校验 EDNS 应答并返回其 OPT 的 (CLASS, TTL)；任何不符抛 EncodeError。
+
+    response 须 QR=1、ID 与 QDCOUNT 同 query、问题字节与 query 的问题段
+    逐字节相同，且全报文恰有一个合法 OPT 并为附加段末项：未压缩根
+    owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags 仅
+    DO、RDLENGTH 内选项 TLV 完整（同 _decode_edns_query 的 OPT 契约，
+    此处违例一律 EncodeError）。query 须已通过 _decode_edns_query
+    校验（单问题）。
+    """
+    if not _MIN_MESSAGE_LEN <= len(response) <= _MAX_REPLY_LEN:
+        raise EncodeError("bad response length")
+    if not int.from_bytes(response[2:4], "big") & _FLAG_QR:
+        raise EncodeError("response must have QR set")
+    if response[0:2] != query[0:2] or response[4:6] != query[4:6]:
+        raise EncodeError("response id or question count mismatch")
+    query_end = _reply_question_end(query, 1)
+    end = _reply_question_end(response, 1)
+    if (end is None or response[_MIN_MESSAGE_LEN:end]
+            != query[_MIN_MESSAGE_LEN:query_end]):
+        raise EncodeError("response question mismatch")
+    ancount = int.from_bytes(response[6:8], "big")
+    nscount = int.from_bytes(response[8:10], "big")
+    arcount = int.from_bytes(response[10:12], "big")
+    total = ancount + nscount + arcount
+    pos = end
+    opt = None  # (CLASS, TTL)，仅允许附加段末项恰一个
+    for index in range(total):
+        start = pos
+        # 跳过 owner 名字（应答中可为压缩形式，仅界定不解码）。
+        while True:
+            if pos >= len(response):
+                raise EncodeError("record name truncated")
+            length = response[pos]
+            kind = length & 0xC0
+            if kind == 0xC0:
+                if pos + 1 >= len(response):
+                    raise EncodeError("record name truncated")
+                pos += 2
+                break
+            if kind != 0x00:
+                raise EncodeError("reserved label type")
+            pos += 1
+            if length == 0:
+                break
+            if pos + length > len(response):
+                raise EncodeError("record name truncated")
+            pos += length
+        if pos + 10 > len(response):
+            raise EncodeError("record truncated")
+        rrtype = int.from_bytes(response[pos:pos + 2], "big")
+        rrclass = int.from_bytes(response[pos + 2:pos + 4], "big")
+        ttl = int.from_bytes(response[pos + 4:pos + 8], "big")
+        rdlength = int.from_bytes(response[pos + 8:pos + 10], "big")
+        pos += 10
+        if pos + rdlength > len(response):
+            raise EncodeError("record rdata truncated")
+        rdata = pos
+        pos += rdlength
+        if rrtype != _TYPE_OPT:
+            continue
+        if opt is not None or index != total - 1 or index < ancount + nscount:
+            raise EncodeError("OPT must be the last additional record")
+        # OPT 字段契约同 _decode_edns_query，违例一律 EncodeError。
+        if response[start] != 0:
+            raise EncodeError("opt owner must be uncompressed root")
+        if rrclass < _MIN_OPT_CLASS:
+            raise EncodeError("opt class out of range")
+        if ttl >> 24:
+            raise EncodeError("opt extended rcode must be 0")
+        if ttl & 0xFFFF & ~_FLAG_DO:
+            raise EncodeError("opt flags must be DO only")
+        opt_end = rdata + rdlength
+        while rdata < opt_end:
+            if rdata + 4 > opt_end:
+                raise EncodeError("opt option truncated")
+            opt_len = int.from_bytes(response[rdata + 2:rdata + 4], "big")
+            rdata += 4
+            if rdata + opt_len > opt_end:
+                raise EncodeError("opt option data truncated")
+            rdata += opt_len
+        opt = (rrclass, ttl)
+    if pos != len(response):
+        raise EncodeError("trailing bytes")
+    if opt is None:
+        raise EncodeError("response must contain exactly one OPT")
+    return opt
 
 
 def forward(query, plan, now, timeout=5):
@@ -5239,6 +5335,18 @@ class RateLimiter:
     取 response 并置 TC、QDCOUNT=1、其余计数为 0、问题段逐字节取
     query[12:]。
 
+    respond_edns(query, response, client, now, truncate=True) 是
+    respond 的 EDNS 变体：query 须 QR=0、单问题且恰含一个合法 OPT
+    （OPT 缺失、非法或尾随字节抛 EDNSError，QR 或问题数错抛
+    EncodeError），response 须 QR=1、ID 与问题字节同 query 且恰有
+    一个合法 OPT 为附加段末项（否则 EncodeError）；其余校验、计数
+    （键忽略 OPT）与统计同 respond，仅计一次 response。放行返回
+    (response, 余量)；拒绝且 truncate 为 False 返回 (None, 0)，
+    否则返回 (tc, 0)：tc 的 ID 取 query、flags 取 response 并置
+    TC、四段计数 1/0/0/1、问题段逐字节取 query 的问题字节，末项
+    OPT 为未压缩根 owner、TYPE41、CLASS 与 TTL 取 response 的
+    OPT、RDLENGTH=0。任何失败都不改变计数状态与入参。
+
     stats(reset=False) 返回固定键序 query,response,expired,evicted,
     keys 的紧凑 ASCII JSON（末尾一个换行）：query/response 各为键序
     allow,deny,unmatched 的对象，值为非负十进制整数。统计仅在 allow
@@ -5447,6 +5555,77 @@ class RateLimiter:
         tc = (query[0:2] + flags.to_bytes(2, "big")
               + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
               + query[12:])
+        return tc, 0
+
+    def respond_edns(self, query: bytes, response: bytes, client: str,
+                     now: int, truncate: bool = True,
+                     ) -> tuple[bytes | None, int]:
+        """按响应配额限流含 OPT 的查询与应答，返回应答报文与余量。
+
+        query、client、now、response、truncate 的类型与值域校验及异常
+        沿用 respond；query 须 QR=0、单问题且恰含一个合法 OPT：OPT
+        缺失、非法或尾随字节抛 EDNSError（同 resolve_edns 的查询契
+        约），QR 置位或问题数非 1 抛 EncodeError。response 须 QR=1、
+        ID 与问题字节同 query，且全报文恰有一个合法 OPT 并为附加段
+        末项（OPT 字段契约同查询），否则抛 EncodeError。全部校验先
+        于计数完成，任何失败都不改变计数、时钟与统计。校验通过后仅
+        计一次 response（同 allow(query, client, now, "response")
+        的匹配、固定窗、容量淘汰与统计提交，计数键忽略 OPT）：放行
+        返回 (response, 余量)；拒绝且 truncate 为 False 返回
+        (None, 0)；拒绝且 truncate 为 True 返回 (tc, 0)，tc 的 ID
+        取 query，flags 取 response 并置 TC，QDCOUNT=1、ANCOUNT=
+        NSCOUNT=0、ARCOUNT=1，问题段逐字节取 query 的问题字节，末项
+        OPT 为未压缩根 owner、TYPE41、CLASS 与 TTL 逐字节取
+        response 的 OPT、RDLENGTH=0。同一状态和输入逐字节一致。
+        """
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        if not isinstance(truncate, bool):
+            raise TypeError("truncate must be bool")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # client 与 query 的校验顺序同 respond：先地址、后解码。
+        try:
+            ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        if int.from_bytes(query[2:4], "big") & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if int.from_bytes(query[4:6], "big") != 1:
+            raise EncodeError("query must contain exactly one question")
+        # EDNS 查询须恰含一个合法 OPT：OPT 缺失、非法或尾随字节均为
+        # EDNSError（_decode_edns_query 的 OPT 契约）。
+        _msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
+        opt_class, opt_ttl = _decode_edns_response(query, response)
+        # 计数键只取问题段的 qname/qtype，与 OPT 无关：剥去 OPT 后沿用
+        # allow 的匹配、固定窗、容量淘汰与统计，一次调用仅计一次
+        # response。
+        query_end = _reply_question_end(query, 1)
+        plain = (query[0:10] + b"\x00\x00"
+                 + query[_MIN_MESSAGE_LEN:query_end])
+        allowed, remaining = self.allow(plain, client, now, "response")
+        if allowed:
+            return response, remaining
+        if not truncate:
+            return None, 0
+        flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
+        tc = (query[0:2] + flags.to_bytes(2, "big")
+              + (1).to_bytes(2, "big") + (0).to_bytes(2, "big")
+              + (0).to_bytes(2, "big") + (1).to_bytes(2, "big")
+              + query[_MIN_MESSAGE_LEN:query_end]
+              + b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+              + opt_class.to_bytes(2, "big") + opt_ttl.to_bytes(4, "big")
+              + (0).to_bytes(2, "big"))
         return tc, 0
 
     def stats(self, reset: bool = False) -> str:
