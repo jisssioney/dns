@@ -139,7 +139,15 @@
   权威缓存为空，plan/timeout 取参数；text 非 str 或 now 非 int（含
   bool）抛 TypeError，text 超 16777216 码点、JSON、重复键、键序、v
   或交叉约束错抛 ConfigError，余错沿用 load_zones、load_rec 及构造
-  器，失败无实例。
+  器，失败无实例；
+  save_state(path, now) 把 dump_state(now) 字节写入同目录临时文件，
+  flush、fsync 后以 os.replace 原子替换，返回写入字节数，任一步 I/O
+  失败抛 OSError 且保留旧文件、删除临时项、状态不变，path 非 str 抛
+  TypeError，空串或含 NUL 抛 ConfigError，now 异常沿用 dump_state；
+  load_state_file(path, plan, now, timeout=5) 类方法最多读 16777217
+  字节：缺失抛 FileNotFoundError，其他 I/O 错抛 OSError，超过
+  16777216 字节、非 ASCII、截断 JSON、重复键或状态结构错抛
+  ConfigError，解码后完全复用 load_state，失败不产生实例。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -362,6 +370,9 @@ _MAX_REC_TEXT_LEN = 1048576
 # 解码对象）；文本上限 16777216 码点（同区域文件上限）。
 _STATE_DUMP_KEYS = ["v", "zones", "rec", "stats"]
 _MAX_STATE_TEXT_LEN = 16777216
+# save_state/load_state_file 的状态文件大小上限（字节，ASCII 文本下与
+# 码点数一致）；读取时多读一字节以判定超限。
+_MAX_STATE_FILE_BYTES = 16777216
 # stats() JSON 的固定键序 h,m,x,u,c,l,r；加载时 c[1] 以 rec.items
 # 长度重算，r 以 h、m 重算，仅核对键序与字段形态。
 _STATS_KEYS = ["h", "m", "x", "u", "c", "l", "r"]
@@ -2640,6 +2651,20 @@ class Resolver:
     或 now 非 int（含 bool）抛 TypeError；text 超 16777216 码点、JSON、
     重复键、键序、v 或交叉约束错抛 ConfigError；余错沿用 load_zones、
     load_rec 及构造器。任何失败都不产生实例；同态同参逐字节一致。
+
+    save_state(path, now)：把 dump_state(now) 字节原子落盘，返回写入
+    字节数。内容逐字节等于 dump_state(now)，在目标同目录建唯一临时
+    文件，写入并 flush、fsync 后 os.replace 原子替换；任一步 I/O 失败
+    抛 OSError，保留旧文件、删除本次临时项且状态不变；成功也不改
+    状态，同态同参重复保存相同。path 非 str 抛 TypeError，空串或含
+    NUL 抛 ConfigError；now 异常沿用 dump_state。
+
+    load_state_file(path, plan, now, timeout=5)：类方法，最多读
+    16777217 字节。缺失抛 FileNotFoundError，其他 I/O 错抛 OSError；
+    超过 16777216 字节、非 ASCII、截断 JSON、重复键或状态结构错抛
+    ConfigError。解码后完全复用 load_state 的协议、plan/timeout 校验、
+    时钟衰减与其余异常；失败不产生实例，成功恢复相同区域历史与修订
+    号、递归正负缓存、FIFO、统计和最后时刻，权威缓存为空。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -3990,6 +4015,71 @@ class Resolver:
         instance._stats_l = l_buckets
         instance._stats_c0 = c[0]
         return instance
+
+    def save_state(self, path: str, now: int) -> int:
+        """把 dump_state(now) 字节原子落盘，返回写入字节数。
+
+        落盘内容逐字节等于 dump_state(now)（只读取得后编码为 ASCII
+        字节），在目标同目录创建唯一临时文件，写入并 flush、fsync 后
+        os.replace 原子替换目标。任一步 I/O 失败抛 OSError：目标旧文件
+        保留、本次临时项删除，解析器状态不变；成功也不改变任何状态，
+        同态同参重复保存逐字节相同。path 非 str 抛 TypeError；path 为
+        空串或含 NUL 抛 ConfigError；now 的异常沿用 dump_state
+        （TypeError/CacheError，且超限抛 ConfigError）。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # dump_state 只读：先取文本再触碰文件系统，now 异常在此原样传播。
+        data = self.dump_state(now).encode("ascii")
+        # 临时文件必须与目标同目录，os.replace 才能在同一文件系统内
+        # 原子改名；path 无目录成分时（""）以当前目录为同目录。
+        directory = os.path.dirname(path) or os.curdir
+        fd, tmp_path = tempfile.mkstemp(prefix=".dns-state-",
+                                        suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            # 失败：临时项绝不残留；目标未被 replace 触碰，旧文件保留。
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return len(data)
+
+    @classmethod
+    def load_state_file(cls, path: str, plan: list, now: int,
+                        timeout: int = 5) -> "Resolver":
+        """从状态文件读取最多 16777217 字节并按 load_state 恢复实例。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError。
+        文件缺失抛 FileNotFoundError，其余 I/O 错抛 OSError；内容超过
+        16777216 字节、含非 ASCII 字节、截断 JSON、重复键或状态结构错
+        误抛 ConfigError。字节解码为 ASCII 文本后完全复用 load_state 的
+        协议、plan/timeout 校验、时钟衰减与其余异常：失败不产生实例，
+        成功恢复相同区域历史与修订号、递归正负缓存、FIFO、统计与最后
+        成功时刻，权威缓存为空。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # 缺失与 I/O 错原样传播（FileNotFoundError/OSError）；仅多读
+        # 一字节即可判定超限，避免把超限文件整体读入内存。
+        with open(path, "rb") as stream:
+            data = stream.read(_MAX_STATE_FILE_BYTES + 1)
+        if len(data) > _MAX_STATE_FILE_BYTES:
+            raise ConfigError("state file exceeds 16777216 bytes")
+        if not data.isascii():
+            raise ConfigError("state file must be ASCII")
+        text = data.decode("ascii")
+        return cls.load_state(text, plan, now, timeout)
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
