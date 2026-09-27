@@ -110,6 +110,17 @@
   换行），result 为 "applied"、"unchanged" 或 "conflict"；target
   未保留抛 ConfigError，applied 恢复 timeout、attempts 与 plan 并
   加一版本，upstream_stats 按恢复 plan 清零，其余状态保留；
+  replay_forward(log, expected) 原子重放上游配置操作序列，返回键序
+  v,r 的紧凑 ASCII JSON 报告（末尾换行）：log 限 1048576 码点
+  ASCII JSON，顶层键序 v,o（v=1），o 含 1..4096 个键序仅 k,x,e 的
+  项（k="l" 时 x 为 migrate_forward 配置文本，k="r" 时 x 为非负
+  非 bool 目标版本，e 为非负非 bool 步骤前预期版本）；版本不符不
+  解析 log 并报告 conflict，相符时完整预检（错误抛 ReplayError）、
+  深拷贝上隔离调用 reload_forward/rollback_forward（目标缺失等
+  异常原样传播），任一失败不提交，全部成功后一次提交，r 为出现
+  applied 则 "applied" 否则 "unchanged"，提交后配置、版本、32 项
+  历史与直转统计等同逐步调用，其余状态不变，同态同 log 逐字节
+  一致；
   cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
   （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
   p,nx,nd,total,capacity,ttl，ttl 为同顺序三类最小剩余 TTL（无条目
@@ -334,6 +345,12 @@ _MAX_REPLAY_LOG_TEXT_LEN = 1048576
 # replay_log/replay_log_file 的冲突报告：内容固定，共用同一常量保证
 # 逐字节一致。
 _REPLAY_LOG_CONFLICT = '{"v":1,"result":"conflict","ops":[],"state":null}\n'
+# replay_forward 的上游配置重放日志：顶层键序仅 v,o（v 恒为 1），o 含
+# 1..4096 项，项键序仅 k,x,e：k="l" 时 x 为 migrate_forward 配置文本，
+# k="r" 时 x 为非负非 bool 目标版本；e 为非负非 bool 的步骤前预期版本。
+_REPLAY_FORWARD_KEYS = ["v", "o"]
+_REPLAY_FORWARD_ITEM_KEYS = ["k", "x", "e"]
+_REPLAY_FORWARD_OPS = frozenset(("l", "r"))
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -1403,6 +1420,63 @@ def _replay_log_pairs(pairs):
             raise ReplayError("duplicate key")
         obj[key] = value
     return obj
+
+
+def _parse_replay_forward_log(text):
+    """解析并结构预检 replay_forward 的日志文本，返回项列表（不执行）。
+
+    text 已由调用方限定为不超过 1048576 码点的 ASCII str。日志须为
+    ASCII JSON 对象：顶层键序仅 v,o，v 恒为 1；o 为含 1..4096 项的
+    数组，项为键序仅 k,x,e 的对象：k 仅 "l"/"r"，k="l" 时 x 为 str
+    （migrate_forward 配置文本，其内容与长度由执行时预检收口），
+    k="r" 时 x 为非负非 bool 整数（rollback 目标版本）；e 为非负
+    非 bool 整数（步骤前暂存预期版本）。JSON 解析（含超长整数、超
+    深嵌套）、重复键、顶层/项键序、v、容器与字段类型、项数量或
+    取值错误统一抛 ReplayError，不泄漏 json 异常。
+    """
+    try:
+        log = json.loads(text, object_pairs_hook=_replay_log_pairs)
+    except ReplayError:
+        # 重复键由 _replay_log_pairs 抛 ReplayError，原样传播。
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        # json 对超长整数抛非 JSONDecodeError 的 ValueError、对超深
+        # 嵌套抛 RecursionError，统一归为 ReplayError，不泄漏 json 异常。
+        raise ReplayError("invalid JSON") from None
+    if not isinstance(log, dict):
+        raise ReplayError("log must be an object")
+    if list(log.keys()) != _REPLAY_FORWARD_KEYS:
+        raise ReplayError("log keys must be v,o")
+    version = log["v"]
+    if (not isinstance(version, int) or isinstance(version, bool)
+            or version != 1):
+        raise ReplayError("unsupported v")
+    items = log["o"]
+    if not isinstance(items, list):
+        raise ReplayError("o must be list")
+    if not 1 <= len(items) <= _MAX_REPLAY_OPS:
+        raise ReplayError("o must contain 1..4096 items")
+    checked = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReplayError("item must be dict")
+        if list(item.keys()) != _REPLAY_FORWARD_ITEM_KEYS:
+            raise ReplayError("item keys must be k,x,e")
+        kind = item["k"]
+        if not isinstance(kind, str) or kind not in _REPLAY_FORWARD_OPS:
+            raise ReplayError('k must be "l" or "r"')
+        value = item["x"]
+        if kind == "l":
+            if not isinstance(value, str):
+                raise ReplayError("x must be str when k is l")
+        elif not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ReplayError("x must be a non-negative int when k is r")
+        expected = item["e"]
+        if (not isinstance(expected, int) or isinstance(expected, bool)
+                or expected < 0):
+            raise ReplayError("e must be a non-negative int")
+        checked.append((kind, value, expected))
+    return checked
 
 
 def _atomic_write_file(path, data, prefix):
@@ -3031,6 +3105,22 @@ class Resolver:
     upstream_stats 按恢复 plan 清零，缓存、时钟、区域、递归状态与
     其他统计不变；非 applied 与任何异常均不改变任何状态。
 
+    replay_forward(log, expected)：确定性原子重放上游配置操作序列，
+    返回键序 v,r 的紧凑 ASCII JSON 报告（末尾单换行）。log 限
+    1048576 码点 ASCII JSON，顶层键序 v,o（v=1），o 含 1..4096
+    项，项键序仅 k,x,e：k="l" 时 x 为 migrate_forward 配置文本，
+    k="r" 时 x 为非负非 bool 目标版本；e 为非负非 bool 的步骤前
+    预期版本。log/expected 类型错抛 TypeError，expected<0 抛
+    ConfigError；expected 不等于当前版本号时不解析 log，报告
+    conflict（v 为当前版本号）且状态不变。相符时完整预检：解析、
+    重复键、键序、版本、数量、字段、非 ASCII、配置错误或 e 不等于
+    步骤前暂存版本号均抛 ReplayError；随后在深拷贝上隔离调用
+    reload_forward/rollback_forward，rollback 目标未保留等异常原样
+    传播，任一失败不提交。全部成功后一次原子提交配置、直转统计、
+    版本号与 32 项历史（其余状态不变）；v 为提交后版本号，r 为出现
+    applied 则 "applied"，否则 "unchanged"。提交后状态等同逐步
+    调用，同态同 log 逐字节一致。
+
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
     p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
@@ -4546,6 +4636,97 @@ class Resolver:
         self._archive_forward(self._forward_version)
         return self._rollback_report(self._forward_version, "applied",
                                      target)
+
+    def replay_forward(self, log: str, expected: int) -> str:
+        """确定性原子重放上游配置操作序列：整体预检、隔离执行、一次提交。
+
+        log 为不超过 1048576 码点的 ASCII JSON：顶层键序仅 v,o，v 恒为
+        1；o 含 1..4096 项，项键序仅 k,x,e：k 仅 "l"/"r"，k="l" 时 x
+        为 migrate_forward 配置文本（预检阶段对其运行 migrate_forward
+        完整校验，含 1048576 码点长度限制，规范化文本供隔离执行复用），
+        k="r" 时 x 为非负非 bool 的 rollback 目标版本；e 为非负非 bool
+        整数，须等于该步骤执行前暂存版本号。log 非 str 或 expected 非
+        int（含 bool）抛 TypeError；expected<0 抛 ConfigError；expected
+        不等于当前版本号时不解析 log，返回键序 v,r 的报告（v 为当前
+        版本号、r="conflict"），不改变任何状态。
+
+        相符时先完整预检（先于一切隔离执行）：超长、非 ASCII、JSON
+        解析、重复键、键序、v、版本（数量、字段、非 bool、非负）、项
+        数量、字段类型、非 ASCII 或任一 k="l" 配置错误均抛 ReplayError。
+        随后在解析器深拷贝上按序隔离执行：逐步核对 e 等于步骤前暂存
+        版本号（不符抛 ReplayError），k="l" 隔离调用 reload_forward、
+        k="r" 隔离调用 rollback_forward；rollback 目标未保留等异常原样
+        传播（不转 ReplayError）。任一预检或执行失败均不提交，真实
+        解析器不变。
+
+        全部成功后一次原子提交仅替换 timeout、attempts、plan、
+        upstream_stats、版本号与 32 项历史（取自暂存副本），其余状态
+        不变。返回键序 v,r 的紧凑 ASCII JSON（末尾单换行）：v 为提交
+        后版本号，r 为序列中出现 applied 则 "applied"，否则
+        "unchanged"。提交后配置、版本号、32 项历史及直转统计须等同
+        以同一版本序列逐步调用 reload_forward/rollback_forward，其余
+        状态不变。同态同 log 逐字节一致。
+        """
+        if not isinstance(log, str):
+            raise TypeError("log must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected version must be non-negative")
+        # 冲突不解析 log：任何解析都必须在版本号检查之后。
+        if expected != self._forward_version:
+            return json.dumps(
+                {"v": self._forward_version, "r": "conflict"},
+                ensure_ascii=True, separators=(",", ":")) + "\n"
+        if len(log) > _MAX_REPLAY_LOG_TEXT_LEN:
+            raise ReplayError("log exceeds 1048576 code points")
+        if not log.isascii():
+            raise ReplayError("log must be ASCII")
+        # 结构预检：仅校验日志形态与字段类型，不触碰任何配置内容；
+        # k="l" 的配置内容随后由独立的完整预检阶段收口。
+        checked = _parse_replay_forward_log(log)
+        # 完整预检（先于一切隔离执行）：对每个 k="l" 项的配置文本运行
+        # 纯函数 migrate_forward，长度、解析、结构等配置错误统一为
+        # ReplayError；规范 v1 文本再次迁移逐字节不变，规范化结果直接
+        # 供隔离执行复用，使执行阶段不可能再冒出配置类 ConfigError。
+        migrated = {}
+        for index, (kind, value, _step_expected) in enumerate(checked):
+            if kind == "l":
+                try:
+                    migrated[index] = migrate_forward(value)
+                except ConfigError:
+                    raise ReplayError("forward config is invalid") from None
+        # 隔离执行：全部步骤在深拷贝上执行，任何失败放弃全部暂存
+        # 状态，真实解析器（配置、版本、历史、直转统计、缓存、时钟与
+        # 其他统计）均不受影响。
+        candidate = copy.deepcopy(self)
+        applied = False
+        for index, (kind, value, step_expected) in enumerate(checked):
+            if step_expected != candidate._forward_version:
+                # e 不等于步骤前暂存版本号：与结构错误同级，整序列拒绝。
+                raise ReplayError("e must equal the staged version")
+            staged = candidate._forward_version
+            if kind == "l":
+                # 入参为已预检的规范 v1 文本：只可能 unchanged/applied。
+                report = candidate.reload_forward(migrated[index], staged)
+            else:
+                # 目标未保留等 ConfigError 原样传播，不转 ReplayError；
+                # expected 恒为暂存当前号，故无 conflict。
+                report = candidate.rollback_forward(value, staged)
+            if json.loads(report)["result"] == "applied":
+                applied = True
+        # 全部成功后原子提交：仅替换上游配置、直转统计、版本号与历史，
+        # 缓存、时钟、区域、递归状态与其他统计全部保留。
+        self._timeout = candidate._timeout
+        self._attempts = candidate._attempts
+        self._plan = candidate._plan
+        self._upstream_stats = candidate._upstream_stats
+        self._forward_version = candidate._forward_version
+        self._forward_history = candidate._forward_history
+        return json.dumps(
+            {"v": self._forward_version,
+             "r": "applied" if applied else "unchanged"},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
 
     def cache_stats(self, now: int, reset: bool = False) -> str:
         """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
