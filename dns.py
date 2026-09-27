@@ -3172,13 +3172,14 @@ class Resolver:
     结果、a 须为步骤后版本。log/expected 类型错抛 TypeError，
     expected<0 抛 ConfigError；expected 不等于当前版本号时不解析
     log，报告 conflict（v 为当前版本号）且状态不变。相符时先规范化
-    全部项，再在深拷贝上推演配置、历史与版本：每步调用前核对 e、
-    调用后核对五键项 r、a，不符均抛 ReplayError；rollback 目标未
-    保留等异常原样传播，任一失败不提交、不入账。全部成功后一次原子
-    提交配置、直转统计、版本号、32 项历史与 forward_audit 队列（成功
-    序列各步按提交序入账），其余状态不变；v 为提交后版本号，r 为出现
-    applied 则 "applied"，否则 "unchanged"。提交后状态等同逐步调用，
-    同初态同序列逐字节一致。
+    全部项，再无副作用推演配置、历史与版本（整批核对通过前不调用
+    reload_forward/rollback_forward）：每步调用前核对 e、调用后核对
+    五键项 r、a，不符均抛 ReplayError；rollback 目标未保留抛
+    ConfigError，任一失败不执行、不提交、不入账。全序列核对通过后
+    才隔离执行，随后一次原子提交配置、直转统计、版本号、32 项历史与
+    forward_audit 队列（成功序列各步按提交序入账），其余状态不变；
+    v 为提交后版本号，r 为出现 applied 则 "applied"，否则
+    "unchanged"。提交后状态等同逐步调用，同初态同序列逐字节一致。
 
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
@@ -4782,23 +4783,25 @@ class Resolver:
         当前版本号时不解析 log，返回键序 v,r 的报告（v 为当前版本号、
         r="conflict"），不改变任何状态。
 
-        相符时先规范化全部项，再在解析器深拷贝上按序推演配置、历史与
-        版本：每步先核对 e 等于步骤前暂存版本号（不符抛 ReplayError），
-        再在副本上隔离调用 reload_forward（入参为规范化 v1 文本）或
-        rollback_forward，随后五键项核对 r、a 与推演结果一致（不符抛
-        ReplayError），使 forward_audit 文本可直接重放；rollback 目标
-        未保留等异常原样传播（不转 ReplayError）。任一预检或推演失败
-        均不提交，真实解析器（含审计队列）不变，整批失败不入账。
+        相符时先规范化全部项，再无副作用纯推演每步的配置、32 项历史、
+        版本号与结果（整批核对通过前不调用 reload_forward 或
+        rollback_forward，也不触碰任何暂存副本）：每步先核对 e 等于
+        步骤前暂存版本号（不符抛 ReplayError），五键项随后核对 r、a
+        与推演结果一致（不符抛 ReplayError），使 forward_audit 文本可
+        直接重放；rollback 目标未保留抛 ConfigError（原样，不转
+        ReplayError）。任一预检或推演失败均不执行、不提交，真实解析器
+        （含审计队列）不变，整批失败不入账。
 
-        全部成功后一次原子提交：timeout、attempts、plan、
-        upstream_stats、版本号、32 项历史与 forward_audit 队列均取自
-        暂存副本（成功序列的各步按提交序入账，受 4096 项与 16777216
-        字节淘汰），其余状态不变。返回键序 v,r 的紧凑 ASCII JSON（末尾
-        单换行）：v 为提交后版本号，r 为序列中出现 applied 则
-        "applied"，否则 "unchanged"。提交后配置、版本号、32 项历史及
-        直转统计须等同以同一版本序列逐步调用
-        reload_forward/rollback_forward，其余状态不变。同初态同序列逐
-        字节一致。
+        全序列核对通过后才在深拷贝上隔离执行各步（入参为规范化 v1
+        文本或已核对的目标版本，不再失败；执行异常不提交），随后一次
+        原子提交：timeout、attempts、plan、upstream_stats、版本号、
+        32 项历史与 forward_audit 队列均取自暂存副本（成功序列的各步
+        按提交序入账，受 4096 项与 16777216 字节淘汰），其余状态不变。
+        返回键序 v,r 的紧凑 ASCII JSON（末尾单换行）：v 为提交后版本
+        号，r 为序列中出现 applied 则 "applied"，否则 "unchanged"。
+        提交后配置、版本号、32 项历史及直转统计须等同以同一版本序列
+        逐步调用 reload_forward/rollback_forward，其余状态不变。同初
+        态同序列逐字节一致。
         """
         if not isinstance(log, str):
             raise TypeError("log must be str")
@@ -4830,38 +4833,70 @@ class Resolver:
                     migrated[index] = migrate_forward(value)
                 except ConfigError:
                     raise ReplayError("forward config is invalid") from None
-        # 隔离推演：全部步骤在深拷贝上执行，逐步先核对 e 再调用、调用后
-        # 核对五键项的 r、a；副本的审计队列随各步真实入账并自行淘汰。
-        # 任何失败放弃全部暂存状态，真实解析器（配置、版本、历史、审计、
-        # 直转统计、缓存、时钟与其他统计）均不受影响。
-        candidate = copy.deepcopy(self)
+        # 无副作用纯推演：以 (timeout, attempts, 截断 plan) 快照、暂存
+        # 32 项历史与暂存版本号逐步模拟每步结果，逐步核对 e 与五键项的
+        # r、a。整批核对通过前不调用 reload_forward/rollback_forward、
+        # 不构造暂存副本，真实解析器（配置、版本、历史、审计、直转统计、
+        # 缓存、时钟与其他统计）均不受影响。
+        staged_config = self._forward_snapshot()
+        staged_history = dict(self._forward_history)
+        staged_version = self._forward_version
         applied = False
         for index, (kind, value, step_expected,
                     claim_result, claim_after) in enumerate(checked):
             # 调用前核对 e：与结构错误同级，整序列拒绝、不入账。
-            if step_expected != candidate._forward_version:
+            if step_expected != staged_version:
                 raise ReplayError("e must equal the staged version")
-            staged = candidate._forward_version
             if kind == "l":
-                # 入参为已预检的规范 v1 文本：只可能 unchanged/applied。
-                report = candidate.reload_forward(migrated[index], staged)
+                # 规范 v1 文本已经 migrate_forward 完整校验（每上游事件
+                # 不超过 attempts），其 (timeout, attempts, plan) 快照与
+                # 生效配置的比较等价于 reload_forward 的规范文本比较。
+                config = json.loads(migrated[index])
+                snapshot = (
+                    config["timeout"], config["attempts"],
+                    [(item["name"],
+                      [(event["delay"],
+                        None if event["reply"] is None
+                        else bytes.fromhex(event["reply"]))
+                       for event in item["events"]])
+                     for item in config["plan"]])
             else:
-                # 目标未保留等 ConfigError 原样传播，不转 ReplayError；
-                # expected 恒为暂存当前号，故无 conflict。
-                report = candidate.rollback_forward(value, staged)
-            result = json.loads(report)["result"]
-            # 五键审计项：r、a 必须与副本推演结果逐项一致，整批核对通过
-            # 后提交，保证审计文本可直接重放。
+                # 目标未保留抛 ConfigError（原样，不转 ReplayError）。
+                snapshot = staged_history.get(value)
+                if snapshot is None:
+                    raise ConfigError("target version not retained")
+            if snapshot == staged_config:
+                result = "unchanged"
+            else:
+                # applied：暂存配置替换、版本号加 1 并按新版本号归档，
+                # 历史容量 32、超量淘汰最小版本号（同 _archive_forward）。
+                result = "applied"
+                applied = True
+                staged_config = snapshot
+                staged_version += 1
+                staged_history[staged_version] = snapshot
+                if len(staged_history) > _FORWARD_HISTORY_CAPACITY:
+                    del staged_history[min(staged_history)]
+            # 五键审计项：r、a 必须与推演结果逐项一致，保证审计文本可
+            # 直接重放。
             if claim_result is not None and claim_result != result:
                 raise ReplayError("r must match the replayed result")
-            if claim_after is not None and (
-                    claim_after != candidate._forward_version):
+            if claim_after is not None and claim_after != staged_version:
                 raise ReplayError("a must match the replayed version")
-            if result == "applied":
-                applied = True
-        # 全部成功后原子提交：仅替换上游配置、直转统计、版本号、历史与
-        # 审计队列（含本序列各步入账及淘汰结果），缓存、时钟、区域、递归
-        # 状态与其他统计全部保留。
+        # 全序列核对通过后才隔离执行：在深拷贝上按序调用
+        # reload_forward/rollback_forward（入参均已预检核对，只会
+        # unchanged/applied），副本的审计队列随各步真实入账并自行淘汰；
+        # 执行万一抛异常则不提交，真实解析器不变。
+        candidate = copy.deepcopy(self)
+        for index, (kind, value, _e, _r, _a) in enumerate(checked):
+            if kind == "l":
+                candidate.reload_forward(migrated[index],
+                                         candidate._forward_version)
+            else:
+                candidate.rollback_forward(value, candidate._forward_version)
+        # 全部成功后一次原子提交：仅替换上游配置、直转统计、版本号、
+        # 历史与审计队列（含本序列各步入账及淘汰结果），缓存、时钟、
+        # 区域、递归状态与其他统计全部保留。
         self._timeout = candidate._timeout
         self._attempts = candidate._attempts
         self._plan = candidate._plan
