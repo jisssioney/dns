@@ -110,6 +110,19 @@
   换行），result 为 "applied"、"unchanged" 或 "conflict"；target
   未保留抛 ConfigError，applied 恢复 timeout、attempts 与 plan 并
   加一版本，upstream_stats 按恢复 plan 清零，其余状态保留；
+  replay_forward(log, expected) 原子重放上游配置操作序列：log 限
+  1048576 码点 ASCII JSON，顶层键序 v,o，v=1，o 含 1..4096 项，
+  项键序 k,x,e（k="l" 时 x 为 migrate_forward 配置文本，k="r" 时
+  x 为非负非 bool 目标版本，e 为非负非 bool 预期版本）；log/expected
+  类型错抛 TypeError，expected<0 抛 ConfigError，当前版本不符时不解析
+  log 并返回键序 v,r 的当前版本 conflict；版本相符时完整预检（解析、
+  重复键、键序、版本、数量、字段、非 ASCII、配置错误或 e 不等于步骤前
+  暂存版本抛 ReplayError），再在深拷贝上隔离调用
+  reload_forward/rollback_forward（目标缺失等异常原样传播，任一失败不
+  提交）；全部成功一次提交，返回键序 v,r 的紧凑 ASCII JSON（末尾单
+  换行），v 为提交后版本，r 为出现 applied 则 "applied"，否则
+  "unchanged"；提交后配置、版本、32 项历史及直转统计等同逐步调用，
+  其余状态不变，同态同 log 逐字节一致；
   cache_stats(now, reset=False) 返回缓存水位快照的紧凑 ASCII JSON
   （顶层键序仅 a,r,x,v，末尾换行）：a、r（权威、递归）键序均为
   p,nx,nd,total,capacity,ttl，ttl 为同顺序三类最小剩余 TTL（无条目
@@ -334,6 +347,12 @@ _MAX_REPLAY_LOG_TEXT_LEN = 1048576
 # replay_log/replay_log_file 的冲突报告：内容固定，共用同一常量保证
 # 逐字节一致。
 _REPLAY_LOG_CONFLICT = '{"v":1,"result":"conflict","ops":[],"state":null}\n'
+# replay_forward 的原子上游配置重放日志：顶层键序仅 v,o，v 恒为 1；
+# o 项键序仅 k,x,e，k 仅 "l"（x 为 migrate_forward 配置文本）或
+# "r"（x 为非负非 bool 回滚目标版本），e 为非负非 bool 的步骤前暂存
+# 版本号。
+_REPLAY_FORWARD_LOG_KEYS = ["v", "o"]
+_REPLAY_FORWARD_OP_KEYS = ["k", "x", "e"]
 _POLICY_RULE_KEYS = ["client", "name", "type", "action"]
 _POLICY_ACTIONS = frozenset(("allow", "deny"))
 _MAX_POLICY_RULES = 256
@@ -3031,6 +3050,28 @@ class Resolver:
     upstream_stats 按恢复 plan 清零，缓存、时钟、区域、递归状态与
     其他统计不变；非 applied 与任何异常均不改变任何状态。
 
+    replay_forward(log, expected)：原子重放上游配置操作序列，返回键序
+    仅 v,r 的紧凑 ASCII JSON 报告（末尾单换行）。log 为不超过
+    1048576 码点的 ASCII JSON：顶层键序仅 v,o，v 恒为 1，o 为
+    1..4096 项，项键序仅 k,x,e：k="l" 时 x 为 migrate_forward 配置
+    文本（完整校验并规范化，v0/v1），k="r" 时 x 为非负非 bool 整数
+    目标版本；e 为非负非 bool 整数，须等于该步骤执行前的暂存版本号。
+    log 非 str 或 expected 非 int（含 bool）抛 TypeError；expected<0
+    抛 ConfigError；expected 不等于当前版本号时不解析 log，报告
+    conflict（v 为当前版本号，r 为 "conflict"）且状态不变。相符时先
+    完整预检：长度、ASCII、JSON 解析、重复键、键序、v、o 数量、各项
+    k/x/e 类型范围与 l 的配置文本任一错误抛 ReplayError（不调用任何
+    转发事务，状态不变）。预检通过后在解析器深拷贝上依次隔离调用
+    reload_forward（l 步，以暂存版本号为 expected）与
+    rollback_forward（r 步，x 为 target、暂存版本号为 expected）：每
+    步执行前暂存版本号须等于 e，不符抛 ReplayError；目标版本未保留等
+    事务异常（ConfigError 等）原样传播；任一步失败放弃全部暂存状态，
+    真实解析器不变。全部成功后一次提交：候选状态整体替换本解析器。
+    报告 v 为提交后版本号；任一步结果为 applied 则 r 为 "applied"，
+    否则 "unchanged"。提交后当前配置、版本号、32 项历史与直转统计
+    须等同在同初态上逐步调用各事务，缓存、时钟、区域、递归状态与其他
+    统计保持；同态同 log 逐字节一致。
+
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
     p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
@@ -4546,6 +4587,124 @@ class Resolver:
         self._archive_forward(self._forward_version)
         return self._rollback_report(self._forward_version, "applied",
                                      target)
+
+    def replay_forward(self, log: str, expected: int) -> str:
+        """确定性原子上游配置重放：整体预检、隔离执行、全部成功后一次提交。
+
+        log 为不超过 1048576 码点的 ASCII JSON：顶层键序仅 v,o，v 恒
+        为 1，o 为 1..4096 项；项键序仅 k,x,e：k="l" 时 x 为
+        migrate_forward 的 v0/v1 配置文本，k="r" 时 x 为非负非 bool
+        目标版本；e 为非负非 bool 整数，须等于该步骤执行前的暂存
+        版本号。log 非 str 或 expected 非 int（含 bool）抛 TypeError；
+        expected<0 抛 ConfigError。expected 不等于当前版本号时不解析
+        log，返回键序仅 v,r 的 conflict 报告（v 为当前版本号，
+        r="conflict"）且状态不变。相符时先完整预检：长度、非 ASCII、
+        JSON 解析、重复键、顶层/项键序、v、o 数量、k 取值、x 与 e
+        的类型/范围及 l 配置文本的 migrate_forward 校验任一错误抛
+        ReplayError（配置错误归为 ReplayError），且不调用任何转发
+        事务、不改变任何状态。预检通过后在解析器深拷贝上依次隔离
+        执行：l 步以暂存版本号为 expected 调用 reload_forward，
+        r 步以 x 为 target、暂存版本号为 expected 调用
+        rollback_forward；每步执行前暂存版本号须等于 e，不符抛
+        ReplayError；目标版本未保留等事务异常原样传播；任一步失败
+        放弃全部暂存状态，真实解析器不变。全部成功后一次提交：候选
+        状态整体替换本解析器，故提交后当前配置、版本号、32 项历史
+        与直转统计等同在同初态上逐步调用各事务，缓存、时钟、区域、
+        递归状态与其他统计保持。输出为紧凑 ASCII JSON、末尾单换行，
+        键序仅 v,r：v 为提交后版本号，任一步结果为 applied 则 r 为
+        "applied"，否则 "unchanged"。同态同 log 逐字节一致。
+        """
+        if not isinstance(log, str):
+            raise TypeError("log must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if expected < 0:
+            raise ConfigError("expected version must be non-negative")
+        # 冲突不解析 log：任何解析都必须在版本号检查之后。
+        if expected != self._forward_version:
+            return json.dumps(
+                {"v": self._forward_version, "r": "conflict"},
+                ensure_ascii=True, separators=(",", ":")) + "\n"
+        if len(log) > _MAX_REPLAY_LOG_TEXT_LEN:
+            raise ReplayError("log exceeds 1048576 code points")
+        if not log.isascii():
+            raise ReplayError("log must be ASCII")
+        try:
+            record = json.loads(log, object_pairs_hook=_replay_log_pairs)
+        except ReplayError:
+            # 重复键由 _replay_log_pairs 抛 ReplayError，原样传播。
+            raise
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            # json 对超长整数抛非 JSONDecodeError 的 ValueError、对超深
+            # 嵌套抛 RecursionError，统一归为 ReplayError，不泄漏 json 异常。
+            raise ReplayError("invalid JSON") from None
+        if not isinstance(record, dict):
+            raise ReplayError("log must be an object")
+        if list(record.keys()) != _REPLAY_FORWARD_LOG_KEYS:
+            raise ReplayError("log keys must be v,o")
+        version = record["v"]
+        if (not isinstance(version, int) or isinstance(version, bool)
+                or version != 1):
+            raise ReplayError("unsupported v")
+        ops = record["o"]
+        if not isinstance(ops, list):
+            raise ReplayError("o must be list")
+        if not 1 <= len(ops) <= _MAX_REPLAY_OPS:
+            raise ReplayError("o must contain 1..4096 items")
+        # 完整预检：全部项（含 l 步配置文本的 migrate_forward 完整校验
+        # 与规范化）在隔离执行前完成；任何结构或配置错误统一为 ReplayError。
+        checked = []
+        for op in ops:
+            if (not isinstance(op, dict)
+                    or list(op.keys()) != _REPLAY_FORWARD_OP_KEYS):
+                raise ReplayError("op keys must be k,x,e")
+            kind = op["k"]
+            if kind not in ("l", "r"):
+                raise ReplayError("k must be l or r")
+            value = op["x"]
+            if kind == "l":
+                if not isinstance(value, str):
+                    raise ReplayError("x must be str")
+                # 复用 migrate_forward 完整校验并规范化；value 已为 str，
+                # 不可能抛 TypeError，ConfigError 统一归为 ReplayError。
+                try:
+                    value = migrate_forward(value)
+                except ConfigError:
+                    raise ReplayError("invalid forward config") from None
+            else:
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ReplayError("x must be int")
+                if value < 0:
+                    raise ReplayError("x must be non-negative")
+            staged = op["e"]
+            if not isinstance(staged, int) or isinstance(staged, bool):
+                raise ReplayError("e must be int")
+            if staged < 0:
+                raise ReplayError("e must be non-negative")
+            checked.append((kind, value, staged))
+        # 隔离执行：全部步骤在深拷贝上执行，任一异常放弃全部暂存状态，
+        # 真实解析器（配置、版本、历史、直转统计、缓存、时钟等）均不受
+        # 影响。暂存版本号与事务 expected 始终相同，故 l/r 不会返回
+        # conflict；版本号加一即该步 applied。
+        candidate = copy.deepcopy(self)
+        applied = False
+        for kind, value, staged in checked:
+            if staged != candidate._forward_version:
+                raise ReplayError("e does not match staged version")
+            before = candidate._forward_version
+            if kind == "l":
+                candidate.reload_forward(value, before)
+            else:
+                candidate.rollback_forward(value, before)
+            if candidate._forward_version != before:
+                applied = True
+        final_version = candidate._forward_version
+        # 全部成功后原子提交：候选状态整体替换本解析器状态。
+        self.__dict__.update(candidate.__dict__)
+        return json.dumps(
+            {"v": final_version,
+             "r": "applied" if applied else "unchanged"},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
 
     def cache_stats(self, now: int, reset: bool = False) -> str:
         """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
