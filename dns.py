@@ -30,6 +30,10 @@
   并迁移为 v1 文本（v0 顶层键序 v,zones,rec、无 stats，迁移补零值
   统计且 c[1] 等于 rec.items 长度；v1 统计不变；紧凑 ASCII JSON、
   r 六位小数、末尾单换行，最多 16777216 字节）。
+- migrate_forward(text: str) -> str: 把 v0/v1 上游转发计划配置文本
+  完整校验并迁移为 v1 文本（v0 顶层键序 v,timeout,plan、无 attempts，
+  迁移补 attempts=2；plan 与 events 保持原序；紧凑 ASCII JSON、
+  末尾单换行，输入限 1048576 码点）。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
@@ -368,6 +372,14 @@ _PLAN_EVENTS_USED = 2
 _MIN_TIMEOUT = 1
 _MAX_TIMEOUT = 60
 _MAX_REPLY_LEN = 65535
+# migrate_forward 上游转发计划配置：v0 顶层键序仅 v,timeout,plan，
+# v1 仅 v,timeout,attempts,plan（v 分别为 0、1，v0 迁移时 attempts=2）；
+# plan 项键序仅 name,events，事件键序仅 delay,reply；文本限 1048576 码点。
+_FORWARD_KEYS_V0 = ["v", "timeout", "plan"]
+_FORWARD_KEYS_V1 = ["v", "timeout", "attempts", "plan"]
+_FORWARD_ITEM_KEYS = ["name", "events"]
+_FORWARD_EVENT_KEYS = ["delay", "reply"]
+_MAX_FORWARD_TEXT_LEN = 1048576
 _FLAG_QR = 0x8000
 _MAX_RECURSION_LEVELS = 16
 _RECURSIVE_RCODES = {0: 0, 1: 0, 2: _RCODE_NXDOMAIN, 3: 0}
@@ -2203,6 +2215,107 @@ def forward(query, plan, now, timeout=5):
     if saw_timeout and not saw_other:
         raise UpstreamTimeout("all upstream attempts timed out")
     raise UpstreamError("no usable upstream reply")
+
+
+def migrate_forward(text: str) -> str:
+    """把 v0/v1 上游转发计划配置文本完整校验并迁移为 v1 文本。
+
+    v1 顶层键序 v,timeout,attempts,plan（v=1），v0 顶层键序
+    v,timeout,plan（v=0，无 attempts，迁移时补 attempts=2）。timeout
+    为 1..60 的非 bool 整数，attempts 为 1..2 的非 bool 整数；plan 含
+    1..16 项，项键序 name,events，name 为非空 str；events 含 0..2 项，
+    项键序 delay,reply，delay 为非负非 bool 整数，reply 为 null 或解码后
+    不超 65535 字节的偶长小写十六进制；任一 plan 项的 events 多于
+    attempts 抛 ConfigError。先校验全部内容，再按 plan 与 events 两层
+    原序输出 v1：紧凑 ASCII JSON、整数十进制、十六进制小写、末尾单
+    换行。text 非 str 抛 TypeError；text 超 1048576 码点、JSON 解析、
+    重复键、键序、版本、容器或字段类型、范围或十六进制错误抛
+    ConfigError。同输入逐字节一致，对迁移结果再次迁移不变。
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    if len(text) > _MAX_FORWARD_TEXT_LEN:
+        raise ConfigError("text exceeds 1048576 code points")
+    try:
+        config = json.loads(text, object_pairs_hook=_config_pairs)
+    except json.JSONDecodeError:
+        raise ConfigError("invalid JSON") from None
+    if not isinstance(config, dict):
+        raise ConfigError("config must be an object")
+    keys = list(config.keys())
+    if keys == _FORWARD_KEYS_V1:
+        expect = 1
+    elif keys == _FORWARD_KEYS_V0:
+        expect = 0
+    else:
+        raise ConfigError("config keys must be v,timeout[,attempts],plan")
+    version = config["v"]
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ConfigError("v must be int")
+    if version != expect:
+        raise ConfigError("unsupported v")
+    timeout = config["timeout"]
+    if not isinstance(timeout, int) or isinstance(timeout, bool):
+        raise ConfigError("timeout must be int")
+    if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
+        raise ConfigError("timeout out of range")
+    if expect == 1:
+        attempts = config["attempts"]
+        if not isinstance(attempts, int) or isinstance(attempts, bool):
+            raise ConfigError("attempts must be int")
+        if not 1 <= attempts <= _PLAN_EVENTS_USED:
+            raise ConfigError("attempts out of range")
+    else:
+        attempts = _PLAN_EVENTS_USED
+    plan = config["plan"]
+    if not isinstance(plan, list):
+        raise ConfigError("plan must be list")
+    if not 1 <= len(plan) <= _MAX_PLAN_ITEMS:
+        raise ConfigError("plan must contain 1..16 items")
+    items = []
+    for item in plan:
+        if not isinstance(item, dict):
+            raise ConfigError("plan item must be an object")
+        if list(item.keys()) != _FORWARD_ITEM_KEYS:
+            raise ConfigError("plan item keys must be name,events")
+        name = item["name"]
+        if not isinstance(name, str):
+            raise ConfigError("name must be str")
+        if not name:
+            raise ConfigError("name must be non-empty")
+        events = item["events"]
+        if not isinstance(events, list):
+            raise ConfigError("events must be list")
+        if len(events) > _PLAN_EVENTS_USED:
+            raise ConfigError("events must contain 0..2 items")
+        if len(events) > attempts:
+            raise ConfigError("events exceed attempts")
+        checked = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise ConfigError("event must be an object")
+            if list(event.keys()) != _FORWARD_EVENT_KEYS:
+                raise ConfigError("event keys must be delay,reply")
+            delay = event["delay"]
+            if not isinstance(delay, int) or isinstance(delay, bool):
+                raise ConfigError("delay must be int")
+            if delay < 0:
+                raise ConfigError("delay must be non-negative")
+            reply = event["reply"]
+            if reply is not None:
+                if not isinstance(reply, str):
+                    raise ConfigError("reply must be str or null")
+                if (len(reply) % 2
+                        or any(c not in _LOWER_HEXDIGITS for c in reply)):
+                    raise ConfigError(
+                        "reply must be even-length lowercase hex")
+                if len(reply) // 2 > _MAX_REPLY_LEN:
+                    raise ConfigError("reply exceeds 65535 bytes")
+            checked.append({"delay": delay, "reply": reply})
+        items.append({"name": name, "events": checked})
+    out = {"v": 1, "timeout": timeout, "attempts": attempts, "plan": items}
+    return json.dumps(out, ensure_ascii=True,
+                      separators=(",", ":")) + "\n"
 
 
 def _check_resolve_inputs(query, now, limit, last_end):
