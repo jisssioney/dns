@@ -2640,6 +2640,23 @@ class Resolver:
     或 now 非 int（含 bool）抛 TypeError；text 超 16777216 码点、JSON、
     重复键、键序、v 或交叉约束错抛 ConfigError；余错沿用 load_zones、
     load_rec 及构造器。任何失败都不产生实例；同态同参逐字节一致。
+
+    save_state(path, now)：把 dump_state(now) 字节逐字节原子落盘，
+    返回写入字节数。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
+    ConfigError；now 异常沿用 dump_state（TypeError/CacheError）。在
+    目标同目录建唯一临时文件，写入并 flush、fsync 后 os.replace 原子
+    替换目标；任一步 I/O 失败抛 OSError，删除本次临时项、保留旧目标，
+    解析器状态不变。成功也不改变任何状态，同态同参重复保存逐字节
+    相同。
+
+    load_state_file(path, plan, now, timeout=5)：类方法，从状态文件
+    恢复等价解析器。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
+    ConfigError。最多读 16777217 字节：文件缺失抛 FileNotFoundError，
+    其余 I/O 错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
+    ConfigError。解码后完全复用 load_state 的协议（截断 JSON、重复
+    键或状态结构错抛 ConfigError）、plan/timeout 校验、时钟衰减与
+    其余异常；任何失败都不产生实例，成功恢复区域历史与修订号、递归
+    正负缓存、FIFO、统计与最后成功时刻（now），权威缓存为空。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -3990,6 +4007,74 @@ class Resolver:
         instance._stats_l = l_buckets
         instance._stats_c0 = c[0]
         return instance
+
+    def save_state(self, path: str, now: int) -> int:
+        """把 dump_state(now) 字节逐字节原子落盘，返回写入字节数。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError；
+        now 异常沿用 dump_state（TypeError/CacheError）。落盘内容与
+        dump_state(now) 逐字节相同：在目标同目录创建唯一临时文件，写完
+        并 flush、fsync 后以 os.replace 原子替换目标。任一步 I/O 失败
+        抛 OSError，删除本次临时文件、保留旧目标文件；dump_state 只读，
+        任何失败与成功都不改变解析器状态，同态同参重复保存逐字节相同。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # dump_state 只读且先于任何文件操作完成：其 TypeError/
+        # CacheError/ConfigError 原样传播，此时尚无临时文件。
+        data = self.dump_state(now).encode("ascii")
+        # 临时文件必须与目标同目录，os.replace 才能在同一文件系统内
+        # 原子改名；path 无目录成分时（""）以当前目录为同目录。
+        directory = os.path.dirname(path) or os.curdir
+        fd, tmp_path = tempfile.mkstemp(prefix=".dns-state-",
+                                        suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            # 失败：临时项绝不残留；replace 未成功则旧目标保持原样。
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return len(data)
+
+    @classmethod
+    def load_state_file(cls, path: str, plan: list, now: int,
+                        timeout: int = 5) -> "Resolver":
+        """从状态文件恢复等价解析器实例（协议完全复用 load_state）。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError。
+        最多读取 16777217 字节：文件缺失抛 FileNotFoundError，其余 I/O
+        错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
+        ConfigError。解码后完全沿用 load_state：截断 JSON、重复键或状态
+        结构错抛 ConfigError，plan/timeout 校验、时钟衰减与其余异常
+        （RecordError、ZoneError、CacheError 及构造器 TypeError/
+        ValueError）均与其一致；任何失败都不产生实例。成功恢复区域修订
+        历史与修订号、递归正负缓存、FIFO、统计与最后成功时刻，权威缓存
+        为空。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # 缺失与 I/O 错原样传播（FileNotFoundError/OSError）；仅多读一字节
+        # 即可判定超限，避免把超限文件整体读入内存。
+        with open(path, "rb") as stream:
+            data = stream.read(_MAX_STATE_TEXT_LEN + 1)
+        if len(data) > _MAX_STATE_TEXT_LEN:
+            raise ConfigError("state file exceeds 16777216 bytes")
+        if not data.isascii():
+            raise ConfigError("state file must be ASCII")
+        text = data.decode("ascii")
+        # 解码后的全部协议、plan/timeout、时钟衰减与异常均复用 load_state。
+        return cls.load_state(text, plan, now, timeout)
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
