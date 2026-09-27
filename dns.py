@@ -394,6 +394,10 @@ _FORWARD_EVENT_KEYS = ["delay", "reply"]
 _FORWARD_MIN_ATTEMPTS = 1
 _FORWARD_MAX_ATTEMPTS = 2
 _FORWARD_DEFAULT_ATTEMPTS = 2
+# 上游配置历史容量：构造的初始配置与每个 applied 热加载/回滚版本
+# 保存一份 (timeout, attempts, plan) 深拷贝，超量淘汰最小版本号；
+# 版本号单调递增、不复用。
+_FORWARD_HISTORY_CAPACITY = 32
 _MAX_REPLY_LEN = 65535
 _FLAG_QR = 0x8000
 _MAX_RECURSION_LEVELS = 16
@@ -3003,6 +3007,29 @@ class Resolver:
     保留，除此之外无副作用。result 仅 "applied"、"unchanged" 或
     "conflict"；unchanged、conflict 与任何异常均不改变任何状态。
 
+    上游配置历史：构造时初始配置归档为版本 0，之后仅
+    reload_forward/rollback_forward 报告 applied 时按新版本号
+    归档 (timeout, attempts, plan) 深拷贝快照；容量 32，超量
+    淘汰最小版本号，版本号单调递增、不复用。快照与外部改动隔离。
+
+    forward_versions()：只读返回保留版本号的严格升序元组，不改变
+    任何状态，同状态重复调用逐字节相同。
+
+    rollback_forward(target, expected)：带版本检查的原子上游配置
+    回滚，返回键序 version,result,target 的紧凑 ASCII JSON 报告
+    （十进制整数、末尾单换行）。target、expected 非 int（含
+    bool）抛 TypeError，负值抛 ConfigError。两参数校验完成后先
+    比较 expected：不等于当前版本号时不查询 target，报告
+    conflict（version 为当前版本号）。相等且 target 未保留（含
+    已淘汰）抛 ConfigError；target 为当前版本或目标快照与当前
+    生效配置相同报告 unchanged（版本号与状态不变）。否则原子
+    恢复 timeout、attempts 与 plan，版本号加 1 并按新版本归档，
+    报告 applied（version 为新版本号）。applied 后域外 resolve
+    依恢复 plan 原序、每上游取前 attempts 个事件并用恢复的
+    timeout；upstream_stats 按恢复 plan 清零，缓存、时钟、区域、
+    递归状态与其他统计不变。result 仅 "applied"、"unchanged"
+    或 "conflict"；非 applied 与任何异常均不改变任何状态。
+
     cache_stats(now, reset=False)：缓存水位快照，返回顶层键序仅 a,r,x,v
     的紧凑 ASCII JSON（末尾单换行）。a、r 为权威、递归缓存，键序均为
     p,nx,nd,total,capacity,ttl：前三类为正缓存、NXDOMAIN、NODATA 条目
@@ -3233,6 +3260,12 @@ class Resolver:
         # 报告 applied 时替换 timeout/attempts/plan 并加 1。
         self._attempts = _FORWARD_DEFAULT_ATTEMPTS
         self._forward_version = 0
+        # 上游配置历史：版本号 -> (timeout, attempts, plan) 深拷贝。
+        # 构造时初始配置存为版本 0，仅 reload_forward/rollback_forward
+        # 报告 applied 时按新版本号归档；容量 32，超量淘汰最小版本号，
+        # 版本号单调递增、不复用。
+        self._forward_history = {}
+        self._archive_forward(0)
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -4394,7 +4427,8 @@ class Resolver:
         否则复用 migrate_forward 完整校验并规范化（输入限 1048576
         码点，解析与结构错误抛 ConfigError）。候选与当前生效配置相同
         报告 unchanged（版本号与状态不变）；否则原子替换 timeout、
-        attempts 与 plan，版本号加 1 并报告 applied。applied 后域外
+        attempts 与 plan，版本号加 1、按新版本归档快照并报告
+        applied。applied 后域外
         resolve 依新 plan 原序、每上游取前 attempts 个事件并用新
         timeout；upstream_stats 按新 plan 清零，缓存、时钟与其他统计
         保留，除此之外无副作用。报告为紧凑 ASCII JSON（末尾单换行），
@@ -4426,13 +4460,84 @@ class Resolver:
               for event in item["events"]])
             for item in config["plan"]]
         # 全部成功后原子提交：替换 timeout、attempts 与 plan，版本号
-        # 加 1，upstream_stats 按新 plan 清零；缓存、时钟与其他统计保留。
+        # 加 1 并按新版本归档快照，upstream_stats 按新 plan 清零；
+        # 缓存、时钟与其他统计保留。
         self._timeout = config["timeout"]
         self._attempts = config["attempts"]
         self._plan = plan
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in plan]
         self._forward_version += 1
+        self._archive_forward(self._forward_version)
         return self._tx_report(self._forward_version, "applied")
+
+    def _archive_forward(self, version):
+        """按版本保存当前上游配置深拷贝；超容量 32 淘汰最小版本号。
+
+        归档仅在构造与 applied 热加载/回滚提交时进行，版本号单调
+        递增、不复用。
+        """
+        self._forward_history[version] = (
+            self._timeout, self._attempts, copy.deepcopy(self._plan))
+        if len(self._forward_history) > _FORWARD_HISTORY_CAPACITY:
+            oldest = min(self._forward_history)
+            del self._forward_history[oldest]
+
+    def forward_versions(self) -> tuple[int, ...]:
+        """保留的上游配置版本号（严格升序元组）。
+
+        只读：不改变任何状态，同状态重复调用逐字节相同。
+        """
+        return tuple(sorted(self._forward_history))
+
+    def rollback_forward(self, target: int, expected: int) -> str:
+        """带版本检查的原子上游配置回滚，返回键序 version,result,target。
+
+        target、expected 非 int（含 bool）抛 TypeError，负值抛
+        ConfigError。两参数校验完成后先比较 expected：不等于当前
+        版本号时不查询 target，报告 conflict（version 为当前版本
+        号）。相等且 target 未保留（含已淘汰）抛 ConfigError；
+        target 为当前版本或目标快照与当前生效配置相同报告
+        unchanged（版本号与状态不变）。否则原子恢复 timeout、
+        attempts 与 plan，版本号加 1 并按新版本归档，报告
+        applied（version 为新版本号）。applied 后域外 resolve 依
+        恢复 plan 原序、每上游取前 attempts 个事件并用恢复的
+        timeout；upstream_stats 按恢复 plan 清零，缓存、时钟、
+        区域、递归状态与其他统计不变。非 applied 结果或任何异常
+        均不改变任何状态。报告为紧凑 ASCII JSON（十进制整数、
+        末尾单换行），result 仅 "applied"、"unchanged" 或
+        "conflict"。
+        """
+        if not isinstance(target, int) or isinstance(target, bool):
+            raise TypeError("target must be int")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if target < 0:
+            raise ConfigError("target version must be non-negative")
+        if expected < 0:
+            raise ConfigError("expected version must be non-negative")
+        # 两参数校验完成后才比较 expected；冲突时不得查询 target。
+        if expected != self._forward_version:
+            return self._rollback_report(self._forward_version,
+                                         "conflict", target)
+        snapshot = self._forward_history.get(target)
+        if snapshot is None:
+            raise ConfigError("target version not retained")
+        timeout, attempts, plan = snapshot
+        if (timeout == self._timeout and attempts == self._attempts
+                and plan == self._plan):
+            # 目标为当前版本或与当前生效配置等价：不替换、不加版本号。
+            return self._rollback_report(self._forward_version,
+                                         "unchanged", target)
+        # 快照在归档时已深拷贝隔离，恢复时再次深拷贝，与历史条目及
+        # 外部改动互不影响；upstream_stats 按恢复 plan 清零。
+        self._timeout = timeout
+        self._attempts = attempts
+        self._plan = copy.deepcopy(plan)
+        self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in plan]
+        self._forward_version += 1
+        self._archive_forward(self._forward_version)
+        return self._rollback_report(self._forward_version,
+                                     "applied", target)
 
     def cache_stats(self, now: int, reset: bool = False) -> str:
         """缓存水位快照：返回键序仅 a,r,x,v 的紧凑 ASCII JSON（末尾单换行）。
