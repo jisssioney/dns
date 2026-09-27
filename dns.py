@@ -203,7 +203,8 @@
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
-  上依次回放 reload/reload_tx/migrate/migrate_tx/restore_zones/
+  上依次回放 reload/reload_tx/reload_serial/migrate/migrate_tx/
+  restore_zones/
   resolve/recursive/rollback/rollback_batch/update/cache_stats 操作
   并记录为紧凑 ASCII JSON
   （末尾单换行）；ops 限 0..4096 项，结果上限 16777216 字节。
@@ -323,6 +324,7 @@ _CONFIG_RR_KEYS_V0 = ["name", "type", "class", "ttl", "data"]
 _CONFIG_RR_KEYS_V2 = ["name", "type", "ttl", "rdata"]
 _REPLAY_RELOAD_KEYS = ["op", "text"]
 _REPLAY_RELOAD_TX_KEYS = ["op", "text", "expected"]
+_REPLAY_RELOAD_SERIAL_TX_KEYS = ["op", "text", "expected", "force"]
 _REPLAY_ROLLBACK_STEP_KEYS = ["op", "target"]
 _REPLAY_ROLLBACK_BATCH_KEYS = ["op", "expected", "steps"]
 _REPLAY_ROLLBACK_TX_KEYS = ["op", "target", "expected"]
@@ -5321,9 +5323,10 @@ class Resolver:
 
         text 为不超过 1048576 码点的 ASCII JSON：顶层键序仅 v,now,ops，
         v 恒为 1，now 为非负非 bool 整数，ops 为 1..4096 项并沿用
-        replay 的输入协议（reload/reload_tx/migrate/migrate_tx/
-        restore_zones/resolve/recursive/rollback/rollback_batch/
-        update/cache_stats，全部操作在隔离执行前完成预检）。text 非
+        replay 的输入协议（reload/reload_tx/reload_serial/migrate/
+        migrate_tx/restore_zones/resolve/recursive/rollback/
+        rollback_batch/update/cache_stats，全部操作在隔离执行前完成
+        预检）。text 非
         str 或 expected 非 int（含 bool）抛 TypeError；expected<0、
         text 超长或非 ASCII、JSON 解析、重复键、键序、v 非法、now<0
         （在预检 ops 与执行之前）或操作非法抛 ReplayError。expected
@@ -5608,7 +5611,9 @@ def _validate_ops(ops):
 
     reload 键序 op,text 且 op 为 "reload"、text 为 str；reload_tx 键序
     op,text,expected 且 op 为 "reload_tx"、text 为 str、expected 为非负
-    非 bool int；migrate 键序 op,text 且 op 为 "migrate"，text 为
+    非 bool int；reload_serial 键序 op,text,expected,force 且 op 为
+    "reload_serial"，text 为 1..1048576 码点的 str，expected 为非负非
+    bool int，force 为 bool；migrate 键序 op,text 且 op 为 "migrate"，text 为
     1..1048576 码点的 str；migrate_tx 键序 op,text,expected 且 op 为
     "migrate_tx"，text 长度同 migrate，expected 同 reload_tx；
     restore_zones 键序 op,text,expected 且 op 为 "restore_zones"，
@@ -5647,6 +5652,8 @@ def _validate_ops(ops):
             valid_names = ("reload", "migrate")
         elif keys == _REPLAY_RELOAD_TX_KEYS:
             valid_names = ("reload_tx", "migrate_tx", "restore_zones")
+        elif keys == _REPLAY_RELOAD_SERIAL_TX_KEYS:
+            valid_names = ("reload_serial",)
         elif keys == _REPLAY_RESOLVE_KEYS:
             valid_names = ("resolve",)
         elif keys == _REPLAY_RECURSIVE_KEYS:
@@ -5662,7 +5669,8 @@ def _validate_ops(ops):
         else:
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
-                " op,query,now,limit, op,query,levels,now,limit,"
+                " op,text,expected,force, op,query,now,limit,"
+                " op,query,levels,now,limit,"
                 " op,expected,steps, op,target,expected,"
                 " op,changes,serial,expected or op,now,reset")
         if not isinstance(op["op"], str):
@@ -5791,6 +5799,21 @@ def _validate_ops(ops):
                 raise ReplayError("now must be a non-negative int")
             if not isinstance(op["reset"], bool):
                 raise ReplayError("reset must be bool")
+        elif kind == "reload_serial":
+            text = op["text"]
+            if not isinstance(text, str):
+                raise ReplayError("text must be str")
+            # len() 按 Unicode 码点计数；配置文本 1..1048576 码点。
+            if not 1 <= len(text) <= _MAX_MIGRATE_TEXT_LEN:
+                raise ReplayError(
+                    "text must contain 1..1048576 code points")
+            expected = op["expected"]
+            if not isinstance(expected, int) or isinstance(expected, bool):
+                raise ReplayError("expected must be int")
+            if expected < 0:
+                raise ReplayError("expected must be non-negative")
+            if not isinstance(op["force"], bool):
+                raise ReplayError("force must be bool")
         else:
             if not isinstance(op["text"], str):
                 raise ReplayError("text must be str")
@@ -5823,6 +5846,12 @@ def _execute_replay_op(resolver, kind, op, plans):
             resolver.reload_zone_tx(op["text"], op["expected"]))
         return {"ok": True, "version": report["version"],
                 "result": report["result"]}
+    if kind == "reload_serial":
+        report = json.loads(
+            resolver.reload_zone_serial_tx(
+                op["text"], op["expected"], op["force"]))
+        return {"ok": True, "version": report["version"],
+                "result": report["result"], "serial": report["serial"]}
     if kind == "migrate":
         return {"ok": True, "text": migrate_zone(op["text"])}
     if kind == "migrate_tx":
@@ -5898,13 +5927,14 @@ def _execute_replay_op(resolver, kind, op, plans):
 
 def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
-    """在 Resolver 上依次回放 reload/reload_tx/migrate/migrate_tx/
-    restore_zones/resolve/recursive/rollback/rollback_batch/update/
-    cache_stats 操作，返回记录的紧凑 JSON。
+    """在 Resolver 上依次回放 reload/reload_tx/reload_serial/migrate/
+    migrate_tx/restore_zones/resolve/recursive/rollback/rollback_batch/
+    update/cache_stats 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 限 0..4096 项，
     超量或操作项、键序、op 名或字段类型/内容错误（含 recursive 的 levels
-    层级结构、RR 与十六进制形式、migrate/migrate_tx/restore_zones 的
+    层级结构、RR 与十六进制形式、reload_serial/migrate/migrate_tx/
+    restore_zones 的
     text 码点长度、
     rollback 的 target/expected、rollback_batch 的 expected/steps 及其
     reload/rollback 步、update 的 changes/serial/expected 及其项结构、
@@ -5913,7 +5943,13 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     每项记录键序 in,out,stats：in 为操作原文，stats 为该操作后的
     stats() 原文。成功 out 首键 ok 为 true：reload 键序 ok,revision；
     reload_tx 键序 ok,version,result，result 为
-    "applied"/"unchanged"/"conflict"；migrate 键序 ok,text，text 为
+    "applied"/"unchanged"/"conflict"；reload_serial 键序
+    ok,version,result,serial，复用 reload_zone_serial_tx 事务契约：先
+    比较修订号，冲突时不解析 text，result 为 "conflict" 且 serial 为
+    null；相等时文本为 1..1048576 码点，事务结果为 "applied"/
+    "unchanged"/"stale"/"ambiguous"，serial 为候选 SOA 序列号（conflict
+    时为 null），仅 applied 项对后续可见新区域与新修订，其余结果或异常
+    不改状态；migrate 键序 ok,text，text 为
     规范 v2 文本且不改变任何状态；migrate_tx 键序
     ok,version,result,text，先比较修订号，冲突时不解析 text，result
     为 "conflict" 且 text 为 null，相等时先迁移校验再按 reload_zone_tx
