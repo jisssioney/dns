@@ -2313,6 +2313,33 @@ def _plan_total_elapsed(plan, timeout):
     return elapsed
 
 
+def _plan_forward_deltas(query, plan, timeout):
+    """按 forward 规则模拟直转，返回各 plan 位置的 [a,s,to,e,bad,ms] 增量。
+
+    循环语义与 forward 一致（每上游仅前 2 个事件、delay>timeout 记超时、
+    合格应答即停）；无事件的位置增量全零。纯函数：plan 已经校验、
+    _matching_reply 对合法输入不抛异常，故本函数不抛异常。
+    """
+    deltas = [[0] * 6 for _ in plan]
+    for index, (_name, events) in enumerate(plan):
+        delta = deltas[index]
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            delta[0] += 1  # a：每次尝试
+            if delay > timeout:
+                delta[2] += 1  # to
+                delta[5] += timeout  # ms
+                continue
+            delta[5] += delay
+            if reply is not None and _matching_reply(query, reply):
+                delta[1] += 1  # s：通过既有匹配并停止
+                return deltas
+            if reply is None:
+                delta[3] += 1  # e：无应答
+            else:
+                delta[4] += 1  # bad：非空但未通过匹配
+    return deltas
+
+
 def _duration_bucket(elapsed, timeout):
     """模拟时长分桶下标：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
     if elapsed <= 0:
@@ -2770,6 +2797,20 @@ class Resolver:
     调用逐字节相同；True 先返回旧快照再清零十项计数，其余状态与
     stats() 不变。
 
+    upstream_stats(reset=False)：构造 plan 直转的确定性统计，返回顶层
+    键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）。p 按 plan 位置列
+    对象（重名不合并），键序仅 i,n,a,s,to,e,bad,ms：i 为序号、n 为
+    原上游名，其余为非负整数；t 省略 i、n，余键同序并为逐项和。
+    每个上游只取前 2 个事件：尝试即 a 加 1；delay>timeout 时 to 加
+    1、ms 加 timeout，否则 ms 加 delay，reply 为 None 则 e 加 1，
+    非空但未通过既有匹配则 bad 加 1，通过则 s 加 1 并停止；无事件
+    不计。经 resolve 进入该 plan 均计一次；权威、缓存与
+    resolve_recursive 的 levels 不计。直转成功或耗尽抛
+    UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
+    reset 非 bool 抛 TypeError 且无变化；False 只读；True 先返回旧
+    快照再清零上述计数，plan、缓存、时钟及其他统计不变。同初态同
+    序列逐字节一致。
+
     resolve_recursive(query, levels, now, limit=512)：域内查询沿用
     resolve；域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、FIFO
     同 PositiveCache），命中返回 (应答报文, "cache", now, True)，未命中
@@ -3006,6 +3047,10 @@ class Resolver:
         self._rated_o = [0, 0, 0, 0]
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
+        # upstream_stats 的逐位置计数：与 plan 位置一一对应（重名不合并），
+        # 每项为 [a, s, to, e, bad, ms] 六个非负整数，仅 resolve 直转
+        # 成功或耗尽时原子提交。
+        self._upstream_counts = [[0] * 6 for _ in self._plan]
         # stats 的 c[0]（权威条目数）：仅随统计提交与缓存同步，reload_zone
         # 替换缓存不提交统计，故换区后保持旧值直至下次解析提交。
         self._stats_c0 = 0
@@ -3041,9 +3086,12 @@ class Resolver:
             self._sync_stats_c0()
             self._last_end = now
             return response, "authority", now, hit
+        # 直转增量先行模拟（纯函数、不抛异常）；仅成功或耗尽时提交。
+        deltas = _plan_forward_deltas(query, self._plan, self._timeout)
         try:
             reply, name, end = forward(query, self._plan, now, self._timeout)
         except UpstreamTimeout:
+            self._commit_upstream_deltas(deltas)
             self._stats_u[1] += 1
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
@@ -3051,12 +3099,14 @@ class Resolver:
             self._sync_stats_c0()
             raise
         except UpstreamError:
+            self._commit_upstream_deltas(deltas)
             self._stats_u[2] += 1
             self._stats_l[_duration_bucket(
                 _plan_total_elapsed(self._plan, self._timeout),
                 self._timeout)] += 1
             self._sync_stats_c0()
             raise
+        self._commit_upstream_deltas(deltas)
         self._stats_u[0] += 1
         self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
         self._sync_stats_c0()
@@ -3244,6 +3294,17 @@ class Resolver:
     def _sync_stats_c0(self):
         """统计提交点：c[0] 与当前权威缓存条目数同步。"""
         self._stats_c0 = len(self._cache._order)
+
+    def _commit_upstream_deltas(self, deltas):
+        """把一次直转的逐位置增量原子并入 upstream_stats 计数。
+
+        整体替换计数列表（单次赋值），仅在直转成功或耗尽时调用；
+        其他异常路径不调用，计数不变。
+        """
+        self._upstream_counts = [
+            [count + delta for count, delta in zip(counts, delta)]
+            for counts, delta in zip(self._upstream_counts, deltas)
+        ]
 
     def _fold_authority_cleanup(self):
         """把权威缓存自上次折叠以来的清理事件并入解析器累计。
@@ -4666,6 +4727,44 @@ class Resolver:
             self._rated_o = [0, 0, 0, 0]
             self._rated_e = [0, 0]
             self._rated_l = [0, 0, 0, 0]
+        return text
+
+    def upstream_stats(self, reset: bool = False) -> str:
+        """构造 plan 直转的确定性统计（顶层键序仅 p,t，末尾单换行）。
+
+        输出为紧凑 ASCII JSON。p 按 plan 位置列对象（重名不合并），键序
+        仅 i,n,a,s,to,e,bad,ms：i 为序号、n 为原上游名，其余为非负
+        整数；t 省略 i、n，余键同序并为逐项和。每个上游只取前 2 个
+        事件：尝试即 a 加 1；delay>timeout 时 to 加 1、ms 加 timeout，
+        否则 ms 加 delay，reply 为 None 则 e 加 1，非空但未通过既有
+        匹配则 bad 加 1，通过则 s 加 1 并停止；无事件不计。经 resolve
+        进入该 plan 均计一次；权威、缓存与 resolve_recursive 的 levels
+        不计。直转成功或耗尽抛 UpstreamTimeout/UpstreamError 时原子
+        提交，其他异常不提交。reset 非 bool 抛 TypeError 且无变化；
+        False 只读，重复调用逐字节相同；True 先返回旧快照再清零上述
+        计数，plan、缓存、时钟及其他统计不变。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        items = []
+        totals = [0] * 6
+        for index, ((name, _events), counts) in enumerate(
+                zip(self._plan, self._upstream_counts)):
+            a, s, to, e, bad, ms = counts
+            items.append({"i": index, "n": name, "a": a, "s": s,
+                          "to": to, "e": e, "bad": bad, "ms": ms})
+            for k in range(6):
+                totals[k] += counts[k]
+        a, s, to, e, bad, ms = totals
+        text = json.dumps(
+            {"p": items,
+             "t": {"a": a, "s": s, "to": to, "e": e, "bad": bad,
+                   "ms": ms}},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+        if reset:
+            # 先返回旧快照，再清零逐位置计数；plan、缓存、时钟及其余
+            # 统计均不变。
+            self._upstream_counts = [[0] * 6 for _ in self._plan]
         return text
 
 
