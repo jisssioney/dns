@@ -2842,6 +2842,39 @@ def _upstream_forward_counts(plan, query, timeout):
     return counts
 
 
+def _recursive_level_counts(plan, timeout, is_last):
+    """按 resolve_recursive 单层语义统计该层一次模拟的事件计数。
+
+    返回七元组 [a, r, s, to, e, bad, ms]：每个上游仅取前 2 个事件，
+    尝试即 a 加 1；delay > timeout 时 to 加 1、ms 加 timeout，否则
+    ms 加 delay，reply 为 None 则 e 加 1；非末层转介（kind 0）计 r
+    并停止，末层转介计 bad 并继续尝试后续事件；kind 1/2/3 终态计 s
+    并停止。转介或终态之后的事件不计。与 _attempt_recursive_level
+    的时钟推进与停止点一致，本身不产生异常。
+    """
+    counts = [0, 0, 0, 0, 0, 0, 0]
+    for _name, events in plan:
+        for delay, parsed in events[:_PLAN_EVENTS_USED]:
+            counts[0] += 1  # a：尝试
+            if delay > timeout:
+                counts[3] += 1  # to：超时
+                counts[6] += timeout
+                continue
+            counts[6] += delay
+            if parsed is None:
+                counts[4] += 1  # e：无应答
+                continue
+            if parsed[0] == 0:  # 转介
+                if is_last:
+                    counts[5] += 1  # bad：末层转介按普通失败计
+                    continue
+                counts[1] += 1  # r：接受的非末层转介并停止
+                return counts
+            counts[2] += 1  # s：kind 1/2/3 终态并停止
+            return counts
+    return counts
+
+
 def _duration_bucket(elapsed, timeout):
     """模拟时长分桶下标：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
     if elapsed <= 0:
@@ -3326,6 +3359,21 @@ class Resolver:
     False 只读，True 先返回旧快照再清零上述计数，plan、缓存、时钟
     及其他统计不变。
 
+    recursive_upstream_stats(reset=False)：resolve_recursive 的逐层
+    递归模拟统计，返回顶层键序仅 l,t 的紧凑 ASCII JSON（末尾单换行）。
+    l 固定含 16 个数组，索引对应深度 0..15；每项为七个非负整数
+    [a,r,s,to,e,bad,ms]，依次表示尝试数、接受的非末层转介数、
+    kind=1/2/3 终态数、delay>timeout 数、reply=None 数、末层
+    kind=0 数、模拟耗时累计。超时仅给 ms 加 timeout，其余事件加
+    delay；每个上游仍只取前 2 个事件，转介或终态后的事件不计。
+    t 为同顺序七整数数组，逐项等于 l 之和。仅域外递归缓存未命中
+    且 levels 全量校验通过后暂存；成功返回或耗尽抛
+    UpstreamTimeout、UpstreamError 时原子提交已访问事件，查询、
+    levels、编码、缓存写入或其他异常以及权威、缓存命中均不提交。
+    reset 非 bool 抛 TypeError 且无变化；False 只读，True 先返回
+    旧快照再清零本统计，缓存、时钟、区域、plan 及其他统计不变。
+    同初态同调用序列逐字节一致。
+
     dump_forward()：导出当前上游转发配置，返回键序仅 version,config
     的紧凑 ASCII JSON（末尾单换行）。version 为从 0 起的热加载版本号；
     config 为 migrate_forward 的 v1 对象（键序 v,timeout,attempts,
@@ -3621,6 +3669,12 @@ class Resolver:
         # 每项为 [a, s, to, e, bad, ms]，仅经 resolve 的直转在成功返回或
         # 耗尽（UpstreamTimeout/UpstreamError）时原子提交。
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
+        # recursive_upstream_stats 的逐层计数：固定 16 项对应深度 0..15，
+        # 每项为 [a, r, s, to, e, bad, ms]，仅域外递归缓存未命中且
+        # levels 全量校验通过后暂存，成功返回或耗尽（UpstreamTimeout/
+        # UpstreamError）时原子提交。
+        self._rec_upstream_stats = [
+            [0, 0, 0, 0, 0, 0, 0] for _ in range(_MAX_RECURSION_LEVELS)]
         # 上游转发配置热加载状态：attempts 初始为 2（构造 plan 沿用
         # forward 的前 2 事件语义），版本号初始为 0，仅 reload_forward
         # 报告 applied 时替换 timeout/attempts/plan 并加 1。
@@ -3905,6 +3959,20 @@ class Resolver:
             for kind in range(6):
                 acc[kind] += entry[kind]
 
+    def _commit_recursive_counts(self, staged):
+        """把 resolve_recursive 暂存的逐层事件计数原子并入统计。
+
+        staged 为 16 项列表，已访问深度处为七元组计数、未到处为 None；
+        遇首个 None 即止。
+        """
+        for depth in range(_MAX_RECURSION_LEVELS):
+            counts = staged[depth]
+            if counts is None:
+                return
+            acc = self._rec_upstream_stats[depth]
+            for kind in range(7):
+                acc[kind] += counts[kind]
+
     def _fold_authority_cleanup(self):
         """把权威缓存自上次折叠以来的清理事件并入解析器累计。
 
@@ -4039,15 +4107,21 @@ class Resolver:
         # 未命中：m 与（到期时）x 暂记，待成功或耗尽时与 u、l 一并原子提交。
         m_inc = 1
         x_inc = 1 if expired is not None else 0
+        # 逐层事件计数随模拟同步暂存（仅已访问层），成功或耗尽时原子提交；
+        # 编码、缓存写入或其他异常不提交。
+        staged = [None] * _MAX_RECURSION_LEVELS
         # 逐层按 forward 时序模拟；终态先编码成功再记 end 与写缓存。
         clock = now
         result = None
         for depth, plan in enumerate(plans):
+            staged[depth] = _recursive_level_counts(
+                plan, self._timeout, depth == len(plans) - 1)
             result, clock, saw_timeout, saw_other = self._attempt_recursive_level(
                 plan, clock, depth == len(plans) - 1)
             if result is None:
                 # 该层所有上游均未给出可用应答：耗尽异常沿用 forward；
                 # 统计随耗尽提交，缓存与最后时刻不变。
+                self._commit_recursive_counts(staged)
                 self._stats_m += m_inc
                 self._stats_x += x_inc
                 self._sync_stats_c0()
@@ -4067,6 +4141,7 @@ class Resolver:
         response = _encode_plan(query, rcode, an, ns, limit)
         self._store_recursive_terminal(
             question, end, rcode, an, ns, expired)
+        self._commit_recursive_counts(staged)
         self._stats_m += m_inc
         self._stats_x += x_inc
         self._stats_u[0] += 1
@@ -4762,6 +4837,42 @@ class Resolver:
         if reset:
             # 先返回旧快照再清零；plan、缓存、时钟与其他统计均保留。
             self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
+        return text
+
+    def recursive_upstream_stats(self, reset: bool = False) -> str:
+        """返回 resolve_recursive 逐层递归模拟的事件统计（末尾单换行）。
+
+        输出为顶层键序仅 l,t 的紧凑 ASCII JSON。l 固定含 16 个数组，
+        索引对应深度 0..15；每项为七个非负整数 [a,r,s,to,e,bad,ms]，
+        依次表示尝试数、接受的非末层转介数、kind=1/2/3 终态数、
+        delay>timeout 数、reply=None 数、末层 kind=0 数、模拟耗时
+        累计。超时仅给 ms 加 timeout，其余事件加 delay；每个上游仍
+        只取前 2 个事件，转介或终态后的事件不计。t 为同顺序七整数
+        数组，逐项等于 l 之和。仅域外递归缓存未命中且 levels 全量
+        校验通过后暂存；成功返回或耗尽抛 UpstreamTimeout、
+        UpstreamError 时原子提交已访问事件，查询、levels、编码、
+        缓存写入或其他异常以及权威、缓存命中均不提交。reset 非
+        bool 抛 TypeError 且无变化；False 只读，重复调用逐字节
+        相同；True 先返回旧快照再清零本统计，缓存、时钟、区域、
+        plan 及其他统计不变。同初态同调用序列逐字节一致。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        levels = self._rec_upstream_stats
+        totals = [0, 0, 0, 0, 0, 0, 0]
+        parts = []
+        for depth in range(_MAX_RECURSION_LEVELS):
+            acc = levels[depth]
+            for kind in range(7):
+                totals[kind] += acc[kind]
+            parts.append("[" + ",".join(map(str, acc)) + "]")
+        text = ('{"l":[' + ",".join(parts) + '],"t":['
+                + ",".join(map(str, totals)) + "]}\n")
+        if reset:
+            # 先返回旧快照再清零本统计；缓存、时钟、区域、plan 及其他
+            # 统计均保留。
+            self._rec_upstream_stats = [
+                [0, 0, 0, 0, 0, 0, 0] for _ in range(_MAX_RECURSION_LEVELS)]
         return text
 
     def _forward_config(self):
