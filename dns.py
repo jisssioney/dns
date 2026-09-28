@@ -399,6 +399,14 @@ _MAX_REPLAY_LOG_TEXT_LEN = 1048576
 # replay_log/replay_log_file 的冲突报告：内容固定，共用同一常量保证
 # 逐字节一致。
 _REPLAY_LOG_CONFLICT = '{"v":1,"result":"conflict","ops":[],"state":null}\n'
+# replay_bundle 封包：顶层键序仅 v,state,forward,log,result（v 恒为 1），
+# 后四者依次为 dump_state 的 v2 对象、migrate_forward 的 v1 对象、
+# export_log 的 v1 日志对象与 replay_log 成功结果文本（紧凑 ASCII、末尾
+# 单换行）。封包整体为 ASCII JSON，限 16777216 码点。
+_BUNDLE_KEYS = ["v", "state", "forward", "log", "result"]
+_MAX_BUNDLE_TEXT_LEN = 16777216
+# replay_log 成功结果文本的固定顶层键序：v,result,ops,state。
+_REPLAY_LOG_RESULT_KEYS = ["v", "result", "ops", "state"]
 # replay_forward 的上游配置重放日志：顶层键序仅 v,o（v 恒为 1），o 含
 # 0..4096 项。项有两种形态，同一日志内可混用：旧三键项键序仅
 # k,x,e；forward_audit 导出的五键项键序仅 k,x,e,r,a。k="l" 时 x
@@ -3698,6 +3706,20 @@ class Resolver:
     RecordError）、plan/timeout 校验、时钟衰减与其余异常；任何失败
     都不产生实例，成功恢复区域历史与修订号、递归正负缓存、FIFO、
     统计、ru 计数与最后成功时刻（now），权威缓存为空。
+
+    replay_bundle(text)：类方法，从封包恢复计划、缓存、时钟、统计与
+    ru 并原子重放，成功返回 (Resolver, 结果文本)。封包为不超过
+    16777216 码点的 ASCII JSON，顶层键序仅 v,state,forward,log,
+    result：v=1；state 为 dump_state 的 v2 对象；forward 为
+    migrate_forward 的 v1 对象；log 为 export_log 的 v1 日志对象；
+    result 为 replay_log 成功（applied）结果文本（字符串嵌套）。以
+    state.rec.clock 调 load_state，plan、timeout、attempts 取
+    forward，expected 取 state 的区域修订号（zones.version）；执行
+    log 所得文本须与 result 按键序生成的紧凑文本逐字节相同。text 非
+    str 抛 TypeError；超长、非 ASCII、JSON、重复键、顶层键序、v、
+    log/result 结构或结果不符抛 ReplayError；state、forward 错误沿用
+    load_state、migrate_forward 异常，操作异常原样传播；隔离执行，
+    失败不产生实例。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -5905,6 +5927,129 @@ class Resolver:
             raise ReplayError("log file must be ASCII")
         # 解码后的全部协议与异常复用 replay_log。
         return self.replay_log(data.decode("ascii"), expected)
+
+    @classmethod
+    def replay_bundle(cls, text: str) -> "tuple[Resolver, str]":
+        """从重放封包恢复计划、缓存、时钟、统计与 ru 并原子重放。
+
+        封包为不超过 16777216 码点的 ASCII JSON，顶层键序仅
+        v,state,forward,log,result：v 恒为 1；state 为 dump_state 的
+        v2 对象（顶层键序 v,zones,rec,stats,ru，v=2）；forward 为
+        migrate_forward 的 v1 对象（键序 v,timeout,attempts,plan，
+        v=1）；log 为 export_log 的 v1 日志对象（键序 v,now,ops，
+        v=1）；result 为 replay_log 成功（result 为 "applied"）结果
+        文本，作为字符串嵌套于封包中。先经 migrate_forward 取
+        timeout 与内部 plan，再以 state.rec.clock 为 now 调
+        load_state 恢复候选解析器（状态语义异常沿用 load_state，
+        forward 结构异常沿用 migrate_forward），以 state 的区域
+        修订号（state.zones.version）为 expected 原子执行 log；执行
+        所得文本须与 result 按键序生成的紧凑文本逐字节相同，不符抛
+        ReplayError，成功返回恢复后的 Resolver 与该结果文本。整个
+        过程隔离执行，任何失败都不产生实例、不改变任何既有状态；
+        操作执行异常原样传播。text 非 str 抛 TypeError；text 超长、
+        非 ASCII、JSON 解析、任意层级重复键、顶层键序、v、
+        log/result 结构或结果不符均抛 ReplayError。时间 O(文本长度+
+        操作数)，空间 O(文本长度)。
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
+        if len(text) > _MAX_BUNDLE_TEXT_LEN:
+            raise ReplayError("bundle text exceeds 16777216 code points")
+        if not text.isascii():
+            raise ReplayError("bundle text must be ASCII")
+        # 封包按单一 JSON 文档保序解析：任意层级重复键在此统一收口为
+        # ReplayError（先于 state/forward 的内容校验）。
+        try:
+            bundle = json.loads(text, object_pairs_hook=_replay_log_pairs)
+        except ReplayError:
+            # 重复键由 _replay_log_pairs 抛 ReplayError，原样传播。
+            raise
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            # 超长整数、超深嵌套等 json 异常统一归为 ReplayError，不泄漏。
+            raise ReplayError("invalid JSON") from None
+        if (not isinstance(bundle, dict)
+                or list(bundle.keys()) != _BUNDLE_KEYS):
+            raise ReplayError(
+                "bundle keys must be v,state,forward,log,result")
+        version = bundle["v"]
+        if (not isinstance(version, int) or isinstance(version, bool)
+                or version != 1):
+            raise ReplayError("unsupported v")
+        # result 是嵌套的结果文本字符串：其结构在执行前收口为 ReplayError。
+        result_text = bundle["result"]
+        if not isinstance(result_text, str):
+            raise ReplayError("result must be str")
+        if not result_text.isascii():
+            raise ReplayError("result must be ASCII")
+        try:
+            result_obj = json.loads(
+                result_text, object_pairs_hook=_replay_log_pairs)
+        except ReplayError:
+            # 结果文本内重复键同样抛 ReplayError，原样传播。
+            raise
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            raise ReplayError("invalid result JSON") from None
+        if (not isinstance(result_obj, dict)
+                or list(result_obj.keys()) != _REPLAY_LOG_RESULT_KEYS):
+            raise ReplayError("result keys must be v,result,ops,state")
+        result_version = result_obj["v"]
+        if (not isinstance(result_version, int)
+                or isinstance(result_version, bool) or result_version != 1):
+            raise ReplayError("unsupported result v")
+        if result_obj["result"] != "applied":
+            raise ReplayError('result.result must be "applied"')
+        # forward 内容错误沿用 migrate_forward：对象按 dump 形态紧凑序列
+        # 化（封包已限 ASCII，非 ASCII 字符串经 ensure_ascii 转义），其
+        # ConfigError 等异常原样传播；规范 v1 文本再次迁移逐字节不变。
+        forward_text = json.dumps(bundle["forward"], ensure_ascii=True,
+                                  separators=(",", ":")) + "\n"
+        migrated = migrate_forward(forward_text)
+        forward_config = json.loads(migrated, object_pairs_hook=_config_pairs)
+        plan = [
+            (item["name"],
+             [(event["delay"],
+               None if event["reply"] is None
+               else bytes.fromhex(event["reply"]))
+              for event in item["events"]])
+            for item in forward_config["plan"]]
+        timeout = forward_config["timeout"]
+        attempts = forward_config["attempts"]
+        # state 内容错误沿用 load_state：先紧凑序列化再经 migrate_state
+        # 完整校验（ConfigError/ZoneError/RecordError 原样传播），从规范
+        # v2 文本读取 rec.clock 与 zones.version，随后以该时钟调
+        # load_state，plan/timeout 取 forward。
+        state_text = json.dumps(bundle["state"], ensure_ascii=True,
+                                separators=(",", ":")) + "\n"
+        canonical_state = migrate_state(state_text)
+        state_config = json.loads(canonical_state,
+                                  object_pairs_hook=_config_pairs)
+        clock = state_config["rec"]["clock"]
+        expected = state_config["zones"]["version"]
+        resolver = cls.load_state(canonical_state, plan, clock, timeout)
+        # load_state 的构造只恢复缓存/时钟/统计/ru，attempts 仍为构造
+        # 默认值且版本 0 的上游快照按默认 attempts 截断；本入口的
+        # plan、timeout、attempts 统一取 forward，故改写 attempts 并把
+        # 版本 0 的初始快照按新 attempts 重新归档（replay_log 的操作不
+        # 涉及上游配置，归档内容此后不再变化）。
+        resolver._attempts = attempts
+        resolver._archive_forward(0)
+        # log 的形态、长度、now、ops 与修订号核对全部由 replay_log 收口
+        # （不符抛 ReplayError，修订号不符返回 conflict 报告）；紧凑序列
+        # 化保留封包中的各项键序。
+        log_text = json.dumps(bundle["log"], ensure_ascii=True,
+                              separators=(",", ":")) + "\n"
+        # 隔离执行：replay_log 整体预检后在解析器深拷贝上执行全部操作，
+        # 全部通过才原子提交到 resolver；操作异常（CacheError、
+        # RecordError、ZoneError、TransferError 等）原样传播，任何失败
+        # 都不返回该本地实例。
+        actual = resolver.replay_log(log_text, expected)
+        # 执行所得文本须与封包内 result 原文逐字节相同：result 本就是
+        # replay_log 成功输出的紧凑文本（末尾单换行，内嵌 state 的 r 为
+        # 6 位小数字面量），不得重新序列化（否则 0.000000 会变为 0.0），
+        # 其键序与 v 已在上面收口。
+        if actual != result_text:
+            raise ReplayError("replay result does not match bundle result")
+        return resolver, actual
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
