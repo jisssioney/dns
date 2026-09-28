@@ -248,7 +248,10 @@
   校验与异常沿用 RateLimiter.respond，未超 limit 返回
   (response, "pass", 余量)，超额按 slip 周期返回既有格式截断应答
   (tc, "slip", 0) 或 (None, "drop", 0)；状态至多 4096 项，插入第
-  4097 键前淘汰 (窗截止, 创建序) 最小项。
+  4097 键前淘汰 (窗截止, 创建序) 最小项；stats(reset=False) 返回键序
+  pass,drop,slip,expired,evicted,keys,capacity 的紧凑 ASCII JSON
+  （末尾换行），capacity 恒为 4096，reset=True 返回重置前快照并清零
+  五个累计计数。
 - replay_rate(rules, ops, expected=None, policy=None, default="deny")
   -> str: 在 RateLimiter 上依次回放 allow/authorize/reload/rollback
   操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，
@@ -7037,6 +7040,17 @@ class ResponseRateLimiter:
     (None, "drop", 0)。计数表至多 4096 项：插入第 4097 个键前淘汰
     (窗截止时刻, 创建序) 最小项，单次调用开销为 O(4096)。相同初态与
     相同调用序列逐字节相同。
+
+    stats(reset=False) 返回固定键序 pass,drop,slip,expired,evicted,
+    keys,capacity 的紧凑 ASCII JSON（末尾一个换行）：值均为非负十进制
+    整数，capacity 恒为 4096；pass/drop/slip 按成功 apply 的返回动作
+    仅递增其一，expired/evicted 分别累加实际清除的过期键数与为插入新
+    键实际淘汰的键数，keys 为提交后的活动键数。统计仅在 apply 成功
+    返回后原子提交，构造时清零；任何校验失败或异常都不改变计数表、
+    创建序、最后时钟与统计。reset 非 bool 抛 TypeError 且无变化；
+    False 只读，重复读取逐字节相同；True 先返回重置前快照，再清零
+    五个累计计数，保留活动键及其计数、创建序和最后时钟，后续 keys
+    不清零。
     """
 
     def __init__(self, window: int, limit: int, slip: int = 2):
@@ -7056,6 +7070,11 @@ class ResponseRateLimiter:
         self._counts = {}
         self._serial = 0  # 创建序：随新窗计数项从 0 递增
         self._last_now = None  # 上次成功 apply 的时钟值
+        # 统计：三种成功动作 pass/drop/slip 各计一次，expired/evicted 累加
+        # 本次重置周期内实际删除的过期键数与容量淘汰键数。仅在 apply 成功
+        # 返回后原子提交，构造时清零。
+        self._stat = {"pass": 0, "drop": 0, "slip": 0,
+                      "expired": 0, "evicted": 0}
 
     def apply(self, query: bytes, response: bytes, client: str, now: int
               ) -> tuple[bytes | None, str, int]:
@@ -7096,12 +7115,16 @@ class ResponseRateLimiter:
         qtype = msg["questions"][0]["type"]
         rcode = int.from_bytes(response[2:4], "big") & 0x000F
         # 先删除当前已过期窗（截止时刻 <= now），再处理当前键。
+        # 删除数先记为本次局部计数，待成功返回时与动作计数一并提交。
+        expired = 0
         for dead in [key for key, value in self._counts.items()
                      if value[1] <= now]:
             del self._counts[dead]
+            expired += 1
         bucket = now // self._window
         key = (subnet, qname, qtype, rcode, bucket)
         entry = self._counts.get(key)
+        evicted = 0
         if entry is None:
             # 插入第 4097 个键前淘汰 (截止, 创建序) 最小项。
             if len(self._counts) >= _RATE_TABLE_CAPACITY:
@@ -7109,26 +7132,68 @@ class ResponseRateLimiter:
                              key=lambda k: (self._counts[k][1],
                                             self._counts[k][3]))
                 del self._counts[oldest]
+                evicted += 1
             self._counts[key] = [bucket * self._window,
                                  (bucket + 1) * self._window,
                                  0, self._serial]
             self._serial += 1
             entry = self._counts[key]
-        # 成功调用：计数加一，时钟随之推进。
+        # 成功调用：计数加一，统计原子提交，时钟随之推进。
         entry[2] += 1
         count = entry[2]
-        self._last_now = now
+        self._stat["expired"] += expired
+        self._stat["evicted"] += evicted
         if count <= self._limit:
+            self._stat["pass"] += 1
+            self._last_now = now
             return response, "pass", self._limit - count
         excess = count - self._limit
         if self._slip > 0 and excess % self._slip == 0:
+            self._stat["slip"] += 1
+            self._last_now = now
             # 截断应答格式同 RateLimiter.respond 的 TC 应答。
             flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
             tc = (query[0:2] + flags.to_bytes(2, "big")
                   + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
                   + query[12:])
             return tc, "slip", 0
+        self._stat["drop"] += 1
+        self._last_now = now
         return None, "drop", 0
+
+    def stats(self, reset: bool = False) -> str:
+        """返回统计的固定键序紧凑 ASCII JSON（末尾一个换行）。
+
+        键序仅 pass,drop,slip,expired,evicted,keys,capacity，值均为非负
+        十进制整数，capacity 恒为 4096；pass/drop/slip 分别累计三种成功
+        动作次数，expired、evicted 为上次重置后实际删除的过期键数、容量
+        淘汰键数，keys 为当前活动计数键数。统计仅在 apply 成功返回后原子
+        提交，apply 抛异常不改变统计。reset 非 bool 抛 TypeError 且无变
+        化；False 只读且重复读取逐字节相同；True 先返回重置前快照，再清
+        零五个累计计数，保留活动键及其计数、创建序和最后时钟，因此 keys
+        不清零。相同状态与输入逐字节一致；读取时间与额外空间为 O(1)。
+        """
+        if not isinstance(reset, bool):
+            raise TypeError("reset must be bool")
+        stat = self._stat
+        text = (
+            '{"pass":' + str(stat["pass"])
+            + ',"drop":' + str(stat["drop"])
+            + ',"slip":' + str(stat["slip"])
+            + ',"expired":' + str(stat["expired"])
+            + ',"evicted":' + str(stat["evicted"])
+            + ',"keys":' + str(len(self._counts))
+            + ',"capacity":' + str(_RATE_TABLE_CAPACITY) + "}\n"
+        )
+        if reset:
+            # 先返回重置前快照，再清零五个累计计数；活动键及其计数、创建
+            # 序、时钟均保留。
+            stat["pass"] = 0
+            stat["drop"] = 0
+            stat["slip"] = 0
+            stat["expired"] = 0
+            stat["evicted"] = 0
+        return text
 
 
 def _validate_rate_ops(ops):
