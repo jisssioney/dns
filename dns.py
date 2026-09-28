@@ -230,12 +230,25 @@
   顶层键序仅 v,state,forward,log,result：v=1，其余依次为 dump_state 的
   v2 对象、migrate_forward 的 v1 对象、export_log 的 v1 对象与
   replay_log 成功结果对象；以 state.rec.clock 调 load_state，plan、
-  timeout、attempts 取 forward，replay_log 的 expected 取 state 区域
+  timeout、attempts 取 forward 并把当前生效配置重建为唯一版本 0 历史
+  （不产生 forward 版本与审计，故 rollback_forward(0,0) 报告
+  unchanged 且不改配置），replay_log 的 expected 取 state 区域
   修订号，执行 log 所得文本须与 result 按键序生成的紧凑文本逐字节相同。
   text 非 str 抛 TypeError；超 16777216 码点、非 ASCII、JSON、重复键、
   顶层键序、v、log/result 结构或结果不符抛 ReplayError；state、forward
   错误沿用 load_state、migrate_forward 异常，操作异常原样传播；隔离执行，
   失败不产生实例，成功返回解析器与该文本。
+- Resolver.export_bundle(ops: list, now: int) -> str: 只读导出可由
+  replay_bundle 隔离恢复并重放的重放封包。ops 沿用 export_log 协议，
+  限 1..4096 项；起始时刻取最后成功结束时刻，未设为 0。ops 非 list 或
+  now 非 int（bool 非法）抛 TypeError；now 为负或早于起始时刻抛
+  CacheError；ops 非法或结果超 16777216 字节抛 ReplayError；异常原样
+  传播，失败不改变实例。输出顶层键序仅 v,state,forward,log,result：
+  v=1；state 为起始时刻 dump_state 的 v2 对象，forward 为当前
+  migrate_forward v1 对象，log 为 export_log(ops,now) 对象，result 为
+  从前三者经与 replay_bundle 相同路径隔离恢复并重放所得对象。紧凑
+  ASCII JSON、末尾单换行；交给 replay_bundle 后返回文本与 result 逐字节
+  相同；同态同参逐字节一致。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -5942,7 +5955,10 @@ class Resolver:
         ReplayError）；先以 state.rec.clock 与 forward 的 plan、timeout
         经 load_state 恢复候选实例（区域历史、修订号、缓存、时钟、统计
         与 ru），再按 forward 设置 attempts（plan、timeout 已取 forward，
-        不产生 forward 版本/审计），随后在候选上以 state 的区域修订号为
+        不产生 forward 版本/审计），随后把当前生效配置重建为唯一的版本
+        0 历史——恢复实例未经历热加载、版本号仍为 0、审计队列仍空，
+        版本 0 快照即当前生效配置，故 rollback_forward(0,0) 报告
+        unchanged 且不改配置——然后在候选上以 state 的区域修订号为
         expected 执行 log，操作异常与时钟 CacheError 原样传播。执行
         完成后所得文本与 result 紧凑序列化文本逐字节比较，result 的任何
         形态或内容不符（含 conflict）统一抛 ReplayError；仅全部通过才
@@ -5985,6 +6001,43 @@ class Resolver:
                                   separators=(",", ":")) + "\n"
         log_text = json.dumps(log_obj, ensure_ascii=True,
                               separators=(",", ":")) + "\n"
+        # 隔离恢复与重放完全复用 export_bundle 的同一恢复路径，保证同三段
+        # 文本逐字节得到同一结果：state、forward 的语义错误分别沿用
+        # load_state、migrate_forward 原样抛出，log 结构错误抛
+        # ReplayError，操作异常与时钟 CacheError 原样传播；失败时实例仅
+        # 存在于本方法内，不产生对外实例。
+        resolver, out_text = cls._recover_bundle_resolver(
+            state_text, forward_text, log_text)
+        # result 按键序（v,result,ops,state）生成的紧凑文本须与执行 log
+        # 所得文本逐字节相同；result 非对象、形态或内容不符均在此收口
+        # 为 ReplayError。
+        expected_text = json.dumps(result_obj, ensure_ascii=True,
+                                   separators=(",", ":")) + "\n"
+        if out_text != expected_text:
+            raise ReplayError("replay result does not match bundle result")
+        return resolver, out_text
+
+    @classmethod
+    def _recover_bundle_resolver(cls, state_text, forward_text, log_text):
+        """从封包 state/forward/log 三段文本隔离恢复解析器并重放 log。
+
+        replay_bundle 与 export_bundle 共用的唯一恢复路径，保证同三段
+        文本逐字节得到同一结果：state 先经 migrate_state 完整校验取
+        state.rec.clock 与区域当前修订号；forward 经 migrate_forward
+        完整校验规范化，取 plan、timeout、attempts；先以 state.rec.clock
+        经 load_state 恢复候选实例（区域历史、修订号、缓存、时钟、统计
+        与 ru；权威缓存按 load_state 语义为空），再按 forward 设置
+        attempts（plan、timeout 已取 forward，不产生 forward 版本与
+        审计），随后把当前生效配置重建为唯一的版本 0 历史——恢复出的
+        实例未经历任何热加载，版本号仍为 0、审计队列仍为空，版本 0
+        快照即当前生效配置，故 rollback_forward(0, 0) 命中快照且快照
+        与当前等价，报告 unchanged 且不改配置。最后以 state 的区域修订
+        号为 expected 在候选上执行 log。state、forward 的语义错误沿用
+        load_state、migrate_forward（ConfigError/ZoneError/RecordError/
+        CacheError 等），log 结构错误由 replay_log 抛 ReplayError，操作
+        异常与时钟 CacheError 原样传播；返回 (恢复并重放后的解析器,
+        replay_log 文本)。
+        """
         # state 错误沿用 load_state（其内部先经 migrate_state 完整校验
         # 并规范化）：此处先迁移一次以取 state.rec.clock 与区域当前修订
         # 号；ConfigError/ZoneError/RecordError 等原样传播。
@@ -5994,8 +6047,7 @@ class Resolver:
         expected = state_norm["zones"]["version"]
         # forward 的结构与语义校验沿用 migrate_forward（ConfigError 等
         # 原样传播，不归类为 ReplayError）；其规范化文本作为恢复依据。
-        forward_migrated = migrate_forward(forward_text)
-        forward_config = json.loads(forward_migrated)
+        forward_config = json.loads(migrate_forward(forward_text))
         plan = [
             (item["name"],
              [(event["delay"],
@@ -6012,20 +6064,85 @@ class Resolver:
         # timeout 构造，attempts 直接按 forward 设置；不产生 forward
         # 热加载版本或审计（dump_forward 的 version 不属本封包）。
         resolver._attempts = forward_config["attempts"]
+        # 按 forward 恢复后重建版本 0 历史：load_state 构造时按入参 plan
+        # 归档的版本 0 快照（attempts=2）可能与含恢复 attempts 的当前生效
+        # 配置不等价，故丢弃构造历史、以当前生效配置重建唯一版本 0 快照；
+        # 版本号保持 0、审计队列保持空。由此 rollback_forward(0, 0) 命中
+        # 快照且与当前等价，报告 unchanged 且不改配置。
+        resolver._forward_history = {0: resolver._forward_snapshot()}
         # 在恢复出的隔离实例上执行 log：log 的结构预检错误由 replay_log
-        # 抛 ReplayError，操作异常与时钟 CacheError 原样传播；此时实例
-        # 仅存在于本方法内，任何失败都不产生对外实例。expected 取 state
-        # 区域的当前修订号；不符时 replay_log 返回 conflict 文本，随后
-        # 与 result 不符同样抛 ReplayError。
+        # 抛 ReplayError，操作异常与时钟 CacheError 原样传播；expected
+        # 取 state 区域的当前修订号；不符时 replay_log 返回 conflict
+        # 文本，由 replay_bundle 末尾与 result 的比对收口为 ReplayError。
         out_text = resolver.replay_log(log_text, expected)
-        # result 按键序（v,result,ops,state）生成的紧凑文本须与执行 log
-        # 所得文本逐字节相同；result 非对象、形态或内容不符均在此收口
-        # 为 ReplayError。
-        expected_text = json.dumps(result_obj, ensure_ascii=True,
-                                   separators=(",", ":")) + "\n"
-        if out_text != expected_text:
-            raise ReplayError("replay result does not match bundle result")
         return resolver, out_text
+
+    def export_bundle(self, ops: list, now: int) -> str:
+        """导出可由 replay_bundle 隔离恢复并重放的重放封包文本（只读）。
+
+        ops 沿用 export_log 的 ops 协议，限 1..4096 项，项非法抛
+        ReplayError；起始时刻取最后成功结束时刻，未设为 0。ops 非 list
+        或 now 非 int（bool 非法）抛 TypeError；now 为负或早于起始时刻
+        抛 CacheError；ops 非法或完整封包结果超 16777216 字节抛
+        ReplayError。先构造 log 文本（export_log 同形的 v,now,ops），
+        再以起始时刻 dump_state 的 v2 对象、当前 migrate_forward 的 v1
+        对象与 log 的解码对象分别作为 state、forward、log；result 不是
+        本解析器深拷贝的重放结果（dump_state 不含权威缓存等），而是把
+        state、forward、log 三段重新紧凑序列化后经与 replay_bundle 完全
+        相同的隔离恢复路径重放所得 replay_log 文本的解码对象。所有校验
+        与重放都在隔离副本/恢复实例上进行，异常原样传播，成功或失败都
+        不改变本解析器状态（区域、版本、历史、缓存、时钟、统计、上游
+        配置与审计等）。输出顶层键序仅 "v","state","forward","log",
+        "result"：v 恒为 1；紧凑 ASCII JSON、末尾单换行，不超过
+        16777216 字节。封包交给 replay_bundle 恢复重放后，其返回文本与
+        本方法 result 段逐字节相同。同态同参逐字节一致。
+        """
+        if not isinstance(ops, list):
+            raise TypeError("ops must be list")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        start = self._last_end if self._last_end is not None else 0
+        if now < 0 or now < start:
+            raise CacheError("now must be non-negative and monotonic")
+        if not 1 <= len(ops) <= _MAX_REPLAY_OPS:
+            raise ReplayError("ops must contain 1..4096 items")
+        # 先以 export_log 同形构造 log 文本并经 export_log 在隔离副本上
+        # 完整验证（结构预检、隔离执行与时钟契约）：ops 非法抛
+        # ReplayError、操作异常与时钟 CacheError 原样传播，均不改变本
+        # 解析器。log 对象直接取该文本的解码对象。
+        log_text = self.export_log(ops, now)
+        log_obj = json.loads(log_text)
+        # state 为起始时刻 dump_state 的 v2 对象：now 已通过同样的时钟
+        # 校验（start==最后成功结束时刻），dump_state 只读；其自身超
+        # 16MiB 的 ConfigError 即封包结果超限，归为 ReplayError（同
+        # replay_log 对 dump_state 超限的处理）。
+        try:
+            state_text = self.dump_state(start)
+        except ConfigError:
+            raise ReplayError(
+                "replay bundle result exceeds 16777216 bytes") from None
+        state_obj = json.loads(state_text)
+        # forward 为当前 migrate_forward v1 对象：直接由当前生效配置
+        # 规范化生成，避免文本往返；其紧凑文本经 migrate_forward 为不
+        # 动点（规范 v1 再次迁移逐字节不变）。
+        forward_text = json.dumps(self._forward_config(), ensure_ascii=True,
+                                  separators=(",", ":")) + "\n"
+        forward_obj = json.loads(forward_text)
+        # result 必须是“从前三者隔离恢复并重放”的结果：把三段重新紧凑
+        # 序列化后走与 replay_bundle 完全相同的恢复路径（load_state 使
+        # 权威缓存为空、按 forward 重建版本 0 历史），而非本解析器深拷贝
+        # 重放；恢复实例仅存在于本次调用，不触碰本解析器。
+        _recovered, out_text = self._recover_bundle_resolver(
+            state_text, forward_text, log_text)
+        result_obj = json.loads(out_text)
+        bundle = json.dumps(
+            {"v": 1, "state": state_obj, "forward": forward_obj,
+             "log": log_obj, "result": result_obj},
+            ensure_ascii=True, separators=(",", ":")) + "\n"
+        # 紧凑 ASCII 文本字节数与码点数一致；整封包超 16MiB 拒绝导出。
+        if len(bundle) > _MAX_REPLAY_BUNDLE_LEN:
+            raise ReplayError("replay bundle exceeds 16777216 bytes")
+        return bundle
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
