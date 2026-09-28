@@ -205,7 +205,7 @@
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/reload_serial/migrate/migrate_tx/
   restore_zones/
-  resolve/recursive/rollback/rollback_batch/update/cache_stats 操作
+  resolve/transfer/recursive/rollback/rollback_batch/update/cache_stats 操作
   并记录为紧凑 ASCII JSON
   （末尾单换行）；ops 限 0..4096 项，结果上限 16777216 字节。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
@@ -337,6 +337,7 @@ _REPLAY_UPDATE_KEYS = ["op", "changes", "serial", "expected"]
 _MIN_TRANSFER_LIMIT = 1
 _MAX_TRANSFER_LIMIT = 65535
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
+_REPLAY_TRANSFER_KEYS = ["op", "from_serial", "limit"]
 _REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
 _REPLAY_LEVEL_KEYS = ["name", "events"]
 _REPLAY_EVENT_KEYS = ["delay", "reply"]
@@ -5325,7 +5326,7 @@ class Resolver:
         v 恒为 1，now 为非负非 bool 整数，ops 为 1..4096 项并沿用
         replay 的输入协议（reload/reload_tx/reload_serial/migrate/
         migrate_tx/
-        restore_zones/resolve/recursive/rollback/rollback_batch/
+        restore_zones/resolve/transfer/recursive/rollback/rollback_batch/
         update/cache_stats，全部操作在隔离执行前完成预检）。text 非
         str 或 expected 非 int（含 bool）抛 TypeError；expected<0、
         text 超长或非 ASCII、JSON 解析、重复键、键序、v 非法、now<0
@@ -5619,7 +5620,9 @@ def _validate_ops(ops):
     restore_zones 键序 op,text,expected 且 op 为 "restore_zones"，
     text 长度同 migrate，expected 同 reload_tx；resolve
     键序 op,query,now,limit 且 op 为 "resolve"、query 为偶长小写十六
-    进制、now/limit 为非 bool int；recursive 键序
+    进制、now/limit 为非 bool int；transfer 键序
+    op,from_serial,limit 且 op 为 "transfer"、from_serial 为 uint32
+    非 bool int、limit 为 1..65535 非 bool int；recursive 键序
     op,query,levels,now,limit 且 op 为 "recursive"，query 为偶长小写
     十六进制，now/limit 为非 bool int，levels 经
     _validate_replay_levels 校验并转换（非 recursive 项 plans 为 None）；
@@ -5656,6 +5659,8 @@ def _validate_ops(ops):
             valid_names = ("reload_serial",)
         elif keys == _REPLAY_RESOLVE_KEYS:
             valid_names = ("resolve",)
+        elif keys == _REPLAY_TRANSFER_KEYS:
+            valid_names = ("transfer",)
         elif keys == _REPLAY_RECURSIVE_KEYS:
             valid_names = ("recursive",)
         elif keys == _REPLAY_ROLLBACK_BATCH_KEYS:
@@ -5670,6 +5675,7 @@ def _validate_ops(ops):
             raise ReplayError(
                 "op keys must be op,text, op,text,expected,"
                 " op,text,expected,force, op,query,now,limit,"
+                " op,from_serial,limit,"
                 " op,query,levels,now,limit,"
                 " op,expected,steps, op,target,expected,"
                 " op,changes,serial,expected or op,now,reset")
@@ -5722,6 +5728,18 @@ def _validate_ops(ops):
             if (not isinstance(expected, int) or isinstance(expected, bool)
                     or expected < 0):
                 raise ReplayError("expected must be a non-negative int")
+        elif kind == "transfer":
+            from_serial = op["from_serial"]
+            if (not isinstance(from_serial, int)
+                    or isinstance(from_serial, bool)):
+                raise ReplayError("from_serial must be int")
+            if not 0 <= from_serial <= _MAX_TTL:
+                raise ReplayError("from_serial out of range")
+            limit = op["limit"]
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise ReplayError("limit must be int")
+            if not _MIN_TRANSFER_LIMIT <= limit <= _MAX_TRANSFER_LIMIT:
+                raise ReplayError("limit out of range")
         elif kind in ("resolve", "recursive"):
             query = op["query"]
             if not isinstance(query, str):
@@ -5884,6 +5902,12 @@ def _execute_replay_op(resolver, kind, op, plans):
             bytes.fromhex(op["query"]), op["now"], op["limit"])
         return {"ok": True, "response": response.hex(),
                 "source": source, "end": end, "hit": hit}
+    if kind == "transfer":
+        report = json.loads(
+            resolver.transfer_zone(op["from_serial"], op["limit"]))
+        return {"ok": True, "version": report["version"],
+                "serial": report["serial"], "mode": report["mode"],
+                "delete": report["delete"], "add": report["add"]}
     if kind == "rollback":
         report = json.loads(
             resolver.rollback_zone_tx(op["target"], op["expected"]))
@@ -5919,7 +5943,7 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
            timeout: int = 5) -> str:
     """在 Resolver 上依次回放 reload/reload_tx/reload_serial/migrate/
     migrate_tx/
-    restore_zones/resolve/recursive/rollback/rollback_batch/update/
+    restore_zones/resolve/transfer/recursive/rollback/rollback_batch/update/
     cache_stats 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 限 0..4096 项，
@@ -5928,8 +5952,8 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     reload_serial 的 text 码点长度、
     rollback 的 target/expected、rollback_batch 的 expected/steps 及其
     reload/rollback 步、update 的 changes/serial/expected 及其项结构、
-    记录语义与十六进制、cache_stats 的 now/reset、reload_serial 的
-    force）均在创建 Resolver 前
+    记录语义与十六进制、transfer 的 from_serial/limit、cache_stats 的
+    now/reset、reload_serial 的 force）均在创建 Resolver 前
     抛 ReplayError；zone、plan、timeout 的校验与异常同 Resolver 构造。
     每项记录键序 in,out,stats：in 为操作原文，stats 为该操作后的
     stats() 原文。成功 out 首键 ok 为 true：reload 键序 ok,revision；
@@ -5951,7 +5975,11 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     修订号（违反抛 ConfigError），applied 原子替换区域、历史与修订
     号并清权威缓存，保留递归缓存、时钟、plan 与统计，其余结果或
     异常无副作用（后续操作可见已提交项）；resolve 与 recursive 键序
-    ok,response,source,end,hit，response 为小写十六进制；rollback 键序
+    ok,response,source,end,hit，response 为小写十六进制；transfer
+    键序 ok,version,serial,mode,delete,add：调用
+    Resolver.transfer_zone(from_serial,limit)，五值逐值取其报告，传送
+    只读，前序暂存的变更对其可见，ZoneError 或 TransferError 记为
+    out 键序 ok,error 的 false 与类名并继续；rollback 键序
     ok,version,result,target，先比较修订号，版本不符为 conflict 且不查
     历史，target 为当前版为 unchanged、未保留为 missing、命中为
     applied，状态副作用沿用 rollback_zone_tx（后续操作观察其提交）；
