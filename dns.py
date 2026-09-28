@@ -7006,6 +7006,123 @@ class RateLimiter:
         return instance
 
 
+class ResponseRateLimiter:
+    """按客户端网段聚合的确定性固定窗响应限速器（pass/slip/drop）。
+
+    window 为 1..3600、limit 为 1..65535、slip 为 0..65535 的非 bool
+    整数（构造缺省 slip=2）；类型错抛 TypeError，越界抛 PolicyError。
+
+    apply(query, response, client, now) 返回 (报文或 None, 结果类别,
+    余量)。query、client、now、response 的校验与异常沿用
+    RateLimiter.respond（无 truncate 参数）：类型错抛 TypeError，now
+    为负或相对上次成功调用回退抛 CacheError，client 非字面 IP 地址抛
+    PolicyError，query 解码失败抛 MessageError、QR 置位或问题数非 1
+    抛 EncodeError，response 不符合 forward 的合格应答判定抛
+    EncodeError。计数键为 (client 归入 IPv4/24 或 IPv6/56 后的规范
+    网段, 规范 qname, qtype, response 低 4 位 RCODE, 窗号)，窗号按
+    now // window 划分固定窗。校验通过即为一次成功调用，计数加一：
+    count <= limit 返回 (response, "pass", limit-count)；超出后序号
+    n = count-limit，slip > 0 且 n % slip == 0 时返回 (tc, "slip", 0)，
+    否则返回 (None, "drop", 0)。tc 的格式同 RateLimiter.respond 的
+    TC：ID 取 query、flags 取 response 并置 TC、QDCOUNT=1、其余计数
+    为 0、问题段逐字节取 query[12:]。每次调用先删除当前已过期窗
+    （截止 <= now）；插入第 4097 键前淘汰（窗截止时刻, 创建序）最小
+    项，状态至多 4096 项、单次调用至多扫描全表两遍 O(4096)。全部
+    校验先于计数完成，任何失败都不改变计数与时钟；相同初态与调用
+    序列逐字节一致。
+    """
+
+    def __init__(self, window: int, limit: int, slip: int = 2):
+        _check_int(window, "window")
+        _check_int(limit, "limit")
+        _check_int(slip, "slip")
+        if not _MIN_RATE_WINDOW <= window <= _MAX_RATE_WINDOW:
+            raise PolicyError("window out of range")
+        if not 1 <= limit <= _MAX_RATE_QUOTA:
+            raise PolicyError("limit out of range")
+        if not 0 <= slip <= _MAX_RATE_QUOTA:
+            raise PolicyError("slip out of range")
+        self._window = window
+        self._limit = limit
+        self._slip = slip
+        # 计数键 -> [窗起始, 窗截止, 计数, 创建序]
+        self._counts = {}
+        self._serial = 0  # 创建序：随新窗计数项从 0 递增
+        self._last_now = None  # 上次成功 apply 的时钟值
+
+    def apply(self, query: bytes, response: bytes, client: str,
+              now: int) -> tuple[bytes | None, str, int]:
+        """按网段聚合键限流并给出应答报文、结果类别与余量。
+
+        校验顺序与异常同 RateLimiter.respond（先类型、再时钟、再地址、
+        后解码），全部校验先于计数完成，任何失败都不改变计数与时钟。
+        成功调用计数加一：未超 limit 返回 (response, "pass", 余量)；
+        超限后每第 slip 次返回 (tc, "slip", 0)，slip 为 0 或其余返回
+        (None, "drop", 0)。
+        """
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # client 与 query 的校验顺序同 respond：先地址、后解码。
+        try:
+            addr = ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        msg = decode_query(query)
+        if msg["flags"] & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if len(msg["questions"]) != 1:
+            raise EncodeError("query must contain exactly one question")
+        if not _matching_reply(query, response):
+            raise EncodeError("response is not a valid reply to query")
+        rcode = response[3] & 0x0F
+        question = msg["questions"][0]
+        # 客户端聚合网段：IPv4 取 /24，IPv6 取 /56，规范文本作键。
+        if addr.version == 4:
+            net = ipaddress.IPv4Network((int(addr) & 0xFFFFFF00, 24))
+        else:
+            net = ipaddress.IPv6Network((int(addr) >> 72 << 72, 56))
+        # 先删除当前已过期窗（截止 <= now），一次至多扫描全表一遍。
+        for dead in [key for key, value in self._counts.items()
+                     if value[1] <= now]:
+            del self._counts[dead]
+        bucket = now // self._window
+        key = (str(net), question["name"], question["type"], rcode, bucket)
+        entry = self._counts.get(key)
+        if entry is None:
+            # 插入第 4097 键前淘汰 (截止, 创建序) 最小项，保持至多 4096 项。
+            if len(self._counts) >= _RATE_TABLE_CAPACITY:
+                oldest = min(self._counts,
+                             key=lambda k: (self._counts[k][1],
+                                            self._counts[k][3]))
+                del self._counts[oldest]
+            self._counts[key] = [bucket * self._window,
+                                 (bucket + 1) * self._window,
+                                 0, self._serial]
+            self._serial += 1
+            entry = self._counts[key]
+        entry[2] += 1
+        count = entry[2]
+        self._last_now = now
+        if count <= self._limit:
+            return response, "pass", self._limit - count
+        over = count - self._limit
+        if self._slip and over % self._slip == 0:
+            flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
+            tc = (query[0:2] + flags.to_bytes(2, "big")
+                  + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
+                  + query[12:])
+            return tc, "slip", 0
+        return None, "drop", 0
+
+
 def _validate_rate_ops(ops):
     """校验 replay_rate 的操作序列（不执行）。
 
