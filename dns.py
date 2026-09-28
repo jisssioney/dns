@@ -6144,6 +6144,64 @@ class Resolver:
             raise ReplayError("replay bundle exceeds 16777216 bytes")
         return bundle
 
+    def export_bundle_file(self, ops: list, now: int, path: str) -> int:
+        """把 export_bundle(ops, now) 字节逐字节原子落盘，返回写入字节数。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError
+        （沿用 save_state 的路径校验，先于封包内容校验）。随后完全复用
+        export_bundle：ops、now 的 TypeError/CacheError/ReplayError 等
+        异常原样传播，且 export_bundle 只读，任何失败与成功都不改变本
+        解析器状态。落盘内容与 export_bundle(ops, now) 逐字节相同：在
+        目标同目录创建唯一临时文件，循环 write 至全部字节写完（write
+        返回 None、非 int 或非正数抛 OSError），flush、fsync 后以
+        os.replace 原子替换目标。任一步 I/O 失败抛 OSError，删除本次
+        临时文件、保留旧目标文件。同态同参逐字节一致；经
+        replay_bundle_file 读回所得状态与结果和直接经 export_bundle、
+        replay_bundle 两入口完全相同。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # export_bundle 只读且先于任何文件操作完成：其 TypeError/
+        # CacheError/ReplayError 原样传播，此时尚无临时文件。
+        data = self.export_bundle(ops, now).encode("ascii")
+        # 原子落盘与 save_state、export_log 共用同一路径：同目录临时
+        # 文件、循环写、flush、fsync 后 os.replace；失败删除临时项、
+        # 保留旧目标。
+        _atomic_write_file(path, data, ".dns-bundle-")
+        return len(data)
+
+    @classmethod
+    def replay_bundle_file(cls, path: str) -> "tuple[Resolver, str]":
+        """从封包文件隔离恢复并重放（协议完全复用 replay_bundle）。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError
+        （沿用 load_state_file 的路径校验）。最多读取 16777217 字节：
+        文件缺失抛 FileNotFoundError，其余 I/O 错抛 OSError（均沿用
+        load_state_file）；内容超过 16777216 字节或含非 ASCII 字节抛
+        ReplayError。解码后完全复用 replay_bundle：封包格式校验、
+        异常归类、隔离恢复与重放、result 逐字节比对均与其一致，任何
+        失败都不产生实例。读取时间与空间均为 O(文件长度)，上限
+        16777216 字节；仅多读一字节即可判定超限，避免把超限文件整体
+        读入内存。相同封包经本方法与 replay_bundle 所得解析器状态
+        相同、返回文本逐字节一致。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # 缺失与 I/O 错原样传播（FileNotFoundError/OSError）；仅多读
+        # 一字节即可判定超限，避免把超限文件整体读入内存。
+        with open(path, "rb") as stream:
+            data = stream.read(_MAX_REPLAY_BUNDLE_LEN + 1)
+        if len(data) > _MAX_REPLAY_BUNDLE_LEN:
+            raise ReplayError("bundle file exceeds 16777216 bytes")
+        if not data.isascii():
+            raise ReplayError("bundle file must be ASCII")
+        # 解码后的全部协议、异常、隔离恢复与比对均复用 replay_bundle。
+        return cls.replay_bundle(data.decode("ascii"))
+
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
 
