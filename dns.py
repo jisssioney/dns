@@ -205,8 +205,8 @@
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
   上依次回放 reload/reload_tx/reload_serial/migrate/migrate_tx/
   restore_zones/
-  resolve/recursive/rollback/rollback_batch/update/cache_stats 操作
-  并记录为紧凑 ASCII JSON
+  resolve/recursive/rollback/rollback_batch/update/transfer/cache_stats
+  操作并记录为紧凑 ASCII JSON
   （末尾单换行）；ops 限 0..4096 项，结果上限 16777216 字节。
 - authorize(query: bytes, client: str, rules: list, default: str = "deny")
   -> bool: 按 client/名称/类型规则原序匹配授权查询。
@@ -336,6 +336,7 @@ _MAX_UPDATE_CHANGES = 256
 _REPLAY_UPDATE_KEYS = ["op", "changes", "serial", "expected"]
 _MIN_TRANSFER_LIMIT = 1
 _MAX_TRANSFER_LIMIT = 65535
+_REPLAY_TRANSFER_KEYS = ["op", "from_serial", "limit"]
 _REPLAY_RESOLVE_KEYS = ["op", "query", "now", "limit"]
 _REPLAY_RECURSIVE_KEYS = ["op", "query", "levels", "now", "limit"]
 _REPLAY_LEVEL_KEYS = ["name", "events"]
@@ -5326,7 +5327,7 @@ class Resolver:
         replay 的输入协议（reload/reload_tx/reload_serial/migrate/
         migrate_tx/
         restore_zones/resolve/recursive/rollback/rollback_batch/
-        update/cache_stats，全部操作在隔离执行前完成预检）。text 非
+        update/transfer/cache_stats，全部操作在隔离执行前完成预检）。text 非
         str 或 expected 非 int（含 bool）抛 TypeError；expected<0、
         text 超长或非 ASCII、JSON 解析、重复键、键序、v 非法、now<0
         （在预检 ops 与执行之前）或操作非法抛 ReplayError。expected
@@ -5633,7 +5634,9 @@ def _validate_ops(ops):
     键序 name,type,class,ttl,rdata，rdata 为偶长小写十六进制并在校验时
     转为 bytes，记录语义同 zone.records 契约且不得为 SOA），serial 为
     uint32 非 bool int，expected 为非负非 bool int（非 update 项第三元
-    为 None，update 项第三元为转换后的 changes）。cache_stats 键序
+    为 None，update 项第三元为转换后的 changes）。transfer 键序
+    op,from_serial,limit 且 op 为 "transfer"、from_serial 为 uint32
+    非 bool int、limit 为 1..65535 非 bool int。cache_stats 键序
     op,now,reset 且 op 为 "cache_stats"、now 为非负非 bool int、reset
     为 bool。
     ops 非 list 抛 TypeError；ops 超 4096 项及项、键序、op 名或字段类型
@@ -5664,6 +5667,8 @@ def _validate_ops(ops):
             valid_names = ("rollback",)
         elif keys == _REPLAY_UPDATE_KEYS:
             valid_names = ("update",)
+        elif keys == _REPLAY_TRANSFER_KEYS:
+            valid_names = ("transfer",)
         elif keys == _REPLAY_RESOLVER_CACHE_STATS_KEYS:
             valid_names = ("cache_stats",)
         else:
@@ -5672,7 +5677,8 @@ def _validate_ops(ops):
                 " op,text,expected,force, op,query,now,limit,"
                 " op,query,levels,now,limit,"
                 " op,expected,steps, op,target,expected,"
-                " op,changes,serial,expected or op,now,reset")
+                " op,changes,serial,expected, op,from_serial,limit"
+                " or op,now,reset")
         if not isinstance(op["op"], str):
             raise ReplayError("op must be str")
         if op["op"] not in valid_names:
@@ -5793,6 +5799,17 @@ def _validate_ops(ops):
                         raise ReplayError(str(exc)) from None
                 converted.append({"op": change_op, "record": candidate})
             plans = converted
+        elif kind == "transfer":
+            from_serial = op["from_serial"]
+            if not isinstance(from_serial, int) or isinstance(from_serial, bool):
+                raise ReplayError("from_serial must be int")
+            if not 0 <= from_serial <= _MAX_TTL:
+                raise ReplayError("from_serial out of range")
+            limit = op["limit"]
+            if not isinstance(limit, int) or isinstance(limit, bool):
+                raise ReplayError("limit must be int")
+            if not _MIN_TRANSFER_LIMIT <= limit <= _MAX_TRANSFER_LIMIT:
+                raise ReplayError("limit out of range")
         elif kind == "cache_stats":
             now = op["now"]
             if not isinstance(now, int) or isinstance(now, bool) or now < 0:
@@ -5908,6 +5925,12 @@ def _execute_replay_op(resolver, kind, op, plans):
     if kind == "cache_stats":
         snapshot = resolver.cache_stats(op["now"], op["reset"])
         return {"ok": True, "snapshot": snapshot}
+    if kind == "transfer":
+        report = json.loads(
+            resolver.transfer_zone(op["from_serial"], op["limit"]))
+        return {"ok": True, "version": report["version"],
+                "serial": report["serial"], "mode": report["mode"],
+                "delete": report["delete"], "add": report["add"]}
     response, source, end, hit = resolver.resolve_recursive(
         bytes.fromhex(op["query"]), plans,
         op["now"], op["limit"])
@@ -5920,7 +5943,7 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     """在 Resolver 上依次回放 reload/reload_tx/reload_serial/migrate/
     migrate_tx/
     restore_zones/resolve/recursive/rollback/rollback_batch/update/
-    cache_stats 操作，返回记录的紧凑 JSON。
+    transfer/cache_stats 操作，返回记录的紧凑 JSON。
 
     ops 非 list 或 expected 非 None/str 抛 TypeError；ops 限 0..4096 项，
     超量或操作项、键序、op 名或字段类型/内容错误（含 recursive 的 levels
@@ -5928,8 +5951,8 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     reload_serial 的 text 码点长度、
     rollback 的 target/expected、rollback_batch 的 expected/steps 及其
     reload/rollback 步、update 的 changes/serial/expected 及其项结构、
-    记录语义与十六进制、cache_stats 的 now/reset、reload_serial 的
-    force）均在创建 Resolver 前
+    记录语义与十六进制、transfer 的 from_serial/limit、cache_stats 的
+    now/reset、reload_serial 的 force）均在创建 Resolver 前
     抛 ReplayError；zone、plan、timeout 的校验与异常同 Resolver 构造。
     每项记录键序 in,out,stats：in 为操作原文，stats 为该操作后的
     stats() 原文。成功 out 首键 ok 为 true：reload 键序 ok,revision；
@@ -5965,11 +5988,15 @@ def replay(zone: dict, plan: list, ops: list, expected=None,
     递归缓存、时钟及统计。update 键序 ok,version,result,serial：changes
     的 rdata 在校验时已转为 bytes，事务语义（conflict/stale/unchanged/
     applied、修订号与归档、缓存与统计保留）沿用 update_zone_tx，version
-    与 result 取报告值，serial 为入参原值。cache_stats 键序
-    ok,snapshot：调用 Resolver.cache_stats(now,reset)，snapshot 为返回
-    原文（含末尾换行），reset=True 清零对后续操作可见。操作抛出的异常
-    记为 out 键序 ok,error（false 与异常类名）并继续后续操作，状态语义
-    沿用各操作（失败不改变任何状态）。输出为紧凑 ASCII JSON，顶层键序
+    与 result 取报告值，serial 为入参原值。transfer 键序
+    ok,version,serial,mode,delete,add：调用 Resolver.transfer_zone(
+    from_serial,limit)，只读且不改变任何状态，version、serial、mode、
+    delete、add 逐值取传送报告，前序暂存的变更对其可见。cache_stats
+    键序 ok,snapshot：调用 Resolver.cache_stats(now,reset)，snapshot 为
+    返回原文（含末尾换行），reset=True 清零对后续操作可见。操作抛出的
+    异常记为 out 键序 ok,error（false 与异常类名）并继续后续操作，
+    状态语义沿用各操作（失败不改变任何状态）；transfer 的 ZoneError、
+    TransferError 同样记为 ok,error 并继续。输出为紧凑 ASCII JSON，顶层键序
     version,ops，version 为 1，末尾单换行。结果上限 16777216 字节，
     超限抛 ReplayError 且不比较 expected；expected 为 None 时仅记录；
     为 str 时与输出整体逐字节比较，不一致抛 ReplayError。
