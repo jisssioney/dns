@@ -34,7 +34,9 @@
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
   应答末项回显 OPT（OPT 版本非 0 时直接返回 BADVERS，先于时钟回退
-  判断且不触缓存）；
+  判断且不触缓存）；版本 0 查询至多携带一个 ECS（选项码 8），ECS
+  合法时缓存按 (family,source,address) 分区、应答 OPT 回写码 8
+  （scope=source），非法 ECS 在访问缓存前抛 EDNSError；
   stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
@@ -411,6 +413,13 @@ _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
 _FLAG_DO = 0x8000
 _MAX_EDNS_RCODE = 0xFFF
+# EDNS(0) Client Subnet（选项码 8）：family 仅 1（IPv4）/2（IPv6），
+# source prefix 分别限 0..32、0..128，查询 scope 须为 0，address 长度为
+# (source+7)//8 且末字节未用低位须为 0；版本 0 查询至多一个 ECS。
+_OPT_CODE_ECS = 8
+_ECS_FAMILY_IPV4 = 1
+_ECS_FAMILY_IPV6 = 2
+_ECS_MAX_SOURCE = {_ECS_FAMILY_IPV4: 32, _ECS_FAMILY_IPV6: 128}
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
@@ -787,6 +796,45 @@ def _validate_edns_options(options):
         rdata += len(data).to_bytes(2, "big")
         rdata += data
     return bytes(rdata)
+
+
+def _parse_query_ecs(opts):
+    """从版本 0 查询的 OPT 选项表中解析唯一 ECS（码 8）。
+
+    无 ECS 返回 None；有则返回 (family, source, address)。重复 ECS、
+    family 非 1/2、source 越界、scope 非 0、长度不符或末字节未用低位
+    非 0 一律抛 EDNSError；其他选项码原样忽略。
+    """
+    ecs = None
+    for code, data in opts:
+        if code != _OPT_CODE_ECS:
+            continue
+        if ecs is not None:
+            raise EDNSError("duplicate ECS option")
+        if len(data) < 4:
+            raise EDNSError("ECS option truncated")
+        family = int.from_bytes(data[0:2], "big")
+        source = data[2]
+        scope = data[3]
+        address = data[4:]
+        if family not in _ECS_MAX_SOURCE:
+            raise EDNSError("ECS family must be 1 or 2")
+        if not 0 <= source <= _ECS_MAX_SOURCE[family]:
+            raise EDNSError("ECS source prefix out of range")
+        if scope != 0:
+            raise EDNSError("ECS scope prefix must be 0 in queries")
+        if len(address) != (source + 7) // 8:
+            raise EDNSError("ECS address length mismatch")
+        if source & 7 and address[-1] & (0xFF >> (source & 7)):
+            raise EDNSError("ECS address has non-zero padding bits")
+        ecs = (family, source, address)
+    return ecs
+
+
+def _encode_ecs_option(family, source, scope, address):
+    """返回码 8 选项的 data 部分（family 两字节、source、scope、address）；
+    选项 TLV 头由 _validate_edns_options 统一添加。"""
+    return (family.to_bytes(2, "big") + bytes((source, scope)) + address)
 
 
 def _decode_cname_target(rdata):
@@ -1364,8 +1412,11 @@ def _answer_plan(msg, origin, records, zone_class):
     return rcode, an, ns
 
 
-def _encode_plan(query, rcode, an, ns, limit):
-    """把完整应答计划编码为权威应答报文。"""
+def _encode_plan(query, rcode, an, ns, limit, ecs=None):
+    """把完整应答计划编码为权威应答报文。
+
+    ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。
+    """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
@@ -1375,15 +1426,25 @@ def _encode_plan(query, rcode, an, ns, limit):
     return _encode_response(query, model, rcode)
 
 
-def _encode_plan_edns(query, rcode, an, ns, limit):
-    """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。"""
+def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None):
+    """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
+
+    ecs 非 None 时应答 OPT 仅回写该 ECS（码 8）选项：family、source
+    不变，scope=source，address 同查询；查询携带的其他选项不回显。
+    """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
         "ar": [],
         "limit": limit,
     }
-    return edns(query, model, rcode)
+    options = None
+    if ecs is not None:
+        family, source, address = ecs
+        options = [{"code": _OPT_CODE_ECS,
+                    "data": _encode_ecs_option(family, source, source,
+                                               address)}]
+    return edns(query, model, rcode, options)
 
 
 def _encode_policy_refusal(query, limit):
@@ -1906,14 +1967,24 @@ class PositiveCache:
     仅 DO、选项 TLV 校验），QDCOUNT 非 1 或 QR 置位抛 EncodeError，
     其余报文非法抛 EDNSError。OPT 版本 1..255 时按版本协商直接返回
     (BADVERS 应答, False)，上限 min(limit, OPT CLASS)，先于时钟回退
-    判断返回，不读写缓存、FIFO、统计或时钟。版本 0 时缓存键、正负
-    缓存、TTL 衰减、FIFO、
-    命中与统计和 resolve 完全共享（键忽略 OPT、ID、flags 与 limit）；
-    应答按同一权威计划以 edns 语义编码：上限为 min(limit, OPT
-    CLASS)，RCODE 取计划值，末项 OPT 回显 CLASS 与 DO（扩展码、版本
-    及 RDLENGTH 为 0），普通 RR 超限按既有顺序整条尾删并置 TC、OPT
+    判断返回，不读写缓存、FIFO、统计或时钟，也不校验 ECS。版本 0
+    查询至多携带一个 ECS（选项码 8）：data 依次为网络序 family
+    uint16、source、scope 各一字节与 address；family 仅 1（source
+    0..32）或 2（source 0..128），scope 须为 0，address 长度为
+    (source+7)//8 且末字节未用低位须为 0；重复 ECS、未知 family、
+    source/scope 或长度非法、填充位非 0 均在访问缓存前抛 EDNSError。
+    合法 ECS 时缓存按 (family,source,address) 单独分区：正缓存、
+    NODATA、NXDOMAIN 均纳入，无 ECS 查询使用与 resolve 相同的无分区
+    键；版本 0 时缓存分区、正负缓存、TTL 衰减、FIFO、
+    命中与统计和 resolve 完全共享（分区内键忽略 OPT、ID、flags 与
+    limit）；应答按同一权威计划以 edns 语义编码：上限为 min(limit,
+    OPT CLASS)，RCODE 取计划值，末项 OPT 回显 CLASS 与 DO，查询含
+    ECS 时仅回写码 8 选项（family、source 不变，scope=source，
+    address 同查询，其他选项不回显；ECS 使报文超 min(limit,OPT
+    CLASS) 抛 EncodeError），无 ECS 时扩展码、版本及 RDLENGTH 为 0，
+    普通 RR 超限按既有顺序整条尾删并置 TC、OPT
     不删，头部、问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计
-    或最后时刻，成功原子提交；同样调用序列逐字节一致。
+    或最后时刻，成功原子提交；无 ECS 输出与既有逐字节相同。
 
     stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
     h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
@@ -1952,7 +2023,11 @@ class PositiveCache:
         self._clean_evicted = 0
 
     def _negative_entry(self, key, rcode, an, ns, now):
-        """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。"""
+        """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。
+
+        key 已含 ECS 分区（无 ECS 时末项为 None），负键在原 NXDOMAIN/
+        NODATA 键基础上保留该分区，故不同 ECS 分区各自独立。
+        """
         if an or rcode not in (0, _RCODE_NXDOMAIN):
             return None
         if (len(ns) != 1 or ns[0][0] != self._origin
@@ -1965,8 +2040,9 @@ class PositiveCache:
         neg_ttl = min(soa[3], minimum)
         if neg_ttl == 0:
             return None
+        partition = key[-1]
         if rcode == _RCODE_NXDOMAIN:
-            neg_key = ("nxdomain", key[0], key[2])  # 匹配任意 qtype
+            neg_key = ("nxdomain", key[0], key[2], partition)  # 匹配任意 qtype
         else:
             neg_key = ("nodata",) + key
         return neg_key, (now, rcode, soa, neg_ttl)
@@ -1993,14 +2069,24 @@ class PositiveCache:
         EncodeError；其余报文非法及 OPT 缺失（ARCOUNT=0）、OPT 非法或
         尾随字节沿用 edns 契约抛 EDNSError，即查缓存前须恰有一个合法
         OPT。now、limit 非 int 或为 bool 抛 TypeError；now 为负或回退抛
-        CacheError；limit 不在 12..65535 抛 EncodeError。缓存键、正负
-        缓存、TTL 衰减、FIFO、命中与统计和 resolve 完全共享（键忽略
-        OPT、ID、flags 与 limit）；应答按同一权威计划以 edns 语义编码，
-        异常不改变缓存、统计或最后时刻，成功原子提交。OPT 版本 1..255
-        时按版本协商直接返回 (BADVERS 应答, False)：应答同 edns 的
-        BADVERS 契约（上限 min(limit, CLASS)，超限抛 EncodeError 且
-        不置 TC），先于时钟回退判断返回，不读写缓存、FIFO、统计或
-        时钟；版本 0 时 now 回退仍抛 CacheError。
+        CacheError；limit 不在 12..65535 抛 EncodeError。
+
+        OPT 版本 1..255 时按版本协商直接返回 (BADVERS 应答, False)：
+        应答同 edns 的 BADVERS 契约（上限 min(limit, CLASS)，超限抛
+        EncodeError 且不置 TC），先于时钟回退判断返回，不校验 ECS，
+        不读写缓存、FIFO、统计或时钟；版本 0 时 now 回退仍抛
+        CacheError。版本 0 查询至多携带一个 ECS（码 8）：family 仅
+        1/2、source 分别限 0..32/0..128、scope 须为 0、address 长度为
+        (source+7)//8 且末字节未用低位须为 0；重复 ECS、未知 family、
+        长度或位值非法在访问缓存前抛 EDNSError，不改变任何状态。合法
+        ECS 时缓存按 (family,source,address) 分区，正缓存、NODATA、
+        NXDOMAIN 均纳入，无 ECS 查询与 resolve 同区；缓存分区、TTL
+        衰减、FIFO、命中与统计和 resolve 完全共享（分区内键忽略 OPT、
+        ID、flags 与 limit）。应答按同一权威计划以 edns 语义编码，
+        查询含 ECS 时 OPT 仅回写码 8（family、source 不变，
+        scope=source，address 同查询，其他选项不回显），ECS 使报文超
+        min(limit,OPT CLASS) 抛 EncodeError；异常不改变缓存、统计或
+        最后时刻，成功原子提交；无 ECS 时应答与既有输出逐字节相同。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
@@ -2023,22 +2109,30 @@ class PositiveCache:
             raise EDNSError("query must contain exactly one OPT")
         if opt[1] != 0:
             # 版本协商：OPT 版本 1..255 直接以 BADVERS 拒绝，先于时钟
-            # 回退判断返回，不读写缓存、FIFO、统计或时钟。
+            # 回退判断返回，不校验 ECS，不读写缓存、FIFO、统计或时钟。
             return _encode_badvers(msg, opt, limit), False
+        # 版本 0：ECS 校验先于缓存访问（含时钟回退判断），任何非法均
+        # 不改变缓存、统计或最后时刻；其他选项码原样忽略。
+        ecs = _parse_query_ecs(opt[3])
         if self._last_now is not None and now < self._last_now:
             raise CacheError("now must be non-negative and monotonic")
         return self._resolve_cached(msg, query, now, limit,
-                                    _encode_plan_edns)
+                                    _encode_plan_edns, ecs)
 
-    def _resolve_cached(self, msg, query, now, limit, encode_plan):
+    def _resolve_cached(self, msg, query, now, limit, encode_plan,
+                        ecs=None):
         """resolve/resolve_edns 共用的缓存查找、计划应答与原子提交。
 
         msg 为已解码且通过可应答性检查的单问题报文；encode_plan 为
-        (query, rcode, an, ns, limit) -> 应答报文 的编码器，其异常即
-        本次失败，不改变条目、统计与时钟。
+        (query, rcode, an, ns, limit, ecs=None) -> 应答报文 的编码器，
+        其异常即本次失败，不改变条目、统计与时钟。ecs 非 None 时缓存
+        键追加 (family,source,address) 分区，普通 resolve 路径恒为
+        None（无 ECS 单独分区）。
         """
         question = msg["questions"][0]
-        key = (question["name"], question["type"], question["class"])
+        partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
+        key = (question["name"], question["type"], question["class"],
+               partition)
         expired = None  # 到期条目在 _order 中的标记键，待编码成功后清理
         entry = self._entries.get(key)
         if entry is not None:
@@ -2050,7 +2144,7 @@ class PositiveCache:
                         for labels, rrtype, rrclass, ttl, rdata in an]
                 # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
                 # 命中也不改变插入次序。
-                response = encode_plan(query, 0, aged, [], limit)
+                response = encode_plan(query, 0, aged, [], limit, ecs)
                 # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                 self._stats_h[0] += 1
                 self._last_now = now
@@ -2062,7 +2156,7 @@ class PositiveCache:
             neg_key = ("nodata",) + key
             neg = self._neg_entries.get(neg_key)
             if neg is None:
-                neg_key = ("nxdomain", key[0], key[2])
+                neg_key = ("nxdomain", key[0], key[2], partition)
                 neg = self._neg_entries.get(neg_key)
             if neg is not None:
                 inserted, rcode, soa, neg_ttl = neg
@@ -2072,7 +2166,8 @@ class PositiveCache:
                                 neg_ttl - elapsed, soa[4])
                     # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
                     # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
-                    response = encode_plan(query, rcode, [], [aged_soa], limit)
+                    response = encode_plan(query, rcode, [], [aged_soa],
+                                           limit, ecs)
                     # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                     # neg_key 首项区分 NXDOMAIN（h[1]）与 NODATA（h[2]）。
                     self._stats_h[1 if neg_key[0] == "nxdomain" else 2] += 1
@@ -2083,7 +2178,7 @@ class PositiveCache:
         rcode, an, ns = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
         # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
-        response = encode_plan(query, rcode, an, ns, limit)
+        response = encode_plan(query, rcode, an, ns, limit, ecs)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
@@ -3709,14 +3804,15 @@ class Resolver:
     def _authority_miss_expired(self, question, now):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
         cache = self._cache
-        key = (question["name"], question["type"], question["class"])
+        # resolve 不经 EDNS/ECS，恒为无 ECS 分区（partition=None）。
+        key = (question["name"], question["type"], question["class"], None)
         entry = cache._entries.get(key)
         if entry is not None:
             return now - entry[0] >= min(rr[3] for rr in entry[1])
         neg_key = ("nodata",) + key
         neg = cache._neg_entries.get(neg_key)
         if neg is None:
-            neg_key = ("nxdomain", key[0], key[2])
+            neg_key = ("nxdomain", key[0], key[2], None)
             neg = cache._neg_entries.get(neg_key)
         if neg is None:
             return False
