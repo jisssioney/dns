@@ -249,6 +249,21 @@
   从前三者经与 replay_bundle 相同路径隔离恢复并重放所得对象。紧凑
   ASCII JSON、末尾单换行；交给 replay_bundle 后返回文本与 result 逐字节
   相同；同态同参逐字节一致。
+- Resolver.export_bundle_file(ops: list, now: int, path: str) -> int:
+  把 export_bundle(ops, now) 的 ASCII 字节原子落盘并返回字节数，只读且
+  不改变解析器。path 非 str 抛 TypeError，空串或含 NUL 抛 ConfigError
+  （先于 ops、now 校验）；ops、now 的 TypeError/CacheError/ReplayError
+  原样传播。在目标同目录建唯一临时文件，循环写全、flush、fsync 后
+  os.replace；I/O 失败抛 OSError、删除临时项并保留旧目标。同态同参逐
+  字节一致。
+- Resolver.replay_bundle_file(path: str) -> tuple[Resolver, str]: 类方法，
+  从重放封包文件隔离恢复并重放，协议完全复用 replay_bundle。path 非 str
+  抛 TypeError，空串或含 NUL 抛 ConfigError；最多读 16777217 字节，文件
+  缺失抛 FileNotFoundError，其余 I/O 错抛 OSError；超过 16777216 字节或
+  含非 ASCII 字节抛 ReplayError；解码后的 JSON、键序、v、log/result
+  结构、结果不符及 state、forward 语义错误均沿用 replay_bundle 的异常与
+  隔离恢复，失败不产生实例。同一封包经两入口所得状态相同、结果逐字节
+  一致。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -6018,6 +6033,36 @@ class Resolver:
         return resolver, out_text
 
     @classmethod
+    def replay_bundle_file(cls, path: str) -> "tuple[Resolver, str]":
+        """从重放封包文件隔离恢复并重放（协议完全复用 replay_bundle）。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError。
+        最多读取 16777217 字节：文件缺失抛 FileNotFoundError，其余 I/O
+        错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
+        ReplayError。解码后完全复用 replay_bundle：JSON（含重复键、
+        超长整数、超深嵌套）、顶层键序、v、log/result 结构或执行所得
+        文本与 result 不符抛 ReplayError；state、forward 错误沿用
+        load_state、migrate_forward 异常，操作异常与时钟 CacheError
+        原样传播；隔离恢复，任何失败都不产生实例，成功返回 (恢复并重
+        放后的解析器, 该文本)。同一封包经 replay_bundle 与本入口所得
+        解析器状态相同、结果文本逐字节一致。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # 缺失与 I/O 错原样传播（FileNotFoundError/OSError）；仅多读
+        # 一字节即可判定超限，避免把超限文件整体读入内存。
+        with open(path, "rb") as stream:
+            data = stream.read(_MAX_REPLAY_BUNDLE_LEN + 1)
+        if len(data) > _MAX_REPLAY_BUNDLE_LEN:
+            raise ReplayError("bundle file exceeds 16777216 bytes")
+        if not data.isascii():
+            raise ReplayError("bundle file must be ASCII")
+        # 解码后的全部协议、异常与隔离恢复均复用 replay_bundle。
+        return cls.replay_bundle(data.decode("ascii"))
+
+    @classmethod
     def _recover_bundle_resolver(cls, state_text, forward_text, log_text):
         """从封包 state/forward/log 三段文本隔离恢复解析器并重放 log。
 
@@ -6143,6 +6188,34 @@ class Resolver:
         if len(bundle) > _MAX_REPLAY_BUNDLE_LEN:
             raise ReplayError("replay bundle exceeds 16777216 bytes")
         return bundle
+
+    def export_bundle_file(self, ops: list, now: int, path: str) -> int:
+        """把重放封包原子落盘，返回写入字节数（只读，不改变解析器）。
+
+        path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError，
+        均先于 ops、now 与封包内容校验（沿用 save_state 的路径校验）。
+        随后调用 export_bundle(ops, now) 取得封包文本：ops、now 的
+        TypeError/CacheError/ReplayError 等异常原样传播，全部校验与
+        重放都在隔离副本/恢复实例上进行，成功或失败都不改变本解析器。
+        落盘字节与 export_bundle 文本的 ASCII 编码逐字节相同：在目标
+        同目录建唯一临时文件，循环 write 至全部字节写完（write 返回
+        None、非 int 或非正数抛 OSError），flush、fsync 后以
+        os.replace 原子替换目标。任一步 I/O 失败抛 OSError，删除本次
+        临时项、保留旧目标文件。同态同参逐字节一致。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        # export_bundle 只读：其 TypeError/CacheError/ReplayError 等异常
+        # 原样传播，此时尚未创建任何临时文件，本解析器状态不变。
+        text = self.export_bundle(ops, now)
+        data = text.encode("ascii")
+        # 原子落盘与 save_state、export_log 共用同一路径：同目录临时
+        # 文件、循环写、flush、fsync 后 os.replace；失败删除临时项、
+        # 保留旧目标。
+        _atomic_write_file(path, data, ".dns-bundle-")
+        return len(data)
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
