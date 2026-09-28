@@ -249,6 +249,17 @@
   从前三者经与 replay_bundle 相同路径隔离恢复并重放所得对象。紧凑
   ASCII JSON、末尾单换行；交给 replay_bundle 后返回文本与 result 逐字节
   相同；同态同参逐字节一致。
+- Resolver.reload_bundle_file(path: str, expected: int) -> str: 带修订号
+  检查地从封包文件原子接管整解析器状态，返回键序仅 version,result 的
+  紧凑 ASCII JSON 报告（末尾换行）。path 非 str 或 expected 非 int
+  （含 bool）抛 TypeError；path 为空串或含 NUL、expected<0 抛
+  ConfigError；验参后先比修订号，不等不打开文件并报告 conflict，相等时
+  调用 replay_bundle_file 隔离恢复重放，其 16MiB 读取上限、校验与全部
+  异常原样沿用；候选修订号小于当前抛 ConfigError，候选最后成功结束
+  时刻早于当前（未设视为 0）抛 CacheError；全部通过后一次性以候选的
+  区域历史及修订号、权威和递归缓存/FIFO、时钟、全部统计、上游配置
+  历史及审计替换当前对应状态，报告 applied（version 为操作后非负
+  修订号）；冲突外任何异常均不改变原实例，同状态同文件逐字节一致。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -6201,6 +6212,57 @@ class Resolver:
             raise ReplayError("bundle file must be ASCII")
         # 解码后的全部协议、异常、隔离恢复与比对均复用 replay_bundle。
         return cls.replay_bundle(data.decode("ascii"))
+
+    def reload_bundle_file(self, path: str, expected: int) -> str:
+        """带修订号检查地从封包文件原子接管整解析器状态，返回 version,result。
+
+        path 非 str 或 expected 非 int（含 bool）抛 TypeError；path 为空
+        串或含 NUL、expected 为负抛 ConfigError。验参后先比较 expected 与
+        当前区域修订号：不相等时不得打开文件，报告 conflict（version 为
+        当前修订号），不改变任何状态。相等时调用 replay_bundle_file(path)
+        隔离恢复并重放，其 16MiB 读取上限、ASCII 与封包校验、异常归类
+        （FileNotFoundError/OSError/ReplayError 及 state、forward 语义
+        异常等）全部原样沿用；恢复与重放均在隔离实例上进行，本解析器不
+        变。候选修订号小于当前修订号抛 ConfigError；候选最后成功结束
+        时刻早于当前最后成功结束时刻（未设视为 0）抛 CacheError。全部
+        通过后一次性以候选的区域历史及修订号、权威与递归缓存/FIFO、时钟、
+        全部统计、上游配置历史及审计替换当前对应状态（整份 __dict__
+        提交，含 plan、timeout、attempts、forward 版本、rated 与逐上游
+        计数等），提交后后续公开调用须与直接使用候选实例一致；冲突外的
+        任何异常均不改变原实例。报告键序仅 version,result（version 为
+        操作后非负修订号，result 仅 "applied" 或 "conflict"），紧凑
+        ASCII JSON、十进制整数、末尾单换行。同状态同文件逐字节一致；
+        读取与候选恢复的时间及额外空间为 O(文件长度+操作数)。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        # 冲突不打开文件：任何文件访问都必须在修订号检查之后。
+        if expected != self._revision:
+            return self._tx_report(self._revision, "conflict")
+        # 隔离恢复并重放：replay_bundle_file 的 16MiB 读取上限、校验与
+        # 全部异常原样沿用；任何失败都只产生（或不产生）局部候选，原
+        # 实例不受影响。
+        candidate, _out_text = Resolver.replay_bundle_file(path)
+        # 只允许接管到不回退的修订号；候选号更旧一律拒绝。
+        if candidate._revision < self._revision:
+            raise ConfigError("bundle revision must not be less than current")
+        current_last = self._last_end if self._last_end is not None else 0
+        candidate_last = (candidate._last_end
+                          if candidate._last_end is not None else 0)
+        # 时钟不得回退：候选最后成功结束时刻早于当前（未设视为 0）拒绝。
+        if candidate_last < current_last:
+            raise CacheError("bundle clock must not be earlier than current")
+        # 全部校验通过后一次性原子接管：候选整份状态（区域历史与修订号、
+        # 权威与递归缓存/FIFO、时钟、全部统计、上游配置历史及审计等）替换
+        # 当前对应状态，使后续公开调用与直接使用候选一致。
+        self.__dict__.update(candidate.__dict__)
+        return self._tx_report(self._revision, "applied")
 
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
