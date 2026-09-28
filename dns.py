@@ -6202,6 +6202,64 @@ class Resolver:
         # 解码后的全部协议、异常、隔离恢复与比对均复用 replay_bundle。
         return cls.replay_bundle(data.decode("ascii"))
 
+    def reload_bundle_file(self, path: str, expected: int) -> str:
+        """带修订号检查地从封包文件隔离恢复重放并原子接管整个解析器。
+
+        path 非 str 或 expected 非 int（bool 非法）抛 TypeError；path
+        为空串或含 NUL、expected 为负抛 ConfigError。验参后先比 expected
+        与当前区域修订号：不相等时不得打开文件，报告 conflict（version
+        为当前修订号），不改变任何状态。相等时完全沿用
+        replay_bundle_file(path)：16777216 字节读取上限、ASCII 与封包
+        校验、隔离恢复重放及全部异常（FileNotFoundError、OSError、
+        ReplayError、ConfigError、ZoneError、RecordError、CacheError
+        等）原样传播，任何失败都不产生对外实例、也不改变本解析器。
+
+        候选隔离成功后再做两项接管检查：候选区域修订号小于当前修订号
+        抛 ConfigError；候选最后成功结束时刻早于当前最后成功结束时刻
+        （任一未设视为 0）抛 CacheError。全部通过后一次性以候选的区域
+        修订历史与修订号、权威与递归缓存/FIFO、时钟、全部统计（h/m/x/
+        u/c/l/r、rated、逐上游、递归逐层 ru 与清理计数）、plan、
+        timeout、attempts、上游配置历史及版本号与审计替换当前对应状态；
+        替换为单步整体提交，此前任何异常都不会触及本实例，替换后的
+        公开调用与直接使用候选实例完全一致。报告键序仅 "version",
+        "result"：version 为操作后非负修订号，result 为 "applied" 或
+        "conflict"；紧凑 ASCII JSON、十进制整数、末尾单换行。同状态同
+        文件逐字节一致；读取与校验时间及额外空间均为 O(文件长度+操作数)。
+        """
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise TypeError("expected must be int")
+        if path == "" or "\x00" in path:
+            raise ConfigError("path must be non-empty and without NUL")
+        if expected < 0:
+            raise ConfigError("expected revision must be non-negative")
+        # 冲突不读文件：任何文件访问都必须在修订号检查之后。
+        if expected != self._revision:
+            return self._tx_report(self._revision, "conflict")
+        # 16MiB 读取上限、ASCII/封包校验、隔离恢复重放与全部异常原样
+        # 沿用 replay_bundle_file；候选仅存在于本次调用，本解析器此时
+        # 尚未被触及。
+        candidate, _out_text = Resolver.replay_bundle_file(path)
+        # 只允许向前接管修订号：候选区域修订号更旧一律拒绝（同号允许）。
+        if candidate._revision < self._revision:
+            raise ConfigError("bundle revision must not be less than current")
+        # 时钟只允许向前接管：候选与当前的最后成功结束时刻未设均视为 0，
+        # 候选时刻早于当前时刻抛 CacheError，保证接管后公开调用的时钟
+        # 单调性与直接使用候选一致。
+        candidate_end = (candidate._last_end
+                         if candidate._last_end is not None else 0)
+        current_end = (self._last_end
+                       if self._last_end is not None else 0)
+        if candidate_end < current_end:
+            raise CacheError("candidate clock must not be earlier than current")
+        # 全部校验通过后单步整体提交：候选 __dict__ 与本实例同属 Resolver
+        # 且属性集相同，一次 update 即替换区域历史与修订号、权威与递归
+        # 缓存/FIFO、时钟、全部统计、plan、timeout、attempts、上游配置
+        # 历史及审计；此后本实例与直接使用候选完全一致。
+        self.__dict__.update(candidate.__dict__)
+        return self._tx_report(self._revision, "applied")
+
     def rated_stats(self, reset: bool = False) -> str:
         """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
 
