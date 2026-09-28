@@ -33,10 +33,12 @@
   完整校验并迁移为 schema=1 文本（旧格式历史限 1..256 项，先校验全部
   快照再仅留 revision 最大的 32 项并把 zone 转成 v2，version 不变；
   紧凑 ASCII JSON，末尾单换行）。
-- migrate_state(text: str) -> str: 把 v0/v1 整解析器状态文本完整校验
-  并迁移为 v1 文本（v0 顶层键序 v,zones,rec、无 stats，迁移补零值
-  统计且 c[1] 等于 rec.items 长度；v1 统计不变；紧凑 ASCII JSON、
-  r 六位小数、末尾单换行，最多 16777216 字节）。
+- migrate_state(text: str) -> str: 把 v0/v1/v2 整解析器状态文本完整校验
+  并迁移为规范 v2 文本（v0 顶层键序 v,zones,rec、无 stats 与 ru，v1
+  键序 v,zones,rec,stats、无 ru，迁移补零值统计（c[1] 等于
+  rec.items 长度）与零值 ru；v2 键序 v,zones,rec,stats,ru 完整校验，
+  ru 键序 l,t、l 为 16 行每行 7 个非负整数且 t 逐项等于 l 各列之和；
+  紧凑 ASCII JSON、r 六位小数、末尾单换行，最多 16777216 字节）。
 - PositiveCache(zone): 容量 256 的正/负答案缓存，resolve(query, now, limit=512)
   返回 (应答报文, 是否命中)；resolve_edns(query, now, limit=65535) 处理
   含一个 OPT 的单问题查询，与 resolve 共享条目、键、FIFO、时钟与统计，
@@ -205,22 +207,25 @@
   I/O 错、超 16777216 字节或非 ASCII 分别抛 FileNotFoundError、
   OSError、ConfigError，内容不同时文件 version 须更大，result 为
   "applied"、"unchanged" 或 "conflict"；
-  dump_state(now) 导出区域历史、递归缓存与统计的整解析器快照
-  （顶层键序仅 v,zones,rec,stats，v=1，后三者分别为 dump_zones()、
-  dump_rec(now)、stats() 的解码对象，stats.c[1] 固定等于
-  rec.items 长度；紧凑 ASCII JSON、末尾单换行，最多 16777216 字节，
-  超限抛 ConfigError），now 异常沿用 dump_rec 且只读；
-  load_state(text, plan, now, timeout=5) 类方法接受 v0/v1 文本，先经
-  migrate_state 完整校验并迁移为 v1 再恢复实例（zones 沿用
+  dump_state(now) 导出区域历史、递归缓存、统计与递归逐层上游统计的整
+  解析器快照（顶层键序仅 v,zones,rec,stats,ru，v=2，后四者分别为
+  dump_zones()、dump_rec(now)、stats()、recursive_upstream_stats(False)
+  的解码对象，stats.c[1] 固定等于 rec.items 长度，ru 键序 l,t、l 为
+  16 行每行 7 个非负整数且 t 逐项等于 l 各列之和；紧凑 ASCII JSON、
+  末尾单换行，最多 16777216 字节，超限抛 ConfigError），now 异常沿用
+  dump_rec 且只读；
+  load_state(text, plan, now, timeout=5) 类方法接受 v0/v1/v2 文本，先经
+  migrate_state 完整校验并迁移为 v2 再恢复实例（zones 沿用
   load_zones，rec 沿用 load_rec 并按 now-rec.clock 衰减，stats 键序
   h,m,x,u,c,l,r、c[2]=256、c[1] 等于 rec.items 长度且加载后重算、
-  r 等于按 h,m 重算的 6 位小数比值；v0 补零值统计），恢复区域
-  历史、修订号、stats 计数、递归正负缓存、FIFO 与最后成功时刻，
-  权威缓存为空，plan/timeout 取参数；text 非 str 或 now 非 int（含
-  bool）抛 TypeError，text 超 16777216 码点、JSON、重复键、键序、
-  未知 v 或交叉约束错抛 ConfigError，区域或 RR 语义错沿用
-  ZoneError、RecordError，余错沿用 load_zones、load_rec 及构造
-  器，失败无实例。
+  r 等于按 h,m 重算的 6 位小数比值，ru 恢复 16 行逐层计数；v0 补零值
+  stats 与 ru，v1 补零值 ru），恢复区域历史、修订号、stats 计数、ru
+  计数、递归正负缓存、FIFO 与最后成功时刻，权威缓存为空，
+  plan/timeout 取参数；text 非 str 或 now 非 int（含 bool）抛
+  TypeError，text 超 16777216 码点、JSON、重复键、键序、未知 v、ru
+  维度/值域/合计或其他交叉约束错抛 ConfigError，区域或 RR 语义错沿用
+  ZoneError、RecordError，时钟错抛 CacheError，余错沿用 load_zones、
+  load_rec 及构造器，失败无实例。
 - compare_serial(left: int, right: int) -> str: 按 RFC 1982 比较
   uint32 环形序列号，返回 "equal"、"newer"、"older" 或 "ambiguous"。
 - replay(zone, plan, ops, expected=None, timeout=5) -> str: 在 Resolver
@@ -519,16 +524,25 @@ _REC_ITEM_KEYS = ["k", "q", "t", "c", "rr"]
 _REC_RR_KEYS = ["n", "t", "c", "ttl", "d"]
 _REC_ITEM_KINDS = frozenset(("p", "nx", "nd"))
 _MAX_REC_TEXT_LEN = 1048576
-# dump_state/load_state 整解析器快照：顶层键序仅 v,zones,rec,stats
-# （v 恒为 1，后三者分别为 dump_zones()、dump_rec(now)、stats() 的
-# 解码对象）；v0 旧格式顶层键序仅 v,zones,rec（v 恒为 0，无 stats，
-# 迁移时补全）。文本上限 16777216 码点（同区域文件上限）。
-_STATE_DUMP_KEYS = ["v", "zones", "rec", "stats"]
+# dump_state/load_state 整解析器快照：v2 顶层键序仅 v,zones,rec,stats,ru
+# （v 恒为 2，后四者分别为 dump_zones()、dump_rec(now)、stats() 与
+# recursive_upstream_stats(False) 的解码对象）；v1 顶层键序仅
+# v,zones,rec,stats（v 恒为 1，无 ru）；v0 旧格式顶层键序仅
+# v,zones,rec（v 恒为 0，无 stats 与 ru，迁移时补全）。文本上限
+# 16777216 码点（同区域文件上限）。
+_STATE_DUMP_KEYS = ["v", "zones", "rec", "stats", "ru"]
+_STATE_DUMP_KEYS_V1 = ["v", "zones", "rec", "stats"]
 _STATE_DUMP_KEYS_V0 = ["v", "zones", "rec"]
 _MAX_STATE_TEXT_LEN = 16777216
 # stats() JSON 的固定键序 h,m,x,u,c,l,r；加载时 c[1] 以 rec.items
 # 长度重算，r 以 h、m 重算，仅核对键序与字段形态。
 _STATS_KEYS = ["h", "m", "x", "u", "c", "l", "r"]
+# dump_state 内嵌 ru（recursive_upstream_stats 解码对象）的固定键序
+# l,t：l 固定 16 行（递归深度 0..15），每行 7 个非负整数；t 为 7
+# 整数数组且逐项等于 l 各行之和。
+_RU_KEYS = ["l", "t"]
+_RU_ROWS = _MAX_RECURSION_LEVELS
+_RU_COLUMNS = 7
 
 
 def _read_name(data, offset, boundaries):
@@ -3170,22 +3184,69 @@ def _check_state_stats(obj, rec_items):
     return h, m, x, u, c, l
 
 
-def migrate_state(text: str) -> str:
-    """把 v0/v1 整解析器状态文本完整校验并迁移为 v1 状态文本。
+def _check_state_ru(obj):
+    """结构与交叉校验 dump_state 内嵌 ru 的解码对象，返回 (l, t) 拷贝。
 
-    v1 顶层键序 v,zones,rec,stats（v=1），v0 顶层键序 v,zones,rec
-    （v=0，无 stats）；zones、rec 分别沿用 dump_zones()、dump_rec(now)
+    键序须恰为 l,t：l 固定为 16 行、每行恰 7 个非负非 bool 整数（对应
+    递归深度 0..15 的 [a,r,s,to,e,bad,ms]）；t 为恰 7 个非负非 bool
+    整数的数组，逐项等于 l 各列之和。形态、维度、值域或合计错误统一抛
+    ConfigError。返回 (l 各行拷贝, t)。
+    """
+    if not isinstance(obj, dict) or list(obj.keys()) != _RU_KEYS:
+        raise ConfigError("ru keys must be l,t")
+    rows = obj["l"]
+    if not isinstance(rows, list) or len(rows) != _RU_ROWS:
+        raise ConfigError("ru.l must contain 16 rows")
+
+    def cell(value):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError("ru.l items must be non-negative ints")
+        return value
+
+    checked_l = []
+    totals = [0] * _RU_COLUMNS
+    for row in rows:
+        if not isinstance(row, list) or len(row) != _RU_COLUMNS:
+            raise ConfigError("ru.l row must contain 7 ints")
+        copied = [cell(value) for value in row]
+        checked_l.append(copied)
+        for index in range(_RU_COLUMNS):
+            totals[index] += copied[index]
+    t_value = obj["t"]
+    if not isinstance(t_value, list) or len(t_value) != _RU_COLUMNS:
+        raise ConfigError("ru.t must contain 7 ints")
+    checked_t = [cell(value) for value in t_value]
+    if checked_t != totals:
+        raise ConfigError("ru.t must equal the column sums of ru.l")
+    return checked_l, checked_t
+
+
+def _zero_state_ru():
+    """构造补零用的 ru 对象：16 行全零与全零 t（均为新列表）。"""
+    rows = [[0] * _RU_COLUMNS for _ in range(_RU_ROWS)]
+    return rows, [0] * _RU_COLUMNS
+
+
+def migrate_state(text: str) -> str:
+    """把 v0/v1/v2 整解析器状态文本完整校验并迁移为规范 v2 状态文本。
+
+    v2 顶层键序 v,zones,rec,stats,ru（v=2）；v1 顶层键序
+    v,zones,rec,stats（v=1，无 ru）；v0 顶层键序 v,zones,rec（v=0，
+    无 stats 与 ru）。zones、rec 分别沿用 dump_zones()、dump_rec(now)
     的对象契约（schema 0/1 区域历史与递归缓存配置，含全部结构校验与
     区域快照、递归 RR 的语义校验）。v0 迁移补 stats：键序
     h,m,x,u,c,l,r，值依次为 [0,0,0,0]、0、0、[0,0,0]、
-    [0,rec.items 长度,256]、[0,0,0,0]、0.000000；v1 统计保持不变
-    （r 按 h、m 重算重写为等值 6 位小数）。输出为键序
-    v,zones,rec,stats 的 v1 文本：紧凑 ASCII JSON、整数十进制、
+    [0,rec.items 长度,256]、[0,0,0,0]、0.000000；v1/v2 stats 保持
+    不变（r 按 h、m 重算重写为等值 6 位小数）。v0/v1 迁移补全零 ru：
+    键序 l,t，l 为 16 行每行 7 个 0，t 为 7 个 0；v2 ru 完整校验：
+    l 固定 16 行每行 7 个非负非 bool 整数，t 为 7 个非负非 bool 整数
+    且逐项等于 l 各列之和，规范化后重写。输出为键序
+    v,zones,rec,stats,ru 的 v2 文本：紧凑 ASCII JSON、整数十进制、
     r 六位小数、末尾单换行，最多 16777216 字节。text 非 str 抛
     TypeError；text 超 16777216 码点、JSON 解析、重复键、键序、
-    未知 v 或结构错误抛 ConfigError；区域或 RR 语义错误沿用
-    ZoneError、RecordError。同输入逐字节一致，对迁移结果再次迁移
-    不变。
+    未知 v、ru 维度/值域/合计或其他结构错误抛 ConfigError；区域或 RR
+    语义错误沿用 ZoneError、RecordError。同输入逐字节一致，对迁移
+    结果再次迁移不变。
     """
     if not isinstance(text, str):
         raise TypeError("text must be str")
@@ -3199,11 +3260,13 @@ def migrate_state(text: str) -> str:
         raise ConfigError("state must be an object")
     keys = list(config.keys())
     if keys == _STATE_DUMP_KEYS:
+        expect = 2
+    elif keys == _STATE_DUMP_KEYS_V1:
         expect = 1
     elif keys == _STATE_DUMP_KEYS_V0:
         expect = 0
     else:
-        raise ConfigError("state keys must be v,zones,rec[,stats]")
+        raise ConfigError("state keys must be v,zones,rec[,stats[,ru]]")
     version = config["v"]
     if not isinstance(version, int) or isinstance(version, bool):
         raise ConfigError("v must be int")
@@ -3212,14 +3275,14 @@ def migrate_state(text: str) -> str:
     zones_obj, rec_obj = config["zones"], config["rec"]
     if not isinstance(zones_obj, dict) or not isinstance(rec_obj, dict):
         raise ConfigError("zones and rec must be objects")
-    # 三段结构层校验全部先于任何语义校验（与 load_state 同序）：
-    # zones 的 JSON 结构、rec 的配置结构与 v1 stats 的形态及交叉约束
-    # 错误统一为 ConfigError。
+    # 结构层校验全部先于任何语义校验（与 load_state 同序）：zones 的
+    # JSON 结构、rec 的配置结构、stats 的形态及交叉约束与 ru 的形态、
+    # 维度、值域及合计约束错误统一为 ConfigError。
     zones_text = json.dumps(zones_obj, ensure_ascii=True,
                             separators=(",", ":"))
     schema, _zversion, history = _parse_zones_config(zones_text)
     _clock, rec_items = _check_rec_config(rec_obj)
-    if expect == 1:
+    if expect >= 1:
         h, m, x, u, c, l_buckets = _check_state_stats(
             config["stats"], len(rec_items))
     else:
@@ -3227,6 +3290,11 @@ def migrate_state(text: str) -> str:
         h, m, x = [0, 0, 0, 0], 0, 0
         u, l_buckets = [0, 0, 0], [0, 0, 0, 0]
         c = [0, len(rec_items), _CACHE_CAPACITY]
+    if expect == 2:
+        ru_rows, ru_totals = _check_state_ru(config["ru"])
+    else:
+        # v0/v1 无递归逐层上游统计：补全为零值快照。
+        ru_rows, ru_totals = _zero_state_ru()
     # 区域快照语义沿用 load_zones（RecordError、ZoneError），递归 RR
     # 值域与 SOA 语义沿用 load_rec（RecordError）；全部通过后才组装。
     snapshot_loader = (_load_zone_snapshot if schema == 1
@@ -3238,10 +3306,13 @@ def migrate_state(text: str) -> str:
     for kind, _key, rrs in entries:
         if kind == "p" and any(rr[3] <= 0 for rr in rrs):
             raise RecordError("p rr ttl must be positive")
-    out = ('{"v":1,"zones":' + zones_text
+    out = ('{"v":2,"zones":' + zones_text
            + ',"rec":' + json.dumps(rec_obj, ensure_ascii=True,
                                      separators=(",", ":"))
            + ',"stats":' + _state_stats_text(h, m, x, u, c, l_buckets)
+           + ',"ru":' + json.dumps({"l": ru_rows, "t": ru_totals},
+                                   ensure_ascii=True,
+                                   separators=(",", ":"))
            + '}\n')
     # 紧凑 ASCII 文本字节数与码点数一致；整快照超 16MiB 拒绝输出。
     if len(out.encode("ascii")) > _MAX_STATE_TEXT_LEN:
@@ -3571,27 +3642,31 @@ class Resolver:
     不变）；version 为操作后修订号，result 为 "applied"、"unchanged"
     或 "conflict"。
 
-    dump_state(now)：导出区域历史、递归缓存与统计的整解析器快照，
-    只读。顶层键序仅 v,zones,rec,stats：v 恒为 1，zones、rec、stats
-    分别为 dump_zones()、dump_rec(now)、stats() 的解码对象（stats 的
-    c[1] 固定等于 rec.items 长度）。紧凑 ASCII JSON、末尾单换行，
-    最多 16777216 字节，超限抛 ConfigError。now 异常沿用 dump_rec
+    dump_state(now)：导出区域历史、递归缓存、统计与递归逐层上游统计的
+    整解析器快照，只读。顶层键序仅 v,zones,rec,stats,ru：v 恒为 2，
+    zones、rec、stats、ru 分别为 dump_zones()、dump_rec(now)、stats()、
+    recursive_upstream_stats(False) 的解码对象（stats 的 c[1] 固定等于
+    rec.items 长度；ru 键序 l,t，l 为 16 行每行 7 个非负整数，t 逐项
+    等于 l 各列之和）。紧凑 ASCII JSON、末尾单换行，最多 16777216
+    字节，超限抛 ConfigError。now 异常沿用 dump_rec
     （TypeError/CacheError）且只读；同状态同参逐字节相同。
 
-    load_state(text, plan, now, timeout=5)：类方法，接受 v0/v1 状态
-    文本，先经 migrate_state 完整校验并迁移为 v1 再恢复实例。zones
+    load_state(text, plan, now, timeout=5)：类方法，接受 v0/v1/v2 状态
+    文本，先经 migrate_state 完整校验并迁移为 v2 再恢复实例。zones
     沿用 load_zones（schema 0/1），rec 沿用 load_rec（按 now-rec.clock
     衰减并丢弃到期项），stats 为 stats() 解码对象：键序
     h,m,x,u,c,l,r，c[2] 固定 256、c[1] 固定等于 rec.items 长度且
     加载后按实际恢复条目数重算，r 须等于按 h、m 重算的 6 位小数
-    比值，其余沿用各自契约；v0（顶层键序 v,zones,rec，无 stats）
-    补零值统计。恢复区域修订历史与修订号、stats 计数、递归正负缓存、
-    FIFO 及最后成功时刻（now）；权威缓存为空，plan/timeout 取参数。
+    比值，ru 为 recursive_upstream_stats(False) 解码对象并按 l,t
+    恢复 16 行逐层计数，其余沿用各自契约；v0（顶层键序 v,zones,rec，
+    无 stats 与 ru）补零值统计与零值 ru，v1（无 ru）补零值 ru。恢复
+    区域修订历史与修订号、stats 计数、ru 计数、递归正负缓存、FIFO
+    及最后成功时刻（now）；权威缓存为空，plan/timeout 取参数。
     text 非 str 或 now 非 int（含 bool）抛 TypeError；text 超
-    16777216 码点、JSON、重复键、键序、未知 v 或交叉约束错抛
-    ConfigError；区域或 RR 语义错沿用 ZoneError、RecordError，余错
-    沿用 load_zones、load_rec 及构造器。任何失败都不产生实例；同态
-    同参逐字节一致。
+    16777216 码点、JSON、重复键、键序、未知 v、ru 维度/值域/合计或
+    交叉约束错抛 ConfigError；区域或 RR 语义错沿用 ZoneError、
+    RecordError，时钟错抛 CacheError，余错沿用 load_zones、load_rec
+    及构造器。任何失败都不产生实例；同态同参逐字节一致。
 
     save_state(path, now)：把 dump_state(now) 字节逐字节原子落盘，
     返回写入字节数。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
@@ -3606,12 +3681,12 @@ class Resolver:
     恢复等价解析器。path 非 str 抛 TypeError；path 为空串或含 NUL 抛
     ConfigError。最多读 16777217 字节：文件缺失抛 FileNotFoundError，
     其余 I/O 错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
-    ConfigError。解码后完全复用 load_state 的协议（接受 v0/v1 文本
-    并经 migrate_state 迁移；截断 JSON、重复键、未知 v 或状态结构错
-    抛 ConfigError，区域或 RR 语义错抛 ZoneError、RecordError）、
-    plan/timeout 校验、时钟衰减与其余异常；任何失败都不产生实例，
-    成功恢复区域历史与修订号、递归正负缓存、FIFO、统计与最后成功
-    时刻（now），权威缓存为空。
+    ConfigError。解码后完全复用 load_state 的协议（接受 v0/v1/v2 文本
+    并经 migrate_state 迁移为 v2；截断 JSON、重复键、未知 v、ru 维度/
+    值域/合计或状态结构错抛 ConfigError，区域或 RR 语义错抛
+    ZoneError、RecordError）、plan/timeout 校验、时钟衰减与其余异常；
+    任何失败都不产生实例，成功恢复区域历史与修订号、递归正负缓存、
+    FIFO、统计、ru 计数与最后成功时刻（now），权威缓存为空。
     """
 
     def __init__(self, zone: dict, plan: list, timeout: int = 5):
@@ -5358,11 +5433,13 @@ class Resolver:
         return len(new_order)
 
     def dump_state(self, now: int) -> str:
-        """导出区域历史、递归缓存与统计的整解析器快照（只读）。
+        """导出区域历史、递归缓存、统计与递归逐层上游统计的整解析器快照（只读）。
 
-        顶层键序仅 v,zones,rec,stats：v 恒为 1；zones、rec、stats 分别
-        为 dump_zones()、dump_rec(now)、stats() 文本的解码对象（stats
-        的 c[1] 固定等于 rec.items 长度）。输出为紧凑 ASCII JSON、整数
+        顶层键序仅 v,zones,rec,stats,ru：v 恒为 2；zones、rec、stats、ru
+        分别为 dump_zones()、dump_rec(now)、stats() 与
+        recursive_upstream_stats(False) 文本的解码对象（stats 的 c[1]
+        固定等于 rec.items 长度；ru 键序 l,t，l 为 16 行每行 7 个非负
+        整数，t 逐项等于 l 各列之和）。输出为紧凑 ASCII JSON、整数
         十进制、末尾单换行，最多 16777216 字节，超限抛 ConfigError。
         now 非 int 或为 bool 抛 TypeError；now<0 或早于上次成功结束
         时刻抛 CacheError（沿用 dump_rec 的 now 异常），均无副作用。
@@ -5378,8 +5455,10 @@ class Resolver:
         # 删除（stats() 的 c[1] 仍计全部 FIFO 条目），故内嵌对象以此
         # 为准改写；加载时该值再按实际恢复条目数重算。
         stats_obj["c"][1] = len(rec_obj["items"])
-        config = {"v": 1, "zones": zones_obj, "rec": rec_obj,
-                  "stats": stats_obj}
+        # ru 取只读快照（reset=False），不改变递归逐层上游计数。
+        ru_obj = json.loads(self.recursive_upstream_stats(False))
+        config = {"v": 2, "zones": zones_obj, "rec": rec_obj,
+                  "stats": stats_obj, "ru": ru_obj}
         text = json.dumps(config, ensure_ascii=True,
                           separators=(",", ":")) + "\n"
         # 紧凑 ASCII 文本字节数与码点数一致；整快照超 16MiB 拒绝导出。
@@ -5392,44 +5471,47 @@ class Resolver:
                    timeout: int = 5) -> "Resolver":
         """从 dump_state 快照校验全部内容后恢复等价解析器实例。
 
-        接受 v1（顶层键序 v,zones,rec,stats，v=1）与 v0（顶层键序
-        v,zones,rec，v=0，无 stats）文本：先经 migrate_state 完整校验
-        并迁移为 v1（zones 沿用 load_zones 契约，rec 沿用 load_rec
-        结构契约，区域快照与递归 RR 语义、v1 stats 形态及交叉约束均
-        在其中校验；v0 补零值统计，c[1] 等于 rec.items 长度），再按
-        now 规则恢复：rec 按 now-rec.clock 衰减并丢弃到期项，stats
-        键序 h,m,x,u,c,l,r、c[2]=256、c[1] 固定等于 rec.items 长度
-        且加载后按实际恢复条目数重算，r 须等于按 h、m 重算的 6 位
-        小数比值。先校验全部内容再构造实例：恢复区域修订历史与修订号、
-        stats 各计数及递归正负缓存、FIFO 与最后成功时刻（按 now
-        恢复）；权威缓存为空，plan、timeout 取参数，rated 与清理
-        计数清零。text 非 str 或 now 非 int（含 bool）抛 TypeError；
-        text 超 16777216 码点、JSON 解析、重复键、键序、未知 v 或
-        交叉约束错误抛 ConfigError；区域或 RR 语义错误沿用 ZoneError、
-        RecordError，时钟错误抛 CacheError，plan/timeout 错误沿用
-        构造器（TypeError/ValueError）。任何失败都不产生实例；同态
-        同参逐字节一致。
+        接受 v2（顶层键序 v,zones,rec,stats,ru，v=2）、v1（顶层键序
+        v,zones,rec,stats，v=1，无 ru）与 v0（顶层键序 v,zones,rec，
+        v=0，无 stats 与 ru）文本：先经 migrate_state 完整校验并迁移
+        为 v2（zones 沿用 load_zones 契约，rec 沿用 load_rec 结构契约，
+        区域快照与递归 RR 语义、stats 形态及交叉约束、ru 维度/值域/
+        合计均在其中校验；v0 补零值 stats，c[1] 等于 rec.items 长度；
+        v0/v1 补零值 ru），再按 now 规则恢复：rec 按 now-rec.clock
+        衰减并丢弃到期项，stats 键序 h,m,x,u,c,l,r、c[2]=256、c[1]
+        固定等于 rec.items 长度且加载后按实际恢复条目数重算，r 须等于
+        按 h、m 重算的 6 位小数比值，ru 按 l,t 恢复 16 行逐层计数。
+        先校验全部内容再构造实例：恢复区域修订历史与修订号、stats 各
+        计数、递归逐层上游计数及递归正负缓存、FIFO 与最后成功时刻
+        （按 now 恢复）；权威缓存为空，plan、timeout 取参数，rated 与
+        清理计数清零。text 非 str 或 now 非 int（含 bool）抛 TypeError；
+        text 超 16777216 码点、JSON 解析、重复键、键序、未知 v、ru
+        维度/值域/合计或交叉约束错误抛 ConfigError；区域或 RR 语义错误
+        沿用 ZoneError、RecordError，时钟错误抛 CacheError，plan/
+        timeout 错误沿用构造器（TypeError/ValueError）。任何失败都不
+        产生实例；同态同参逐字节一致。
         """
         if not isinstance(text, str):
             raise TypeError("text must be str")
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
-        # 与 load_state_file 共用迁移：v0/v1 文本先经 migrate_state
-        # 完整校验（结构、区域快照与递归 RR 语义）并规范化为 v1 文本，
-        # 此处的结构重校验恒通过；随后仅按 now 规则做时钟校验、衰减
-        # 与恢复。
+        # 与 load_state_file 共用迁移：v0/v1/v2 文本先经 migrate_state
+        # 完整校验（结构、区域快照与递归 RR 语义、stats 与 ru 交叉约束）
+        # 并规范化为 v2 文本，此处的结构重校验恒通过；随后仅按 now 规则
+        # 做时钟校验、衰减与恢复。
         config = json.loads(migrate_state(text),
                             object_pairs_hook=_config_pairs)
-        zones_obj, rec_obj, stats_obj = (
-            config["zones"], config["rec"], config["stats"])
-        # 三段结构层校验全部先于任何语义校验：zones 的 JSON 结构、rec 的
-        # 配置结构与 stats 的形态及交叉约束错误统一为 ConfigError。
+        zones_obj, rec_obj, stats_obj, ru_obj = (
+            config["zones"], config["rec"], config["stats"], config["ru"])
+        # 结构层校验全部先于任何语义校验：zones 的 JSON 结构、rec 的
+        # 配置结构、stats 与 ru 的形态及交叉约束错误统一为 ConfigError。
         zones_text = json.dumps(zones_obj, ensure_ascii=True,
                                 separators=(",", ":"))
         schema, _zversion, history = _parse_zones_config(zones_text)
         clock, rec_items = _check_rec_config(rec_obj)
         h, m, x, u, c, l_buckets = _check_state_stats(
             stats_obj, len(rec_items))
+        ru_rows, _ru_totals = _check_state_ru(ru_obj)
         # zones 快照语义沿用 load_zones：先校验全部快照再恢复（结构错误
         # 已在上一步排除，语义错误沿用 RecordError、ZoneError）。
         snapshot_loader = (_load_zone_snapshot if schema == 1
@@ -5467,6 +5549,8 @@ class Resolver:
         instance._stats_u = u
         instance._stats_l = l_buckets
         instance._stats_c0 = c[0]
+        # 递归逐层上游计数随快照恢复（16 行七列）；权威缓存仍为空。
+        instance._recursive_up = ru_rows
         return instance
 
     def save_state(self, path: str, now: int) -> int:
@@ -5501,13 +5585,13 @@ class Resolver:
         path 非 str 抛 TypeError；path 为空串或含 NUL 抛 ConfigError。
         最多读取 16777217 字节：文件缺失抛 FileNotFoundError，其余 I/O
         错抛 OSError；内容超过 16777216 字节或含非 ASCII 字节抛
-        ConfigError。解码后完全沿用 load_state：接受 v0/v1 状态文本并
-        经 migrate_state 迁移（截断 JSON、重复键、键序、未知 v 或状态
-        结构错抛 ConfigError，区域或 RR 语义错抛 ZoneError、
-        RecordError），plan/timeout 校验、时钟衰减与其余异常
+        ConfigError。解码后完全沿用 load_state：接受 v0/v1/v2 状态文本并
+        经 migrate_state 迁移为 v2（截断 JSON、重复键、键序、未知 v、ru
+        维度/值域/合计或状态结构错抛 ConfigError，区域或 RR 语义错抛
+        ZoneError、RecordError），plan/timeout 校验、时钟衰减与其余异常
         （CacheError 及构造器 TypeError/ValueError）均与其一致；任何
         失败都不产生实例。成功恢复区域修订历史与修订号、递归正负缓存、
-        FIFO、统计与最后成功时刻，权威缓存为空。
+        FIFO、统计、ru 计数与最后成功时刻，权威缓存为空。
         """
         if not isinstance(path, str):
             raise TypeError("path must be str")
@@ -5538,11 +5622,11 @@ class Resolver:
         候选修订号小于当前修订号抛 ConfigError；候选 dump_state(now) 与
         当前 dump_state(now) 相同报告 unchanged（版本与状态不变）；不同
         则原子替换区域修订历史、修订号、递归正负缓存、FIFO、最后成功
-        时刻与统计，权威缓存清空（随候选为空），rated 与清理计数归零，
-        保留 plan 与 timeout，报告 applied。报告键序仅 version,result
-        （version 为操作后修订号，result 为 "applied"、"unchanged" 或
-        "conflict"），紧凑 ASCII JSON、十进制整数、末尾单换行。异常与
-        非 applied 结果均不改变任何状态。
+        时刻、统计与 ru 计数，权威缓存清空（随候选为空），rated 与清理
+        计数归零，保留 plan 与 timeout，报告 applied。报告键序仅
+        version,result（version 为操作后修订号，result 为 "applied"、
+        "unchanged" 或 "conflict"），紧凑 ASCII JSON、十进制整数、末尾
+        单换行。异常与非 applied 结果均不改变任何状态。
         """
         if not isinstance(text, str):
             raise TypeError("text must be str")
@@ -5573,8 +5657,8 @@ class Resolver:
         构造候选实例；候选提交与 reload_state 共用同一路径：候选修订号
         小于当前修订号抛 ConfigError，候选 dump_state(now) 与当前相同
         报告 unchanged，否则原子替换区域修订历史、修订号、递归正负
-        缓存、FIFO、最后成功时刻与统计，清空权威缓存，rated 与清理
-        计数归零，保留 plan 与 timeout，报告 applied。报告键序仅
+        缓存、FIFO、最后成功时刻、统计与 ru 计数，清空权威缓存，rated
+        与清理计数归零，保留 plan 与 timeout，报告 applied。报告键序仅
         version,result，紧凑 ASCII JSON、末尾单换行；异常与非 applied
         结果均不改变任何状态。
         """
@@ -5606,8 +5690,8 @@ class Resolver:
             # 规范化后内容一致：不替换、不改版本与任何状态。
             return self._tx_report(self._revision, "unchanged")
         # 全部校验成功后原子提交：区域历史、修订号、递归正负缓存、FIFO、
-        # 最后成功时刻与统计随候选一并替换；权威缓存随候选为空；rated、
-        # 逐上游与清理计数归零；plan 与 timeout 保留。
+        # 最后成功时刻、统计与 ru 计数随候选一并替换；权威缓存随候选为
+        # 空；rated、逐上游与清理计数归零；plan 与 timeout 保留。
         self._cache = candidate._cache
         self._revision = candidate._revision
         self._zone_history = candidate._zone_history
@@ -5625,10 +5709,9 @@ class Resolver:
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
-        # 递归逐层上游统计与 rated/逐上游统计同为不入 dump_state 的操作
-        # 性计数，状态换入时随之归零（候选实例自身亦为全零）。
-        self._recursive_up = [
-            [0, 0, 0, 0, 0, 0, 0] for _ in range(_MAX_RECURSION_LEVELS)]
+        # 递归逐层上游统计现已入 dump_state：随候选快照一并恢复（不再
+        # 归零）；rated、逐上游与清理计数仍为不入快照的操作性计数。
+        self._recursive_up = candidate._recursive_up
         self._clean_expired = [0, 0]
         self._clean_evicted = [0, 0]
         return self._tx_report(self._revision, "applied")
