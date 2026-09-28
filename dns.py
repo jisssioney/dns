@@ -4,6 +4,8 @@
 - MessageError: 报文格式错误（ValueError 子类）。
 - EDNSError: EDNS 查询截断、尾随、名字非法、AN/NS 非空或 AR/OPT
   （含 OPT 选项 TLV）非法、模型含 OPT（MessageError 子类）。
+- CookieError: EDNS COOKIE 查询非版本 0、COOKIE 数量或 data 长度不符、
+  secret 长度非 16..64 或 client 非合法 IPv4/IPv6（EDNSError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
@@ -17,6 +19,11 @@
 - edns(query: bytes, model: dict, rcode: int = 0, options: list | None = None)
   -> bytes: 编码可含 OPT（查询 RDATA 按选项 TLV 解析）的 EDNS 应答报文；
   OPT 版本 1..255 时返回 BADVERS 版本协商应答。
+- edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
+  rcode: int = 0) -> bytes: 编码带 EDNS(0) COOKIE（码 10）的应答；查询
+  须为版本 0 且恰有一个 COOKIE（8 字节客户端值，或后接 16 字节服务端
+  值），应答 OPT 仅回写码 10（客户端值加新服务端值，其他选项不回
+  显），服务端值不符时清空三段并以扩展 RCODE 23 应答。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -246,6 +253,8 @@
 from bisect import bisect_right
 from collections import deque
 import copy
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -259,6 +268,10 @@ class MessageError(ValueError):
 
 class EDNSError(MessageError):
     """EDNS 报文无法解码：AR/OPT（含选项 TLV）非法、截断、尾随或模型含 OPT。"""
+
+
+class CookieError(EDNSError):
+    """EDNS COOKIE 非法：版本非 0、COOKIE 数量或 data 长度不符、密钥长度或客户端地址非法。"""
 
 
 class ZoneError(ValueError):
@@ -424,6 +437,18 @@ _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
 _RCODE_BADVERS = 16
+# EDNS(0) COOKIE（选项码 10）：版本 0 查询恰有一个 COOKIE，data 为
+# 8 字节客户端值，或其后再跟 16 字节服务端值；应答仅回写码 10。服务
+# 端值为 HMAC-SHA256(secret, family+packed+客户端值) 前 16 字节，
+# family 单字节 0x04/0x06；secret 限 16..64 字节。
+_OPT_CODE_COOKIE = 10
+_COOKIE_CLIENT_LEN = 8
+_COOKIE_SERVER_LEN = 16
+_COOKIE_FAMILY_IPV4 = 0x04
+_COOKIE_FAMILY_IPV6 = 0x06
+_COOKIE_MIN_SECRET = 16
+_COOKIE_MAX_SECRET = 64
+_RCODE_BADCOOKIE = 23
 _CACHE_CAPACITY = 256
 # 区域修订历史容量：每个成功换区修订保存一份规范化区域深拷贝，
 # 超量淘汰最小修订号；修订号单调递增、不复用。
@@ -1262,6 +1287,93 @@ def edns(query: bytes, model: dict, rcode: int = 0,
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
+
+
+def _server_cookie(secret, family, packed, client_cookie):
+    """计算服务端 COOKIE：HMAC-SHA256(secret, family+packed+客户端值) 前 16 字节。
+
+    family 为单字节地址族（0x04/0x06），packed 为客户端 IP 的定长二进制。
+    """
+    message = bytes((family,)) + packed + client_cookie
+    return hmac.new(secret, message, hashlib.sha256).digest()[
+        :_COOKIE_SERVER_LEN]
+
+
+def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
+                rcode: int = 0) -> bytes:
+    """把携带 EDNS(0) COOKIE（选项码 10）的查询编码为带 COOKIE 的应答。
+
+    query/model/rcode 的契约沿用 edns：query 非 bytes、rcode 非非 bool
+    整数抛 TypeError；模型类型错抛 TypeError、键序或 RR 非法抛
+    RecordError；报文截断、尾随、名字非法、AN/NS 非空或 AR/OPT 非法抛
+    EDNSError；QR 置位、limit 越界等抛 EncodeError；OPT 不删，普通 RR
+    超限尾删并置 TC 沿用 edns。secret 非 bytes 或 client 非 str 抛
+    TypeError；secret 长度非 16..64、client 非合法 IPv4/IPv6 抛
+    CookieError（CookieError 为 EDNSError 子类）。
+
+    查询 OPT 须为版本 0 且选项中恰有一个码 10 COOKIE（无 OPT、版本非
+    0、COOKIE 缺失或多于一个均抛 CookieError，不触发版本协商）；其
+    data 须恰为 8 字节客户端值，或 8 字节客户端值后接 16 字节服务端
+    值，其余长度抛 CookieError；查询携带的其他选项一律不回显。服务端
+    值为 HMAC-SHA256(secret, family+packed+客户端值) 前 16 字节，
+    family 是单字节 0x04（IPv4）或 0x06（IPv6），packed 由 ipaddress
+    取定长二进制。未带服务端值或其与期望值一致时，按 model、rcode 正常
+    应答；不一致时先完成 model 校验，再清空 an/ns/ar 并以扩展 RCODE
+    23 应答（头部低 4 位为 7）。两种应答的末项 OPT 均回显 CLASS、DO、
+    版本 0，RDATA 仅含码 10，data 为原客户端值加新算出的服务端值；同
+    参逐字节一致。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    _check_int(rcode, "rcode")
+    if not isinstance(secret, bytes):
+        raise TypeError("secret must be bytes")
+    if not isinstance(client, str):
+        raise TypeError("client must be str")
+    if not _COOKIE_MIN_SECRET <= len(secret) <= _COOKIE_MAX_SECRET:
+        raise CookieError("secret length must be 16..64 bytes")
+    try:
+        address = ipaddress.ip_address(client)
+    except ValueError:
+        raise CookieError("client must be a valid IPv4/IPv6 address") from None
+    an, ns, ar, limit = _validate_model(model)
+    msg, opt = _decode_edns_query(query)
+    for section in (an, ns, ar):
+        if any(rr[1] == _TYPE_OPT for rr in section):
+            raise EDNSError("model must not contain OPT records")
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    if opt is None or opt[1] != 0:
+        raise CookieError("cookie query must contain one version-0 OPT")
+    cookies = [data for code, data in opt[3] if code == _OPT_CODE_COOKIE]
+    if len(cookies) != 1:
+        raise CookieError("query must contain exactly one COOKIE option")
+    cookie_data = cookies[0]
+    if len(cookie_data) == _COOKIE_CLIENT_LEN:
+        client_cookie = cookie_data
+        supplied_server = None
+    elif len(cookie_data) == _COOKIE_CLIENT_LEN + _COOKIE_SERVER_LEN:
+        client_cookie = cookie_data[:_COOKIE_CLIENT_LEN]
+        supplied_server = cookie_data[_COOKIE_CLIENT_LEN:]
+    else:
+        raise CookieError("COOKIE data must be 8 or 24 bytes")
+    if isinstance(address, ipaddress.IPv4Address):
+        family = _COOKIE_FAMILY_IPV4
+    else:
+        family = _COOKIE_FAMILY_IPV6
+    server_cookie = _server_cookie(secret, family, address.packed,
+                                   client_cookie)
+    if supplied_server is not None and not hmac.compare_digest(
+            supplied_server, server_cookie):
+        # 服务端值不符：model 已校验通过；清空三段并以扩展 RCODE 23
+        # （BADCOOKIE）应答，limit 沿用 model。
+        model = {"an": [], "ns": [], "ar": [], "limit": limit}
+        rcode = _RCODE_BADCOOKIE
+    options = [{"code": _OPT_CODE_COOKIE,
+                "data": client_cookie + server_cookie}]
+    return edns(query, model, rcode, options)
 
 
 def _labels_to_name(labels):
