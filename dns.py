@@ -29,12 +29,13 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/
-  CAA/SOA、
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/
+  CDNSKEY/CAA/SOA、
   class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
 - export_master(zone: dict) -> str: 把仅含
-  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/CAA/SOA、
+  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/CAA/
+  SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数/Base64/十六进制摘要、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
@@ -549,6 +550,7 @@ _TYPE_AAAA = 28
 _TYPE_SRV = 33
 _TYPE_NAPTR = 35
 _TYPE_DS = 43
+_TYPE_RRSIG = 46
 _TYPE_NSEC = 47
 _TYPE_DNSKEY = 48
 _TYPE_CDS = 59
@@ -2169,7 +2171,7 @@ _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
                  "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
                  "NAPTR": _TYPE_NAPTR, "DS": _TYPE_DS,
-                 "NSEC": _TYPE_NSEC,
+                 "RRSIG": _TYPE_RRSIG, "NSEC": _TYPE_NSEC,
                  "DNSKEY": _TYPE_DNSKEY, "CDS": _TYPE_CDS,
                  "CDNSKEY": _TYPE_CDNSKEY, "CAA": _TYPE_CAA,
                  "SOA": _TYPE_SOA}
@@ -2549,7 +2551,8 @@ def _master_parse_nsec_rdata(rest):
 
     rest 为行中 TYPE 之后的原文，至少两个以 ASCII 空白分隔的 token：
     'next types...'；types 为 1..256 个互异的大写 TYPE 助记符（限当前
-    已支持类型及 NSEC）。字段数、助记符或重复类型错抛 ConfigError。
+    已支持类型及 NSEC、RRSIG）。字段数、助记符或重复类型错抛
+    ConfigError。
     """
     parts = rest.split()
     if len(parts) < 2:
@@ -2629,7 +2632,7 @@ def _master_decode_nsec_rdata(rdata):
     rdata 须恰为一个未压缩、0 结尾的小写绝对名后接至少一个位图块；
     每块为窗口号、长度各一字节与 1..32 字节位图，窗口严格升序且不
     重复，长度恰覆盖该窗最高类型（末字节非 0），置位类型须为当前已
-    支持类型或 NSEC。压缩名、截断、尾随、未知类型、空位图、窗口不
+    支持类型或 NSEC、RRSIG。压缩名、截断、尾随、未知类型、空位图、窗口不
     升序或重复、长度越界或末字节为 0 抛 RecordError。
     """
     next_labels, pos = _master_decode_nsec_name(rdata)
@@ -2662,6 +2665,188 @@ def _master_decode_nsec_rdata(rdata):
                     codes.append(code)
         pos += length
     return next_labels, codes
+
+
+_RRSIG_MONTH_DAYS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _master_rrsig_leap_year(year):
+    """公历闰年判定：能被 4 整除且不能被 100 整除，或能被 400 整除。"""
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _master_days_from_civil(year, month, day):
+    """公历日期 -> 自 1970-01-01 的天数（可负；Howard Hinnant 算法）。"""
+    year -= month <= 2
+    era = year // 400
+    yoe = year - era * 400
+    mp = (month + 9) % 12
+    doy = (153 * mp + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _master_civil_from_days(days):
+    """自 1970-01-01 的天数 -> (year, month, day)（上函数之逆）。"""
+    z = days + 719468
+    era = z // 146097
+    doe = z - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    year = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    day = doy - (153 * mp + 2) // 5 + 1
+    month = mp + 3 if mp < 10 else mp - 9
+    return year + (month <= 2), month, day
+
+
+def _master_parse_rrsig_time(token):
+    """把 14 位 UTC 公历时间 token 解析为自 1970-01-01T00:00:00Z 的 uint32 秒。
+
+    token 须恰为 14 个 ASCII 数字 YYYYMMDDHHMMSS 且为合法公历时间
+    （月份 1..12、日 1..当月天数含闰年、时 0..23、分 0..59、秒 0..59，
+    拒绝闰秒），对应时刻须在 19700101000000..21060207062815（即
+    0..4294967295 秒，不回绕）内；任何不符抛 ConfigError。
+    """
+    if len(token) != 14 or not token.isascii() or not token.isdigit():
+        raise ConfigError("rrsig time must be 14 digits")
+    year = int(token[0:4])
+    month = int(token[4:6])
+    day = int(token[6:8])
+    hour = int(token[8:10])
+    minute = int(token[10:12])
+    second = int(token[12:14])
+    if not 1 <= month <= 12:
+        raise ConfigError("rrsig time month out of range")
+    month_days = _RRSIG_MONTH_DAYS[month - 1]
+    if month == 2 and _master_rrsig_leap_year(year):
+        month_days = 29
+    if not 1 <= day <= month_days:
+        raise ConfigError("rrsig time day out of range")
+    if hour > 23 or minute > 59 or second > 59:
+        raise ConfigError("rrsig time out of range")
+    seconds = (_master_days_from_civil(year, month, day) * 86400
+               + hour * 3600 + minute * 60 + second)
+    if not 0 <= seconds <= 0xFFFFFFFF:
+        raise ConfigError("rrsig time out of range")
+    return seconds
+
+
+def _master_format_rrsig_time(seconds):
+    """把 uint32 秒逆算为 14 位 UTC 公历时间文本（导出用）。"""
+    days, rem = divmod(seconds, 86400)
+    year, month, day = _master_civil_from_days(days)
+    hour, rem = divmod(rem, 3600)
+    minute, second = divmod(rem, 60)
+    return "%04d%02d%02d%02d%02d%02d" % (year, month, day, hour,
+                                         minute, second)
+
+
+def _master_parse_rrsig_rdata(rest):
+    """把 RRSIG rdata 原文解析为 (covered 类型码, algorithm, labels,
+    original ttl, expiration, inception, keytag, signer token, signature)。
+
+    rest 为行中 TYPE 之后的原文，恰为九个以 ASCII 空白分隔的 token：
+    'covered algorithm labels originalttl expiration inception keytag
+    signer signature'。covered 为除 RRSIG 外当前已支持的大写 TYPE
+    助记符；algorithm、labels 为允许前导零的 uint8，originalttl 为
+    允许前导零的 uint32，keytag 为允许前导零的 uint16；expiration、
+    inception 为 14 位 UTC 公历时间（见 _master_parse_rrsig_time）；
+    signer 为 "@" 或小写绝对名（此处仅返回原文 token，名称校验由
+    调用方完成）；signature 为解码非空的规范 RFC4648 Base64。字段数、
+    助记符、整数、日期或 Base64 错抛 ConfigError。
+    """
+    parts = rest.split()
+    if len(parts) != 9:
+        raise ConfigError("RRSIG rdata must contain 9 fields")
+    covered = _MASTER_TYPES.get(parts[0])
+    if covered is None or covered == _TYPE_RRSIG:
+        raise ConfigError("RRSIG covered type mnemonic not supported")
+    algorithm = _master_parse_uint8(parts[1])
+    labels = _master_parse_uint8(parts[2])
+    original_ttl = _master_parse_uint32(parts[3])
+    expiration = _master_parse_rrsig_time(parts[4])
+    inception = _master_parse_rrsig_time(parts[5])
+    keytag = _master_parse_uint16(parts[6])
+    signature = _master_parse_canonical_b64(parts[8])
+    return (covered, algorithm, labels, original_ttl, expiration,
+            inception, keytag, parts[7], signature)
+
+
+def _master_rrsig_rdata(covered, algorithm, labels, original_ttl,
+                        expiration, inception, keytag, signer_labels,
+                        signature):
+    """把 RRSIG 字段编码为 rdata：前七项按网络序（两字节覆盖类型、
+    一字节算法、一字节标签数、四字节原 TTL、四字节到期、四字节起始、
+    两字节密钥标签），后接未压缩 0 结尾签名者与签名原始字节。"""
+    return (covered.to_bytes(2, "big") + bytes((algorithm, labels))
+            + original_ttl.to_bytes(4, "big")
+            + expiration.to_bytes(4, "big")
+            + inception.to_bytes(4, "big")
+            + keytag.to_bytes(2, "big")
+            + _master_wire_name(signer_labels) + signature)
+
+
+def _master_decode_rrsig_name(rdata, pos):
+    """从 rdata[pos] 起解码未压缩、0 结尾的小写绝对名，返回 (标签列表, 名后偏移)。
+
+    标签 1..63、总长 ≤255、仅小写字母/数字/下划线/连字符，含大写 ASCII
+    即抛 RecordError（不得小写化，否则破坏逐字节往返）；压缩指针（长度
+    字节 >63）、截断与非法字符均抛 RecordError。名后的签名不在此解码。
+    """
+    labels = []
+    wire_len = 1
+    while True:
+        if pos >= len(rdata):
+            raise RecordError("rrsig signer not terminated")
+        length = rdata[pos]
+        if length == 0:
+            return labels, pos + 1
+        if length > _MAX_LABEL_LEN:
+            raise RecordError("rrsig signer bad label length")
+        pos += 1
+        if pos + length > len(rdata):
+            raise RecordError("rrsig signer truncated")
+        try:
+            label = rdata[pos:pos + length].decode("ascii")
+        except UnicodeDecodeError:
+            raise RecordError("rrsig signer label not ascii") from None
+        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
+               for ch in label):
+            raise RecordError("rrsig signer invalid label character")
+        labels.append(label)
+        pos += length
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("rrsig signer name too long")
+
+
+def _master_decode_rrsig_rdata(rdata):
+    """解码 RRSIG rdata 为 (covered 类型码, algorithm, labels, original ttl,
+    expiration, inception, keytag, signer 标签列表, signature bytes)。
+
+    rdata 须恰为 18 字节网络序前七项、一个未压缩、0 结尾的小写绝对名
+    （标签仅小写，含大写即 RecordError）与 1..65517 字节签名，总长
+    ≤65535；覆盖类型须为除 RRSIG 外当前已支持的类型。截断、压缩、
+    空签名、覆盖类型不支持或名称非法抛 RecordError。
+    """
+    if len(rdata) < 18:
+        raise RecordError("rrsig rdata truncated")
+    covered = int.from_bytes(rdata[0:2], "big")
+    if covered not in _NSEC_TYPE_NAMES or covered == _TYPE_RRSIG:
+        raise RecordError("rrsig covered type not supported")
+    algorithm = rdata[2]
+    labels = rdata[3]
+    original_ttl = int.from_bytes(rdata[4:8], "big")
+    expiration = int.from_bytes(rdata[8:12], "big")
+    inception = int.from_bytes(rdata[12:16], "big")
+    keytag = int.from_bytes(rdata[16:18], "big")
+    signer, pos = _master_decode_rrsig_name(rdata, 18)
+    signature = bytes(rdata[pos:])
+    if not signature:
+        raise RecordError("rrsig signature empty")
+    return (covered, algorithm, labels, original_ttl, expiration,
+            inception, keytag, signer, signature)
 
 
 def _master_parse_name(token, allow_wildcard=False):
@@ -2712,8 +2897,8 @@ def import_master(text: str) -> dict:
     mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
     的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
     "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
-    "DS"（43）、"NSEC"（47）、"DNSKEY"（48）、"CDS"（59）、
-    "CDNSKEY"（60）、"CAA"（257）或 "SOA"（6），
+    "DS"（43）、"RRSIG"（46）、"NSEC"（47）、"DNSKEY"（48）、
+    "CDS"（59）、"CDNSKEY"（60）、"CAA"（257）或 "SOA"（6），
     仅接受 class "IN"；ttl、MX preference、SRV 的 priority/weight/port
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
     整数（uint32 为 0..4294967295，uint16 为 0..65535）；A 的 rdata
@@ -2746,18 +2931,30 @@ def import_master(text: str) -> dict:
     接受，此时四字段文本须恰为 '0 0 0 00'、rdata 为五个零字节
     （00 00 00 00 00），DS 不接受 digesttype 0；NSEC rdata 为
     'next types...'：next 为 "@" 或不含通配的小写绝对名，types 为
-    1..256 个互异的大写 TYPE 助记符（限当前已支持类型及 NSEC），
+    1..256 个互异的大写 TYPE 助记符（限当前已支持类型及 NSEC、
+    RRSIG），
     next 写为未压缩、0 结尾的线格式名，类型按数值升序编码为
     RFC4034 位图，每块为窗口号、长度各一字节及位图，窗口严格升序
     且非空，长度为覆盖该窗最高类型所需的 1..32 字节，类型号低八位
-    按高位优先置位；rdata
+    按高位优先置位；RRSIG rdata 为 'covered algorithm labels
+    originalttl expiration inception keytag signer signature'：
+    covered 为除 RRSIG 外当前已支持的大写 TYPE 助记符，algorithm、
+    labels 为允许前导零的 uint8，originalttl 为允许前导零的 uint32，
+    keytag 为允许前导零的 uint16，expiration、inception 为
+    19700101000000..21060207062815 内合法的 14 位 UTC 公历时间
+    （秒 00..59，拒绝闰秒），各编码为自 1970-01-01T00:00:00Z 起
+    不回绕的网络序 uint32 秒，signer 为 "@" 或不含通配的小写绝对名
+    （写为未压缩、0 结尾线格式），signature 为解码非空的规范
+    RFC4648 Base64；rdata 依次为网络序两字节覆盖类型、一字节算法、
+    一字节标签数、四字节原 TTL、四字节到期、四字节起始、两字节
+    密钥标签、签名者线格式名与签名原始字节；rdata
     总长 ≤65535。返回记录键序
     name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
     并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、CNAME
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
-    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、Base64、
-    删除标记、digesttype、十六进制字符或摘要长度、tag、NSEC 助记符/
-    重复类型/总长或 IP 错误抛
+    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、日期、
+    Base64、删除标记、digesttype、十六进制字符或摘要长度、tag、
+    NSEC/RRSIG 助记符/重复类型/总长或 IP 错误抛
     ConfigError；名称及 rdata 错误抛 RecordError；zone 约束
     错误抛 ZoneError。时空复杂度为 O(字符数+记录数+类型数)。
     """
@@ -2796,7 +2993,7 @@ def import_master(text: str) -> dict:
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
                 "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
-                "DS, NSEC, DNSKEY, CDS, CDNSKEY, CAA or SOA")
+                "DS, RRSIG, NSEC, DNSKEY, CDS, CDNSKEY, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2901,6 +3098,19 @@ def import_master(text: str) -> dict:
             rdata = _master_nsec_rdata(next_labels, nsec_codes)
             if len(rdata) > _MAX_RDATA_LEN:
                 raise ConfigError("NSEC rdata too long")
+        elif rrtype == _TYPE_RRSIG:
+            (covered, algorithm, rrsig_labels, original_ttl, expiration,
+             inception, keytag, signer_token,
+             signature) = _master_parse_rrsig_rdata(rdata_rest)
+            if signer_token == "@":
+                signer_labels = origin_labels
+            else:
+                signer_labels = _master_parse_name(signer_token)
+            rdata = _master_rrsig_rdata(covered, algorithm, rrsig_labels,
+                                        original_ttl, expiration, inception,
+                                        keytag, signer_labels, signature)
+            if len(rdata) > _MAX_RDATA_LEN:
+                raise ConfigError("RRSIG rdata too long")
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_parse_caa_rdata(rdata_rest)
             rdata = _master_caa_rdata(flags, tag, value)
@@ -3160,7 +3370,8 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/CAA/SOA
+    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/
+    CAA/SOA
     的记录。输出首行
     "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
@@ -3192,15 +3403,24 @@ def export_master(zone: dict) -> str:
     未压缩、0 结尾且无尾随的小写绝对名（标签仅小写，含大写即
     RecordError）后接至少一个 RFC4034 位图块：每块为窗口号、长度各
     一字节与 1..32 字节位图，窗口严格升序且不重复、末字节非 0，置位
-    类型须为当前已支持类型或 NSEC；按 'next types...' 输出，next 等于
-    origin 时写 "@"，类型按类型码升序写助记符；CAA rdata 须恰为
+    类型须为当前已支持类型或 NSEC、RRSIG；按 'next types...' 输出，
+    next 等于
+    origin 时写 "@"，类型按类型码升序写助记符；RRSIG rdata 须恰为
+    网络序两字节覆盖类型（须为除 RRSIG 外当前已支持类型）、一字节
+    算法、一字节标签数、四字节原 TTL、四字节到期、四字节起始、
+    两字节密钥标签，后接未压缩、0 结尾且无尾随的小写绝对名签名者
+    （标签仅小写，含大写即 RecordError）与 1..65517 字节签名；按
+    'covered algorithm labels originalttl expiration inception
+    keytag signer signature' 输出，整数无前导零，两时间按 14 位
+    UTC 公历数逆算输出，signer 等于 origin 时写 "@"，签名以规范
+    RFC4648 Base64（无空白）输出；CAA rdata 须恰为
     一字节 flags、一字节 tag 长度（1..15）、tag 与 value，按
     'flags tag "value"' 输出，value 可为空。引号串内双引号与反斜杠
     写转义形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD。
     对导出结果再 import_master 得到等价 zone；同一 zone 多次导出逐字节
     一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误
     （含截断、尾随、protocol、digesttype/删除标记/摘要长度、tag/长度、
-    NSEC 位图或编码错）抛 RecordError，zone
+    NSEC 位图、RRSIG 覆盖类型/签名或编码错）抛 RecordError，zone
     约束错误抛
     ZoneError；类型或 class 不受支持、记录超 65535 条或文本超 1048576
     字符抛 ConfigError。
@@ -3302,6 +3522,19 @@ def export_master(zone: dict) -> str:
             lines.append(prefix + "NSEC " + next_text + " "
                          + " ".join(_NSEC_TYPE_NAMES[code]
                                     for code in nsec_codes))
+        elif rrtype == _TYPE_RRSIG:
+            (covered, algorithm, rrsig_labels, original_ttl, expiration,
+             inception, keytag, signer,
+             signature) = _master_decode_rrsig_rdata(rdata)
+            signer_text = ("@" if signer == origin_labels
+                           else _labels_to_name(signer))
+            lines.append(prefix + "RRSIG " + _NSEC_TYPE_NAMES[covered] + " "
+                         + str(algorithm) + " " + str(rrsig_labels) + " "
+                         + str(original_ttl) + " "
+                         + _master_format_rrsig_time(expiration) + " "
+                         + _master_format_rrsig_time(inception) + " "
+                         + str(keytag) + " " + signer_text + " "
+                         + base64.b64encode(signature).decode("ascii"))
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_decode_caa_rdata(rdata)
             lines.append(prefix + "CAA " + str(flags) + " "
@@ -3319,8 +3552,8 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA, SRV, NAPTR, DS, NSEC, DNSKEY, CDS, CDNSKEY, CAA "
-                "and SOA")
+                "AAAA, SRV, NAPTR, DS, RRSIG, NSEC, DNSKEY, CDS, CDNSKEY, "
+                "CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
