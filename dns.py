@@ -29,9 +29,9 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/CAA/SOA、class=1、rdata 为 bytes；
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA、class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
-- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/MX/TXT/AAAA/SRV/CAA/SOA、
+- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
@@ -543,6 +543,7 @@ _TYPE_MX = 15
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
 _TYPE_SRV = 33
+_TYPE_NAPTR = 35
 _TYPE_CAA = 257
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
@@ -2157,7 +2158,8 @@ _MASTER_DIRECTIVE = "$ORIGIN"
 _MASTER_CLASS = "IN"
 _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
-                 "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV, "CAA": _TYPE_CAA,
+                 "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
+                 "NAPTR": _TYPE_NAPTR, "CAA": _TYPE_CAA,
                  "SOA": _TYPE_SOA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
 
@@ -2328,6 +2330,69 @@ def _master_caa_rdata(flags, tag, value):
     return bytes((flags, len(tag))) + tag + value
 
 
+def _master_parse_naptr_quoted(rest, pos):
+    """解析 NAPTR 的一个字符串并校验解码后为 0..255 字节。"""
+    value, pos = _master_parse_quoted(rest, pos)
+    if len(value) > 0xFF:
+        raise ConfigError("NAPTR character-string exceeds 255 bytes")
+    return value, pos
+
+
+def _master_parse_naptr_rdata(rest):
+    """把 NAPTR rdata 原文解析为
+    (order, preference, flags, services, regexp, replacement token)。
+
+    rest 为行中 TYPE 之后的原文，形如
+    'order preference "flags" "services" "regexp" replacement'，三个引号
+    串（引号内允许空白）与各字段以 ASCII 空白分隔；order、preference 为
+    允许前导零的 uint16 十进制，引号串解析规则同 CAA value，replacement
+    作为末个 token 原样返回（"@" 由调用方处理）。字段数、整数、引号、
+    转义、串长或尾随非法抛 ConfigError。
+    """
+    parts = rest.split(None, 2)
+    if len(parts) != 3:
+        raise ConfigError(
+            "NAPTR rdata must be order preference flags services "
+            "regexp replacement")
+    order = _master_parse_uint16(parts[0])
+    preference = _master_parse_uint16(parts[1])
+    body = parts[2]
+    strings = []
+    pos = 0
+    for index in range(3):
+        if index > 0:
+            if pos >= len(body) or not body[pos].isspace():
+                raise ConfigError("NAPTR fields must be separated by "
+                                  "whitespace")
+            while pos < len(body) and body[pos].isspace():
+                pos += 1
+        value, pos = _master_parse_naptr_quoted(body, pos)
+        strings.append(value)
+    if pos >= len(body) or not body[pos].isspace():
+        raise ConfigError("NAPTR fields must be separated by whitespace")
+    while pos < len(body) and body[pos].isspace():
+        pos += 1
+    start = pos
+    while pos < len(body) and not body[pos].isspace():
+        pos += 1
+    replacement = body[start:pos]
+    if not replacement or body[pos:].strip():
+        raise ConfigError("NAPTR rdata has trailing characters")
+    return (order, preference, strings[0], strings[1], strings[2],
+            replacement)
+
+
+def _master_naptr_rdata(order, preference, flags, services, regexp,
+                        replacement_labels):
+    """把 NAPTR 字段编码为 rdata：两个网络序 uint16，三个「一字节长度+
+    内容」字符串，最后为未压缩、0 结尾的 replacement 线格式名。"""
+    return (order.to_bytes(2, "big") + preference.to_bytes(2, "big")
+            + bytes((len(flags),)) + flags
+            + bytes((len(services),)) + services
+            + bytes((len(regexp),)) + regexp
+            + _master_wire_name(replacement_labels))
+
+
 def _master_parse_name(token, allow_wildcard=False):
     """把主文件中的绝对域名（"@" 由调用方先行处理）解析为小写标签列表。
 
@@ -2375,7 +2440,8 @@ def import_master(text: str) -> dict:
     名或最左标签恰为 "*" 且后缀在 origin 内的通配绝对名；SOA 的
     mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
     的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
-    "TXT"（16）、"AAAA"（28）、"SRV"（33）、"CAA"（257）或 "SOA"（6），
+    "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
+    "CAA"（257）或 "SOA"（6），
     仅接受 class "IN"；ttl、MX preference、SRV 的 priority/weight/port
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
     整数（uint32 为 0..4294967295，uint16 为 0..65535）；A 的 rdata
@@ -2386,10 +2452,16 @@ def import_master(text: str) -> dict:
     线格式写入 rdata、后接五个网络序 uint32；TXT rdata 为 1..255 个
     双引号串，CAA rdata 为「flags tag "value"」：flags 为允许前导零的
     uint8，tag 为 1..15 字节小写 [a-z0-9-]，value 为单个双引号串
-    （可为空）；两类引号串内仅接受可打印 ASCII，转义仅反斜杠反斜杠、
-    反斜杠双引号或三位十进制反斜杠加 DDD（000..255），TXT 每段解码后
-    ≤255 字节、依次写一字节长度及内容，CAA 依次写 flags 一字节、tag
-    长度一字节、tag 与 value；rdata 总长 ≤65535。返回记录键序
+    （可为空）；NAPTR rdata 为
+    'order preference "flags" "services" "regexp" replacement'：order、
+    preference 为允许前导零的 uint16 十进制，三个引号串（均可为空，
+    引号内允许空白）各解码为 0..255 字节，replacement 为 "@" 或不含
+    通配的小写绝对名；三类引号串内仅接受可打印 ASCII，转义仅反斜杠
+    反斜杠、反斜杠双引号或三位十进制反斜杠加 DDD（000..255），TXT
+    每段解码后 ≤255 字节、依次写一字节长度及内容，CAA 依次写 flags
+    一字节、tag 长度一字节、tag 与 value，NAPTR 依次写两个网络序
+    uint16、三个一字节长度及内容、未压缩 0 结尾 replacement；rdata
+    总长 ≤65535。返回记录键序
     name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
     并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、CNAME
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
@@ -2431,7 +2503,8 @@ def import_master(text: str) -> dict:
             raise ConfigError("class must be IN")
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
-                "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, CAA or SOA")
+                "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
+                "CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2504,6 +2577,15 @@ def import_master(text: str) -> dict:
             rdata = (priority.to_bytes(2, "big") + weight.to_bytes(2, "big")
                      + port.to_bytes(2, "big")
                      + _master_wire_name(target_labels))
+        elif rrtype == _TYPE_NAPTR:
+            (order, preference, flags, services, regexp,
+             replacement_token) = _master_parse_naptr_rdata(rdata_rest)
+            if replacement_token == "@":
+                replacement_labels = origin_labels
+            else:
+                replacement_labels = _master_parse_name(replacement_token)
+            rdata = _master_naptr_rdata(order, preference, flags, services,
+                                        regexp, replacement_labels)
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_parse_caa_rdata(rdata_rest)
             rdata = _master_caa_rdata(flags, tag, value)
@@ -2670,21 +2752,92 @@ def _master_decode_caa_rdata(rdata):
     return flags, tag, value
 
 
+def _master_decode_naptr_name(rdata, pos):
+    """从 rdata[pos] 起解码未压缩、0 结尾且无尾随的小写绝对名。
+
+    返回 (标签列表, 名后偏移)；标签 1..63、总长 ≤255；禁止压缩指针、
+    截断、尾随与非法字符，任何不符抛 RecordError。
+    """
+    if len(rdata) - pos > _MAX_NAME_WIRE_LEN:
+        raise RecordError("naptr replacement too long")
+    labels = []
+    wire_len = 1
+    while True:
+        if pos >= len(rdata):
+            raise RecordError("naptr replacement not terminated")
+        length = rdata[pos]
+        if length == 0:
+            return labels, pos + 1
+        if length > _MAX_LABEL_LEN:
+            raise RecordError("naptr replacement bad label length")
+        pos += 1
+        if pos + length > len(rdata):
+            raise RecordError("naptr replacement truncated")
+        try:
+            label = rdata[pos:pos + length].decode("ascii")
+        except UnicodeDecodeError:
+            raise RecordError("naptr replacement label not ascii") from None
+        if any(ch not in _LABEL_CHARS for ch in label):
+            raise RecordError("naptr replacement invalid label character")
+        labels.append(label.lower())
+        pos += length
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("naptr replacement name too long")
+
+
+def _master_decode_naptr_rdata(rdata):
+    """解码 NAPTR rdata 为
+    (order, preference, flags, services, regexp, replacement 标签列表)。
+
+    rdata 须恰为两个网络序 uint16、三个各以一字节长度开头的 0..255
+    字节字符串，以及一个未压缩、0 结尾且无尾随的小写绝对名；总长
+    ≤65535；压缩指针、截断或尾随抛 RecordError。
+    """
+    if len(rdata) < 7:
+        raise RecordError("naptr rdata truncated")
+    order = int.from_bytes(rdata[0:2], "big")
+    preference = int.from_bytes(rdata[2:4], "big")
+    strings = []
+    pos = 4
+    for _ in range(3):
+        if pos >= len(rdata):
+            raise RecordError("naptr rdata truncated")
+        count = rdata[pos]
+        pos += 1
+        if pos + count > len(rdata):
+            raise RecordError("naptr rdata truncated")
+        strings.append(bytes(rdata[pos:pos + count]))
+        pos += count
+    replacement, pos = _master_decode_naptr_name(rdata, pos)
+    if pos != len(rdata):
+        raise RecordError("naptr rdata trailing bytes")
+    return (order, preference, strings[0], strings[1], strings[2],
+            replacement)
+
+
 def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/CAA/SOA 的记录。输出首行 "$ORIGIN 绝对名"，
+    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA 的记录。输出首行
+    "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
-    NS/CNAME/SRV 目标与 MX 交换名等于 origin 时输出 "@"，否则输出小写
+    NS/CNAME/SRV 目标、NAPTR replacement 与 MX 交换名等于 origin 时输出
+    "@"，否则输出小写
     绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不压缩亦
     不含通配）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、TTL、
-    SOA、MX preference 与 SRV priority/weight/port、CAA flags 整数均
+    SOA、MX preference、SRV priority/weight/port、NAPTR order/preference
+    与 CAA flags 整数均
     按规范形式输出（无前导零）；NS/CNAME rdata 须为未压缩、0 结尾且
     无尾随的线格式，MX rdata 须恰为网络序 uint16 preference 加该线
     格式名，SRV rdata 须恰为三个网络序 uint16 加该线格式名，AAAA
     rdata 须恰为 16 字节；TXT rdata 依次为一字节长度及内容，逐段加
-    双引号输出（1..255 段），空段写 ""，段间单空格；CAA rdata 须恰为
+    双引号输出（1..255 段），空段写 ""，段间单空格；NAPTR rdata 须恰为
+    两个网络序 uint16、三个各以一字节长度开头的 0..255 字节字符串与
+    未压缩、0 结尾且无尾随的 replacement，按
+    'order preference "flags" "services" "regexp" replacement' 输出，
+    三个字符串均可为空；CAA rdata 须恰为
     一字节 flags、一字节 tag 长度（1..15）、tag 与 value，按
     'flags tag "value"' 输出，value 可为空。引号串内双引号与反斜杠
     写转义形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD。
@@ -2750,6 +2903,17 @@ def export_master(zone: dict) -> str:
             lines.append(prefix + "SRV "
                          + str(priority) + " " + str(weight) + " "
                          + str(port) + " " + target_text)
+        elif rrtype == _TYPE_NAPTR:
+            (order, preference, flags, services, regexp,
+             replacement) = _master_decode_naptr_rdata(rdata)
+            replacement_text = ("@" if replacement == origin_labels
+                                else _labels_to_name(replacement))
+            lines.append(prefix + "NAPTR "
+                         + str(order) + " " + str(preference) + " "
+                         + '"' + _master_format_quoted(flags) + '"' + " "
+                         + '"' + _master_format_quoted(services) + '"' + " "
+                         + '"' + _master_format_quoted(regexp) + '"' + " "
+                         + replacement_text)
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_decode_caa_rdata(rdata)
             lines.append(prefix + "CAA " + str(flags) + " "
@@ -2767,7 +2931,7 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA, SRV, CAA and SOA")
+                "AAAA, SRV, NAPTR, CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
