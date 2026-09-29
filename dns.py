@@ -29,9 +29,11 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 仅 A/SOA、class=1、rdata 为 bytes）为规范化 zone。
-- export_master(zone: dict) -> str: 把仅含 A/SOA、class=1 记录的 zone
-  按原序导出为确定性主文件文本（单空格、规范域名/IP/整数、末尾换行）。
+  TYPE 为 A/CNAME/SOA/AAAA、class=1、rdata 为 bytes；末尾无换行或恰
+  一个换行，ttl 与 SOA 五整数允许前导零）为规范化 zone。
+- export_master(zone: dict) -> str: 把仅含 A/CNAME/SOA/AAAA、class=1
+  记录的 zone 按原序导出为确定性主文件文本（单空格、规范域名/IP/整数、
+  末尾一个换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
 - migrate_zones(text: str) -> str: 把 schema=0/1 的区域历史配置文本
@@ -534,8 +536,9 @@ _FLAGS_RESPONSE = 0x8400  # QR | AA
 _FLAGS_KEPT = 0x7910  # opcode | RD | CD
 _FLAG_TC = 0x0200
 _TYPE_A = 1
-_TYPE_SOA = 6
 _TYPE_CNAME = 5
+_TYPE_SOA = 6
+_TYPE_AAAA = 28
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
 _FLAG_DO = 0x8000
@@ -2147,16 +2150,20 @@ def export_zone(zone: dict) -> str:
 
 _MASTER_DIRECTIVE = "$ORIGIN"
 _MASTER_CLASS = "IN"
-_MASTER_TYPES = {"A": _TYPE_A, "SOA": _TYPE_SOA}
+_MASTER_TYPES = {"A": _TYPE_A, "CNAME": _TYPE_CNAME, "SOA": _TYPE_SOA,
+                 "AAAA": _TYPE_AAAA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
 
 
 def _master_parse_uint32(token):
-    """把规范十进制 token 解析为 uint32；非纯数字、含前导零或越界抛 ConfigError。"""
-    if (not token or not token.isascii() or not token.isdigit()
-            or (len(token) > 1 and token[0] == "0")):
+    """把十进制 token 解析为 uint32；允许前导零，非纯数字或越界抛 ConfigError。"""
+    if not token or not token.isascii() or not token.isdigit():
         raise ConfigError("invalid uint32 decimal")
-    value = int(token)
+    try:
+        value = int(token)
+    except ValueError:
+        # 超长数字串在 3.11+ 触发整数数字位上限。
+        raise ConfigError("invalid uint32 decimal") from None
     if value > _MAX_TTL:
         raise ConfigError("uint32 out of range")
     return value
@@ -2202,18 +2209,22 @@ def _master_wire_name(labels):
 def import_master(text: str) -> dict:
     """把确定性 DNS 主文件文本导入为规范化 zone dict（键序 origin,records）。
 
-    文本限 1048576 字符且须为 ASCII：首行仅 "$ORIGIN 绝对名"，其后
-    1..65535 行记录 "owner ttl IN TYPE rdata"，按 ASCII 空白分词，末尾
-    恰一个换行。owner 可为 "@"（代表 origin）、小写绝对名或最左标签恰
-    为 "*" 且后缀在 origin 内的通配绝对名；SOA 的 mname/rname 仅可为
-    "@" 或不含通配的小写绝对名；TYPE 仅 "A"（1）与 "SOA"（6）；ttl 及 SOA 的
-    serial/refresh/retry/expire/minimum 为规范十进制 uint32；A 的
-    rdata 为点分十进制 IPv4，SOA 的两个域名以未压缩线格式写入 rdata、
-    后接五个网络序 uint32。返回记录键序 name,type,class,ttl,rdata，
-    class 恒为 1、rdata 为 bytes，记录保序并沿用 zone 约束
-    （origin 恰一条 SOA、owner 均在 origin 内等）。
-    text 非 str 抛 TypeError；超长、非 ASCII、语法、TYPE、整数或 IP
-    错误抛 ConfigError；名称/rdata 错误抛 RecordError；zone 约束错误
+    文本限 1048576 码点且须为 ASCII：首行仅 "$ORIGIN 绝对名"，其后
+    1..65535 行记录 "owner ttl IN TYPE rdata"，按 ASCII 空白分词；末尾
+    无换行或恰一个换行，其余位置出现空行（含纯空白行）抛 ConfigError。
+    owner 可为 "@"（代表 origin）、小写绝对名或最左标签恰为 "*" 且后缀
+    在 origin 内的通配绝对名；SOA 的 mname/rname 仅可为 "@" 或不含通配
+    的小写绝对名；TYPE 仅 "A"（1）、"CNAME"（5）、"SOA"（6）、"AAAA"（28），
+    class 仅 "IN"；ttl 及 SOA 的 serial/refresh/retry/expire/minimum 为
+    允许前导零的十进制 uint32（0..4294967295）；A 的 rdata 为点分十进制
+    IPv4，AAAA 的 rdata 为一个合法 IPv6 文本并存为 16 字节，CNAME 的
+    rdata 为 "@" 或小写绝对名并存为未压缩、0 结尾、无尾随的线格式，SOA
+    的两个域名以未压缩线格式写入 rdata、后接五个网络序 uint32。返回记录
+    键序 name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录
+    保序并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、
+    CNAME 不重复且不与同 owner 其他类型并存等）。
+    text 非 str 抛 TypeError；超长、非 ASCII、语法、TYPE、非 IN、整数或
+    IP 错误抛 ConfigError；名称/rdata 错误抛 RecordError；zone 约束错误
     抛 ZoneError。时空复杂度为 O(字符数+记录数)。
     """
     if not isinstance(text, str):
@@ -2223,9 +2234,10 @@ def import_master(text: str) -> dict:
     if not text.isascii():
         raise ConfigError("text must be ASCII")
     lines = text.split("\n")
-    if lines[-1:] != [""]:
-        raise ConfigError("master text must end with newline")
-    lines.pop()
+    if lines and lines[-1] == "":
+        lines.pop()  # 允许末尾无换行或恰一个换行
+    if any(not line.strip() for line in lines):
+        raise ConfigError("blank lines are not allowed")
     if not 2 <= len(lines) <= _MAX_MASTER_RECORDS + 1:
         raise ConfigError("master text must contain 1..65535 records")
     first = lines[0].split()
@@ -2244,7 +2256,7 @@ def import_master(text: str) -> dict:
         if class_token != _MASTER_CLASS:
             raise ConfigError("class must be IN")
         if type_token not in _MASTER_TYPES:
-            raise ConfigError("type must be A or SOA")
+            raise ConfigError("unsupported TYPE")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2258,6 +2270,21 @@ def import_master(text: str) -> dict:
                 rdata = ipaddress.IPv4Address(rdata_tokens[0]).packed
             except ValueError:
                 raise ConfigError("invalid IPv4 address") from None
+        elif rrtype == _TYPE_AAAA:
+            if len(rdata_tokens) != 1:
+                raise ConfigError("AAAA rdata must be one address")
+            try:
+                rdata = ipaddress.IPv6Address(rdata_tokens[0]).packed
+            except ValueError:
+                raise ConfigError("invalid IPv6 address") from None
+        elif rrtype == _TYPE_CNAME:
+            if len(rdata_tokens) != 1:
+                raise ConfigError("CNAME rdata must be one name")
+            if rdata_tokens[0] == "@":
+                target_labels = origin_labels
+            else:
+                target_labels = _master_parse_name(rdata_tokens[0])
+            rdata = _master_wire_name(target_labels)
         else:
             if len(rdata_tokens) != 7:
                 raise ConfigError("SOA rdata must contain 7 fields")
@@ -2275,7 +2302,8 @@ def import_master(text: str) -> dict:
                         "type": rrtype, "class": 1, "ttl": ttl,
                         "rdata": rdata})
     # 结构层解析通过后统一套用 zone 约束：origin 恰一条 SOA、owner 在
-    # origin 内、ttl/rdata 长度等；错误沿用 RecordError、ZoneError。
+    # origin 内、CNAME 独占 owner、ttl/rdata 长度等；错误沿用
+    # RecordError、ZoneError。
     zone = {"origin": origin_text, "records": records}
     checked_origin, checked_rrs, _cls = _validate_zone(zone)
     return {"origin": _labels_to_name(checked_origin),
@@ -2325,16 +2353,19 @@ def _master_decode_soa_rdata(rdata):
 
 
 def export_master(zone: dict) -> str:
-    """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
+    """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾一个换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/SOA 的记录。输出首行 "$ORIGIN 绝对名"，记录保序，owner 与 SOA
-    域名等于 origin 时输出 "@"，域名为小写绝对名（owner 允许最左标签
-    恰为 "*" 的通配名，SOA 域名不压缩亦不含通配），A 地址与 SOA 整数
-    均按规范形式输出；对导出结果再 import_master 得到等价 zone。zone
-    非 dict 抛 TypeError；名称/rdata 错误抛 RecordError，zone 约束
-    错误抛 ZoneError；类型或 class 不受支持、记录超 65535 条或文本超
-    1048576 字符抛 ConfigError。
+    A/CNAME/SOA/AAAA 的记录。输出首行 "$ORIGIN 绝对名"，记录保序，owner
+    等于 origin 时输出 "@"，否则为小写绝对名（owner 允许最左标签恰为
+    "*" 的通配名）；SOA 域名不压缩亦不含通配，等于 origin 时输出 "@"；
+    A 地址、AAAA 地址（IPv6Address 的小写压缩形式）与 SOA 整数（不写
+    前导零）均按规范形式输出；CNAME 目标等于 origin 时输出 "@"，否则
+    输出小写绝对名，其 rdata 须为未压缩、0 结尾且无尾随的线格式，AAAA
+    rdata 须恰为 16 字节；对导出结果再 import_master 得到等价 zone，
+    同一区域多次导出逐字节一致。zone 非 dict 抛 TypeError；名称/rdata
+    错误抛 RecordError，zone 约束错误抛 ZoneError；类型或 class 不受
+    支持、记录超 65535 条或文本超 1048576 字符抛 ConfigError。
     """
     if not isinstance(zone, dict):
         raise TypeError("zone must be dict")
@@ -2356,6 +2387,19 @@ def export_master(zone: dict) -> str:
             except ValueError:
                 raise RecordError("invalid A rdata") from None
             lines.append(prefix + "A " + address)
+        elif rrtype == _TYPE_AAAA:
+            if len(rdata) != 16:
+                raise RecordError("AAAA rdata must be 16 bytes")
+            try:
+                address = str(ipaddress.IPv6Address(rdata))
+            except ValueError:
+                raise RecordError("invalid AAAA rdata") from None
+            lines.append(prefix + "AAAA " + address)
+        elif rrtype == _TYPE_CNAME:
+            target = _decode_cname_target(rdata)
+            target_text = ("@" if target == origin_labels
+                           else _labels_to_name(target))
+            lines.append(prefix + "CNAME " + target_text)
         elif rrtype == _TYPE_SOA:
             mname, rname, numbers = _master_decode_soa_rdata(rdata)
             mname_text = ("@" if mname == origin_labels
@@ -2366,7 +2410,7 @@ def export_master(zone: dict) -> str:
                               + numbers)
             lines.append(prefix + "SOA " + fields)
         else:
-            raise ConfigError("master export only supports A and SOA")
+            raise ConfigError("master export unsupported type")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
