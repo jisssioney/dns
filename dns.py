@@ -29,12 +29,12 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/
   CAA/SOA、
   class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
 - export_master(zone: dict) -> str: 把仅含
-  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/CAA/SOA、
+  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/CAA/SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数/Base64/十六进制摘要、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
@@ -549,6 +549,7 @@ _TYPE_AAAA = 28
 _TYPE_SRV = 33
 _TYPE_NAPTR = 35
 _TYPE_DS = 43
+_TYPE_NSEC = 47
 _TYPE_DNSKEY = 48
 _TYPE_CDS = 59
 _TYPE_CDNSKEY = 60
@@ -2168,10 +2169,17 @@ _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
                  "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
                  "NAPTR": _TYPE_NAPTR, "DS": _TYPE_DS,
+                 "NSEC": _TYPE_NSEC,
                  "DNSKEY": _TYPE_DNSKEY, "CDS": _TYPE_CDS,
                  "CDNSKEY": _TYPE_CDNSKEY, "CAA": _TYPE_CAA,
                  "SOA": _TYPE_SOA}
+# NSEC 类型位图仅允许主文件当前支持的类型助记符；码->助记符反向表用于
+# 导出时按类型码升序写大写助记符。
+_MASTER_TYPE_NAMES = {code: name for name, code in _MASTER_TYPES.items()}
+_MASTER_TYPE_CODES = frozenset(_MASTER_TYPES.values())
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
+_NSEC_MAX_TYPES = 256
+_NSEC_MAX_BLOCK_LEN = 32
 
 
 def _master_parse_uint32(token):
@@ -2540,6 +2548,134 @@ def _master_decode_ds_rdata(rdata, allow_delete, type_name):
     return keytag, algorithm, digesttype, digest
 
 
+def _master_parse_nsec_rdata(rest):
+    """把 NSEC rdata 原文解析为 (next 原文 token, 类型码列表)。
+
+    rest 为行中 TYPE 之后的原文，以 ASCII 空白分词后须恰为
+    'next type...'：next 原文（"@" 由调用方按 origin 处理，否则须为
+    小写绝对名）后跟 1..256 个互异的大写类型助记符，助记符限主文件
+    当前支持的类型（含 NSEC）。字段数（无 next 或无类型）、类型多于
+    256、未知助记符或类型重复抛 ConfigError；next 名称合法性由调用方
+    经 _master_parse_name 校验（非法抛 RecordError）。
+    """
+    tokens = rest.split()
+    if len(tokens) < 2:
+        raise ConfigError("NSEC rdata must be next and at least one type")
+    next_token = tokens[0]
+    type_tokens = tokens[1:]
+    if len(type_tokens) > _NSEC_MAX_TYPES:
+        raise ConfigError("NSEC type bitmap must contain 1..256 types")
+    codes = []
+    seen = set()
+    for token in type_tokens:
+        code = _MASTER_TYPES.get(token)
+        if code is None:
+            raise ConfigError(
+                "NSEC type mnemonic must be a supported TYPE")
+        if code in seen:
+            raise ConfigError("NSEC type bitmap must not repeat types")
+        seen.add(code)
+        codes.append(code)
+    return next_token, codes
+
+
+def _master_nsec_rdata(next_labels, codes):
+    """把 next 标签列表与类型码列表编码为 NSEC rdata。
+
+    next 写为未压缩、0 结尾绝对名；类型按 RFC4034 位图编码：类型号
+    window=code//256、低八位 bit=code%256 按高位优先置位；输出各窗口
+    严格升序，每块为各一字节的窗口号、长度（覆盖该窗最高置位类型所需
+    的 1..32 字节）与位图。
+    """
+    out = bytearray(_master_wire_name(next_labels))
+    windows = {}
+    for code in codes:
+        window, offset = divmod(code, 256)
+        byte_index, bit = divmod(offset, 8)
+        block = windows.setdefault(window, bytearray(_NSEC_MAX_BLOCK_LEN))
+        block[byte_index] |= 0x80 >> bit
+    for window in sorted(windows):
+        block = windows[window]
+        highest = max(index for index, value in enumerate(block) if value)
+        out.append(window)
+        out.append(highest + 1)
+        out.extend(block[:highest + 1])
+    return bytes(out)
+
+
+def _master_decode_nsec_rdata(rdata):
+    """解码 NSEC rdata 为 (next 标签列表, 类型码升序列表)。
+
+    rdata 须恰为一个未压缩、0 结尾且无尾随的小写绝对名（标签仅小写，
+    含大写即 RecordError，不得小写化），后接非空 RFC4034 类型位图：
+    每块为各一字节的窗口号、长度与位图，窗口严格升序且不重复，长度须
+    为 1..32 且恰覆盖该窗最高置位类型（末字节非 0），类型号低八位按
+    高位优先置位；置位类型须为主文件当前支持的类型（含 NSEC），类型
+    总数 1..256。压缩名、截断、尾随、空位图、窗口不升序或重复、长度
+    越界、末字节为 0、未知类型或类型数超 256 均抛 RecordError。
+    """
+    labels = []
+    pos = 0
+    wire_len = 1
+    while True:
+        if pos >= len(rdata):
+            raise RecordError("nsec next name not terminated")
+        length = rdata[pos]
+        if length == 0:
+            pos += 1
+            break
+        if length > _MAX_LABEL_LEN:  # 含 0xC0..0xFF 压缩指针形态
+            raise RecordError("nsec next name bad label length")
+        pos += 1
+        if pos + length > len(rdata):
+            raise RecordError("nsec next name truncated")
+        try:
+            label = rdata[pos:pos + length].decode("ascii")
+        except UnicodeDecodeError:
+            raise RecordError("nsec next name label not ascii") from None
+        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
+               for ch in label):
+            raise RecordError("nsec next name invalid label character")
+        labels.append(label)
+        pos += length
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise RecordError("nsec next name too long")
+    if pos >= len(rdata):
+        raise RecordError("nsec type bitmap empty")
+    types = []
+    prev_window = None
+    while pos < len(rdata):
+        if pos + 2 > len(rdata):
+            raise RecordError("nsec bitmap block truncated")
+        window = rdata[pos]
+        block_len = rdata[pos + 1]
+        if not 1 <= block_len <= _NSEC_MAX_BLOCK_LEN:
+            raise RecordError("nsec bitmap block length out of range")
+        if prev_window is not None and window <= prev_window:
+            raise RecordError(
+                "nsec bitmap windows must be strictly ascending")
+        prev_window = window
+        pos += 2
+        if pos + block_len > len(rdata):
+            raise RecordError("nsec bitmap block truncated")
+        if rdata[pos + block_len - 1] == 0:
+            raise RecordError("nsec bitmap last byte must be non-zero")
+        for byte_index in range(block_len):
+            value = rdata[pos + byte_index]
+            for bit in range(8):
+                if value & (0x80 >> bit):
+                    code = window * 256 + byte_index * 8 + bit
+                    if code not in _MASTER_TYPE_CODES:
+                        raise RecordError(
+                            "nsec bitmap contains unsupported type")
+                    types.append(code)
+        pos += block_len
+    if len(types) > _NSEC_MAX_TYPES:
+        raise RecordError("nsec type bitmap must contain 1..256 types")
+    return labels, types
+
+
 def _master_parse_name(token, allow_wildcard=False):
     """把主文件中的绝对域名（"@" 由调用方先行处理）解析为小写标签列表。
 
@@ -2588,7 +2724,8 @@ def import_master(text: str) -> dict:
     mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
     的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
     "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
-    "DS"（43）、"DNSKEY"（48）、"CDS"（59）、"CDNSKEY"（60）、
+    "DS"（43）、"NSEC"（47）、"DNSKEY"（48）、"CDS"（59）、
+    "CDNSKEY"（60）、
     "CAA"（257）或 "SOA"（6），
     仅接受 class "IN"；ttl、MX preference、SRV 的 priority/weight/port
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
@@ -2620,15 +2757,22 @@ def import_master(text: str) -> dict:
     大小写），rdata 依次编码网络序两字节 keytag、一字节 algorithm、
     一字节 digesttype 与摘要字节；CDS 的 digesttype 0 仅作为删除标记
     接受，此时四字段文本须恰为 '0 0 0 00'、rdata 为五个零字节
-    （00 00 00 00 00），DS 不接受 digesttype 0；rdata
+    （00 00 00 00 00），DS 不接受 digesttype 0；NSEC rdata 为
+    'next type...'：next 仅为 "@" 或不含通配的小写绝对名，types 为
+    1..256 个互异的大写 TYPE 助记符（限当前已支持类型含 NSEC），next
+    写为未压缩、0 结尾且无尾随的线格式，类型按数值升序编码为 RFC4034
+    位图（各块为各一字节的窗口号、长度及位图，窗口严格升序且非空，
+    长度为覆盖该窗最高类型所需的 1..32 字节，类型号低八位按高位优先
+    置位）；rdata
     总长 ≤65535。返回记录键序
     name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
     并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、CNAME
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
     非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、Base64、
-    删除标记、digesttype、十六进制字符或摘要长度、tag 或 IP 错误抛
+    删除标记、digesttype、十六进制字符或摘要长度、tag、IP 或 NSEC
+    字段数/助记符/重复类型/总长错误抛
     ConfigError；名称及 rdata 错误抛 RecordError；zone 约束
-    错误抛 ZoneError。时空复杂度为 O(字符数+记录数)。
+    错误抛 ZoneError。时空复杂度为 O(字符数+记录数+类型数)。
     """
     if not isinstance(text, str):
         raise TypeError("text must be str")
@@ -2665,7 +2809,7 @@ def import_master(text: str) -> dict:
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
                 "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
-                "DS, DNSKEY, CDS, CDNSKEY, CAA or SOA")
+                "DS, NSEC, DNSKEY, CDS, CDNSKEY, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2751,6 +2895,15 @@ def import_master(text: str) -> dict:
             keytag, algorithm, digesttype, digest = _master_parse_ds_rdata(
                 rdata_rest, False, "DS")
             rdata = _master_ds_rdata(keytag, algorithm, digesttype, digest)
+        elif rrtype == _TYPE_NSEC:
+            next_token, codes = _master_parse_nsec_rdata(rdata_rest)
+            if next_token == "@":
+                next_labels = origin_labels
+            else:
+                next_labels = _master_parse_name(next_token)
+            rdata = _master_nsec_rdata(next_labels, codes)
+            if len(rdata) > _MAX_RDATA_LEN:
+                raise ConfigError("rdata exceeds 65535 bytes")
         elif rrtype in (_TYPE_DNSKEY, _TYPE_CDNSKEY):
             dnskey_type_name = (
                 "DNSKEY" if rrtype == _TYPE_DNSKEY else "CDNSKEY")
@@ -3020,15 +3173,16 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/CAA/SOA 的记录。
+    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/NSEC/DNSKEY/CDS/CDNSKEY/CAA/SOA
+    的记录。
     输出首行
     "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
     NS/CNAME/SRV 目标、NAPTR replacement 与 MX 交换名等于 origin 时输出
     "@"，否则输出小写
     绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不压缩亦
-    不含通配；NAPTR replacement 线标签含大写 ASCII 时直接抛
-    RecordError，不得小写化）；A 地址、AAAA 地址（IPv6Address 的小写
+    不含通配；NAPTR replacement 与 NSEC next 线标签含大写 ASCII 时直接
+    抛 RecordError，不得小写化）；A 地址、AAAA 地址（IPv6Address 的小写
     压缩形式）、TTL、
     SOA、MX preference、SRV priority/weight/port、NAPTR order/preference
     与 CAA flags、DNSKEY/CDNSKEY flags/algorithm 整数均
@@ -3050,7 +3204,13 @@ def export_master(zone: dict) -> str:
     小写十六进制输出；CDS 另允许恰为五字节 00 00 00 00 00 的删除标记，
     输出 '0 0 0 00'，DS 不允许 digesttype 0；CAA rdata 须恰为
     一字节 flags、一字节 tag 长度（1..15）、tag 与 value，按
-    'flags tag "value"' 输出，value 可为空。引号串内双引号与反斜杠
+    'flags tag "value"' 输出，value 可为空；NSEC rdata 须恰为一个
+    未压缩、0 结尾且无尾随的 next 名（标签仅小写）后接非空 RFC4034
+    类型位图（每块为各一字节的窗口号、长度及位图，窗口严格升序且不
+    重复，长度为 1..32 且末字节非 0，置位类型限当前支持的类型含 NSEC、
+    总数 1..256），完整解码后按 'next TYPE...' 输出，类型码升序写大写
+    助记符，next 等于 origin 时输出 "@"，否则输出小写绝对名。
+    引号串内双引号与反斜杠
     写转义形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD。
     对导出结果再 import_master 得到等价 zone；同一 zone 多次导出逐字节
     一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误
@@ -3127,6 +3287,12 @@ def export_master(zone: dict) -> str:
                          + '"' + _master_format_quoted(services) + '"' + " "
                          + '"' + _master_format_quoted(regexp) + '"' + " "
                          + replacement_text)
+        elif rrtype == _TYPE_NSEC:
+            next_labels, codes = _master_decode_nsec_rdata(rdata)
+            next_text = ("@" if next_labels == origin_labels
+                         else _labels_to_name(next_labels))
+            type_text = " ".join(_MASTER_TYPE_NAMES[code] for code in codes)
+            lines.append(prefix + "NSEC " + next_text + " " + type_text)
         elif rrtype == _TYPE_DS:
             keytag, algorithm, digesttype, digest = _master_decode_ds_rdata(
                 rdata, False, "ds")
@@ -3167,7 +3333,8 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA, SRV, NAPTR, DS, DNSKEY, CDS, CDNSKEY, CAA and SOA")
+                "AAAA, SRV, NAPTR, DS, NSEC, DNSKEY, CDS, CDNSKEY, "
+                "CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
