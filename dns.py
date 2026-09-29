@@ -7,6 +7,7 @@
 - CookieError: EDNS COOKIE 查询非法：OPT 版本非 0、COOKIE 缺失或
   不唯一、data 长度不符，或 secret 长度非 16..64、client 非合法
   IPv4/IPv6（EDNSError 子类）。
+- EDEError: EDNS EDE 查询非法：OPT 缺失或版本非 0（EDNSError 子类）。
 - ZoneError: zone 模型非法（ValueError 子类）。
 - RecordError: 记录模型不符合编码要求（ValueError 子类）。
 - EncodeError: 应答无法在给定限制内编码（ValueError 子类）。
@@ -29,6 +30,11 @@
   版本 0 时 Padding 至多一项且 data 全零，应答 OPT 仅含一个 Padding
   TLV，按 ar、ns、an 尾删候选取首个 B+(-B)%block≤min(limit, CLASS)
   者填零；版本 1..255 在全部参数校验后返回 BADVERS 且不填充。
+- edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
+  rcode: int = 0) -> bytes: 编码 EDNS(0) EDE（选项码 15）应答；查询须
+  恰含一个版本 0 的 OPT（缺失或版本非 0 抛 EDEError），查询选项不
+  回显，应答 OPT 仅含一个 EDE TLV（网络序 uint16 info_code 后接
+  text 的 UTF-8 字节，可为空）。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -380,6 +386,10 @@ class CookieError(EDNSError):
     COOKIE data 长度不符，或 secret 长度非 16..64、client 非合法 IP。"""
 
 
+class EDEError(EDNSError):
+    """EDNS EDE 查询非法：OPT 缺失或版本非 0。"""
+
+
 class ZoneError(ValueError):
     """zone 模型非法。"""
 
@@ -592,6 +602,11 @@ _RCODE_BADCOOKIE = 23
 _OPT_CODE_PADDING = 12
 _MIN_PADDING_BLOCK = 16
 _MAX_PADDING_BLOCK = 512
+# EDE（Extended DNS Errors，选项码 15）：data 为网络序 uint16 info_code
+# 后接 UTF-8 文本（可空）；文本上限 65529 字节使 TLV 总 RDATA 不超
+# 65535（4 字节 TLV 头 + 2 字节 info_code）。
+_OPT_CODE_EDE = 15
+_MAX_EDE_TEXT_LEN = 65529
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
@@ -1633,6 +1648,56 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
+
+
+def edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
+             rcode: int = 0) -> bytes:
+    """把携带 OPT 的查询编码为 EDNS(0) EDE（选项码 15）应答。
+
+    query/model/rcode 与 RR 编码的契约沿用 edns。查询须恰含一个版本
+    0 的 OPT，缺失或版本非 0 抛 EDEError；查询选项一律忽略、不回显。
+    info_code 为非 bool 的 0..65535 整数，text 为 str；类型错抛
+    TypeError，info_code 越界、text 含代理码点或 UTF-8 编码超 65529
+    字节抛 EncodeError。应答 ar 末项为同 CLASS 根 OPT，回显 DO、版本
+    0，扩展 RCODE 取 rcode>>4、头部低 4 位取 rcode&15，RDATA 仅含一
+    个 EDE TLV：code=15、length=2+text 的 UTF-8 字节数、data 为网络
+    序 uint16 info_code 后接 text 的 UTF-8 字节（可为空）。上限
+    min(model.limit, OPT CLASS)；超限普通 RR 按 ar、ns、an 尾删并置
+    TC，OPT 不删不截，删空仍超限抛 EncodeError。其余错误沿用 edns。
+    相同参数逐字节一致，时空 O(报文长+RR 数)。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    _check_int(rcode, "rcode")
+    _check_int(info_code, "info_code")
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    an, ns, ar, limit = _validate_model(model)
+    msg, opt = _decode_edns_query(query)
+    if opt is None:
+        raise EDEError("query must contain an OPT record")
+    if opt[1] != 0:
+        raise EDEError("OPT version must be 0")
+    for section in (an, ns, ar):
+        if any(rr[1] == _TYPE_OPT for rr in section):
+            raise EDNSError("model must not contain OPT records")
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    if not 0 <= rcode <= _MAX_EDNS_RCODE:
+        raise EncodeError("rcode out of range")
+    if not 0 <= info_code <= 0xFFFF:
+        raise EncodeError("info_code out of range")
+    try:
+        text_bytes = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise EncodeError("text must be encodable as UTF-8") from None
+    if len(text_bytes) > _MAX_EDE_TEXT_LEN:
+        raise EncodeError("text exceeds 65529 UTF-8 bytes")
+    options = [{"code": _OPT_CODE_EDE,
+                "data": info_code.to_bytes(2, "big") + text_bytes}]
+    return edns(query, model, rcode, options)
 
 
 def _labels_to_name(labels):
@@ -3538,8 +3603,8 @@ def export_master(zone: dict) -> str:
     一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误
     （含截断、尾随、protocol、digesttype/删除标记/摘要长度、tag/长度、
     NSEC 位图、RRSIG 头/signer/签名或编码错）抛 RecordError，zone
-    约束错误抛
-    ZoneError；类型或 class 不受支持、记录超 65535 条或文本超 1048576
+    约束错误或 RR 的 class 非 1 抛
+    ZoneError；类型不受支持、记录超 65535 条或文本超 1048576
     字符抛 ConfigError。
     """
     if not isinstance(zone, dict):
@@ -3551,7 +3616,7 @@ def export_master(zone: dict) -> str:
     lines = [_MASTER_DIRECTIVE + " " + origin_text]
     for labels, rrtype, rrclass, ttl, rdata in rrs:
         if rrclass != 1:
-            raise ConfigError("master export only supports class IN")
+            raise ZoneError("master export only supports class IN")
         owner = "@" if labels == origin_labels else _labels_to_name(labels)
         prefix = owner + " " + str(ttl) + " " + _MASTER_CLASS + " "
         if rrtype == _TYPE_A:
