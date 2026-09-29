@@ -29,9 +29,11 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA、class=1、rdata 为 bytes；
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA、
+  class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
-- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA、
+- export_master(zone: dict) -> str: 把仅含
+  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
@@ -347,6 +349,8 @@
 
 from bisect import bisect_right
 from collections import deque
+import base64
+import binascii
 import copy
 import hashlib
 import hmac
@@ -544,6 +548,8 @@ _TYPE_TXT = 16
 _TYPE_AAAA = 28
 _TYPE_SRV = 33
 _TYPE_NAPTR = 35
+_TYPE_DNSKEY = 48
+_TYPE_CDNSKEY = 60
 _TYPE_CAA = 257
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
@@ -2159,7 +2165,8 @@ _MASTER_CLASS = "IN"
 _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
                  "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
-                 "NAPTR": _TYPE_NAPTR, "CAA": _TYPE_CAA,
+                 "NAPTR": _TYPE_NAPTR, "DNSKEY": _TYPE_DNSKEY,
+                 "CDNSKEY": _TYPE_CDNSKEY, "CAA": _TYPE_CAA,
                  "SOA": _TYPE_SOA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
 
@@ -2393,6 +2400,83 @@ def _master_naptr_rdata(order, preference, flags, services, regexp,
             + _master_wire_name(replacement_labels))
 
 
+# DNSKEY/CDNSKEY：protocol 恒为 3；公钥为 1..65531 字节的规范 Base64。
+_DNSKEY_PROTOCOL = 3
+_DNSKEY_MIN_KEY_LEN = 1
+_DNSKEY_MAX_KEY_LEN = 65531
+_DNSKEY_RDATA_PREFIX_LEN = 4  # flags uint16 + protocol uint8 + algorithm uint8
+
+
+def _master_parse_base64(token):
+    """把单个 split token 解析为规范 RFC4648 Base64（标准字母表 '+' '/'）。
+
+    token 由调用方以 ASCII 空白切分得到，故本身不含空白；它还须非空、
+    长度为 4 的倍数，仅由 Base64 字母与必要填充 '=' 组成，且解码后再
+    编码须与原文逐字节相同（即禁止非规范填充位与多余/缺失填充）；任何
+    不符抛 ConfigError。返回解码 bytes。
+    """
+    if not token or len(token) % 4 != 0:
+        raise ConfigError("invalid canonical Base64")
+    try:
+        key = base64.b64decode(token, validate=True)
+    except (binascii.Error, ValueError):
+        raise ConfigError("invalid canonical Base64") from None
+    if base64.b64encode(key).decode("ascii") != token:
+        raise ConfigError("non-canonical Base64")
+    return key
+
+
+def _master_parse_dnskey_rdata(rest):
+    """把 DNSKEY/CDNSKEY rdata 原文解析为 (flags, protocol, algorithm, key)。
+
+    rest 为行中 TYPE 之后的原文，形如 'flags protocol algorithm publickey'，
+    恰四个以 ASCII 空白分隔的字段：flags 为允许前导零的 uint16 十进制，
+    algorithm 为允许前导零的 uint8 十进制，protocol 须恰为十进制 3（允许
+    前导零），publickey 为单个不含空白的规范 RFC4648 Base64 token，解码
+    后为 1..65531 字节。字段数、整数、值域、protocol 或 Base64 非法抛
+    ConfigError。
+    """
+    tokens = rest.split()
+    if len(tokens) != 4:
+        raise ConfigError(
+            "DNSKEY rdata must be flags protocol algorithm and publickey")
+    flags_token, protocol_token, algorithm_token, key_token = tokens
+    flags = _master_parse_uint16(flags_token)
+    protocol = _master_parse_uint8(protocol_token)
+    if protocol != _DNSKEY_PROTOCOL:
+        raise ConfigError("DNSKEY protocol must be 3")
+    algorithm = _master_parse_uint8(algorithm_token)
+    key = _master_parse_base64(key_token)
+    if not _DNSKEY_MIN_KEY_LEN <= len(key) <= _DNSKEY_MAX_KEY_LEN:
+        raise ConfigError("DNSKEY public key must be 1..65531 bytes")
+    return flags, protocol, algorithm, key
+
+
+def _master_dnskey_rdata(flags, protocol, algorithm, key):
+    """把 DNSKEY/CDNSKEY 字段编码为 rdata：网络序两字节 flags、一字节
+    protocol、一字节 algorithm，后接公钥原文。"""
+    return (flags.to_bytes(2, "big") + bytes((protocol, algorithm)) + key)
+
+
+def _master_decode_dnskey_rdata(rdata):
+    """解码 DNSKEY/CDNSKEY rdata 为 (flags, protocol, algorithm, key bytes)。
+
+    rdata 须恰为网络序两字节 flags、一字节 protocol、一字节 algorithm 与
+    1..65531 字节公钥；截断、公钥长度非法或 protocol 非 3 抛 RecordError。
+    """
+    if len(rdata) < _DNSKEY_RDATA_PREFIX_LEN:
+        raise RecordError("dnskey rdata truncated")
+    flags = int.from_bytes(rdata[0:2], "big")
+    protocol = rdata[2]
+    algorithm = rdata[3]
+    key = bytes(rdata[_DNSKEY_RDATA_PREFIX_LEN:])
+    if not _DNSKEY_MIN_KEY_LEN <= len(key) <= _DNSKEY_MAX_KEY_LEN:
+        raise RecordError("dnskey public key must be 1..65531 bytes")
+    if protocol != _DNSKEY_PROTOCOL:
+        raise RecordError("dnskey protocol must be 3")
+    return flags, protocol, algorithm, key
+
+
 def _master_parse_name(token, allow_wildcard=False):
     """把主文件中的绝对域名（"@" 由调用方先行处理）解析为小写标签列表。
 
@@ -2441,7 +2525,7 @@ def import_master(text: str) -> dict:
     mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
     的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
     "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
-    "CAA"（257）或 "SOA"（6），
+    "DNSKEY"（48）、"CDNSKEY"（60）、"CAA"（257）或 "SOA"（6），
     仅接受 class "IN"；ttl、MX preference、SRV 的 priority/weight/port
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
     整数（uint32 为 0..4294967295，uint16 为 0..65535）；A 的 rdata
@@ -2456,16 +2540,24 @@ def import_master(text: str) -> dict:
     'order preference "flags" "services" "regexp" replacement'：order、
     preference 为允许前导零的 uint16 十进制，三个引号串（均可为空，
     引号内允许空白）各解码为 0..255 字节，replacement 为 "@" 或不含
-    通配的小写绝对名；三类引号串内仅接受可打印 ASCII，转义仅反斜杠
+    通配的小写绝对名；DNSKEY/CDNSKEY rdata 为
+    'flags protocol algorithm publickey'：flags 为允许前导零的 uint16
+    十进制、algorithm 为允许前导零的 uint8 十进制，protocol 须恰为
+    十进制 3（允许前导零），publickey 为单个不含空白的规范 RFC4648
+    Base64 token（标准字母表，解码再编码与原文逐字节相同），解码后为
+    1..65531 字节；三类引号串内仅接受可打印 ASCII，转义仅反斜杠
     反斜杠、反斜杠双引号或三位十进制反斜杠加 DDD（000..255），TXT
     每段解码后 ≤255 字节、依次写一字节长度及内容，CAA 依次写 flags
     一字节、tag 长度一字节、tag 与 value，NAPTR 依次写两个网络序
-    uint16、三个一字节长度及内容、未压缩 0 结尾 replacement；rdata
+    uint16、三个一字节长度及内容、未压缩 0 结尾 replacement，DNSKEY/
+    CDNSKEY 依次写网络序两字节 flags、一字节 protocol、一字节 algorithm
+    与公钥原文；rdata
     总长 ≤65535。返回记录键序
     name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
     并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、CNAME
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
-    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、tag 或
+    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、值域、
+    Base64、tag 或
     IP 错误抛 ConfigError；名称及 rdata 错误抛 RecordError；zone 约束
     错误抛 ZoneError。时空复杂度为 O(字符数+记录数)。
     """
@@ -2504,7 +2596,7 @@ def import_master(text: str) -> dict:
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
                 "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
-                "CAA or SOA")
+                "DNSKEY, CDNSKEY, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2586,6 +2678,10 @@ def import_master(text: str) -> dict:
                 replacement_labels = _master_parse_name(replacement_token)
             rdata = _master_naptr_rdata(order, preference, flags, services,
                                         regexp, replacement_labels)
+        elif rrtype in (_TYPE_DNSKEY, _TYPE_CDNSKEY):
+            flags, protocol, algorithm, key = _master_parse_dnskey_rdata(
+                rdata_rest)
+            rdata = _master_dnskey_rdata(flags, protocol, algorithm, key)
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_parse_caa_rdata(rdata_rest)
             rdata = _master_caa_rdata(flags, tag, value)
@@ -2756,7 +2852,8 @@ def _master_decode_naptr_name(rdata, pos):
     """从 rdata[pos] 起解码未压缩、0 结尾且无尾随的小写绝对名。
 
     返回 (标签列表, 名后偏移)；标签 1..63、总长 ≤255；禁止压缩指针、
-    截断、尾随与非法字符，任何不符抛 RecordError。
+    截断、尾随、非法字符与大写 ASCII（大写标签按 RecordError 拒绝，不得
+    小写化），任何不符抛 RecordError。
     """
     if len(rdata) - pos > _MAX_NAME_WIRE_LEN:
         raise RecordError("naptr replacement too long")
@@ -2777,9 +2874,10 @@ def _master_decode_naptr_name(rdata, pos):
             label = rdata[pos:pos + length].decode("ascii")
         except UnicodeDecodeError:
             raise RecordError("naptr replacement label not ascii") from None
-        if any(ch not in _LABEL_CHARS for ch in label):
+        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
+               for ch in label):
             raise RecordError("naptr replacement invalid label character")
-        labels.append(label.lower())
+        labels.append(label)
         pos += length
         wire_len += length + 1
         if wire_len > _MAX_NAME_WIRE_LEN:
@@ -2820,14 +2918,16 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/CAA/SOA 的记录。输出首行
+    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA 的记录。输出首行
     "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
     NS/CNAME/SRV 目标、NAPTR replacement 与 MX 交换名等于 origin 时输出
     "@"，否则输出小写
     绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不压缩亦
-    不含通配）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、TTL、
-    SOA、MX preference、SRV priority/weight/port、NAPTR order/preference
+    不含通配；NAPTR replacement 的线格式标签含大写 ASCII 时抛
+    RecordError，不得小写化）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、TTL、
+    SOA、MX preference、SRV priority/weight/port、NAPTR order/preference、
+    DNSKEY/CDNSKEY flags/protocol/algorithm
     与 CAA flags 整数均
     按规范形式输出（无前导零）；NS/CNAME rdata 须为未压缩、0 结尾且
     无尾随的线格式，MX rdata 须恰为网络序 uint16 preference 加该线
@@ -2837,13 +2937,17 @@ def export_master(zone: dict) -> str:
     两个网络序 uint16、三个各以一字节长度开头的 0..255 字节字符串与
     未压缩、0 结尾且无尾随的 replacement，按
     'order preference "flags" "services" "regexp" replacement' 输出，
-    三个字符串均可为空；CAA rdata 须恰为
+    三个字符串均可为空；DNSKEY/CDNSKEY rdata 须恰为网络序两字节 flags、
+    一字节 protocol、一字节 algorithm 与 1..65531 字节公钥，protocol 须
+    为 3，按 'flags protocol algorithm publickey' 输出，公钥以规范
+    RFC4648 Base64（标准字母表）写出；CAA rdata 须恰为
     一字节 flags、一字节 tag 长度（1..15）、tag 与 value，按
     'flags tag "value"' 输出，value 可为空。引号串内双引号与反斜杠
     写转义形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD。
     对导出结果再 import_master 得到等价 zone；同一 zone 多次导出逐字节
     一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误
-    （含尾随、截断、tag/长度错）抛 RecordError，zone 约束错误抛
+    （含尾随、截断、protocol、长度、编码或 tag 错）抛 RecordError，
+    zone 约束错误抛
     ZoneError；类型或 class 不受支持、记录超 65535 条或文本超 1048576
     字符抛 ConfigError。
     """
@@ -2914,6 +3018,15 @@ def export_master(zone: dict) -> str:
                          + '"' + _master_format_quoted(services) + '"' + " "
                          + '"' + _master_format_quoted(regexp) + '"' + " "
                          + replacement_text)
+        elif rrtype in (_TYPE_DNSKEY, _TYPE_CDNSKEY):
+            flags, protocol, algorithm, key = _master_decode_dnskey_rdata(
+                rdata)
+            lines.append(prefix
+                         + ("DNSKEY " if rrtype == _TYPE_DNSKEY
+                            else "CDNSKEY ")
+                         + str(flags) + " " + str(protocol) + " "
+                         + str(algorithm) + " "
+                         + base64.b64encode(key).decode("ascii"))
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_decode_caa_rdata(rdata)
             lines.append(prefix + "CAA " + str(flags) + " "
@@ -2931,7 +3044,7 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA, SRV, NAPTR, CAA and SOA")
+                "AAAA, SRV, NAPTR, DNSKEY, CDNSKEY, CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
