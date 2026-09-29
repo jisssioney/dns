@@ -24,6 +24,11 @@
   rcode: int = 0) -> bytes: 编码 EDNS(0) COOKIE（选项码 10）应答；查询须
   版本 0 且恰有一个 COOKIE，服务端值缺失或匹配按 model 应答，不匹配清空
   三段并以扩展 RCODE 23 应答，非法查询/参数抛 CookieError。
+- edns_padded(query: bytes, model: dict, block: int = 128, rcode: int = 0)
+  -> bytes: 编码 EDNS(0) Padding（选项码 12）应答；查询须恰有一个 OPT，
+  版本 0 时 Padding 至多一项且 data 全零，应答 OPT 仅含一个 Padding
+  TLV，按 ar、ns、an 尾删候选取首个 B+(-B)%block≤min(limit, CLASS)
+  者填零；版本 1..255 在全部参数校验后返回 BADVERS 且不填充。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
@@ -580,6 +585,13 @@ _FAMILY_IPV6 = 0x06
 _MIN_COOKIE_SECRET_LEN = 16
 _MAX_COOKIE_SECRET_LEN = 64
 _RCODE_BADCOOKIE = 23
+# EDNS(0) Padding（选项码 12）：版本 0 查询至多一个 Padding 且 data
+# 全零；应答 OPT 仅含一个 Padding TLV，按 ar、ns、an 尾删候选取首个
+# B+(-B)%block≤min(limit, CLASS) 者填零（B 为候选含零长 TLV 的报文
+# 长度，n=0 仍保留 TLV）。block 限 16..512 内 2 的幂。
+_OPT_CODE_PADDING = 12
+_MIN_PADDING_BLOCK = 16
+_MAX_PADDING_BLOCK = 512
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
@@ -1510,6 +1522,117 @@ def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
         model = {"an": [], "ns": [], "ar": [], "limit": limit}
         rcode = _RCODE_BADCOOKIE
     return edns(query, model, rcode, options)
+
+
+def edns_padded(query: bytes, model: dict, block: int = 128,
+                rcode: int = 0) -> bytes:
+    """把（可含 OPT 的）查询报文编码为 EDNS(0) Padding（选项码 12）应答。
+
+    query/model/rcode 的契约沿用 edns；查询须恰有一个 OPT，否则抛
+    EDNSError。block 为填充块长：非 int 或为 bool 抛 TypeError，非
+    16..512 内 2 的幂抛 EncodeError。OPT 版本 1..255 时在全部参数
+    校验后返回既有 BADVERS 应答（同 edns 的版本协商契约：model 三段
+    须空、rcode 须为 0），不填充。版本 0 查询中 Padding 选项至多一
+    项且 data 全零，否则抛 EDNSError；其余选项一律忽略、不回显。
+    应答 OPT 仅含一个 Padding TLV：按 ar、ns、an 尾删顺序枚举候选
+    （优先保留最多普通 RR），B 为候选含零长 TLV 时的报文长度，
+    n=(-B)%block，取首个 B+n≤min(model.limit, OPT CLASS) 的候选并
+    写 n 个零（n=0 仍保留 TLV）；无候选抛 EncodeError。OPT 不删不
+    截，仅删过普通 RR 才置 TC；标志、扩展 RCODE、名称压缩与其余异
+    常沿用 edns。相同参数逐字节一致，时空 O(报文长+RR 数)。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    _check_int(rcode, "rcode")
+    _check_int(block, "block")
+    an, ns, ar, limit = _validate_model(model)
+    msg, opt = _decode_edns_query(query)
+    if opt is None:
+        raise EDNSError("query must contain an OPT record")
+    for section in (an, ns, ar):
+        if any(rr[1] == _TYPE_OPT for rr in section):
+            raise EDNSError("model must not contain OPT records")
+    if msg["flags"] & 0x8000:
+        raise EncodeError("query has QR set")
+    if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+        raise EncodeError("limit out of range")
+    if not 0 <= rcode <= _MAX_EDNS_RCODE:
+        raise EncodeError("rcode out of range")
+    if (not _MIN_PADDING_BLOCK <= block <= _MAX_PADDING_BLOCK
+            or block & (block - 1)):
+        raise EncodeError("block must be a power of 2 in 16..512")
+    if opt[1] != 0:
+        # 版本协商：全部参数校验完成后按 edns 的 BADVERS 契约应答，不填充。
+        if an or ns or ar:
+            raise EncodeError("badvers response must have empty sections")
+        if rcode:
+            raise EncodeError("badvers requires rcode 0")
+        return _encode_badvers(msg, opt, limit)
+    # 版本 0：查询 Padding 至多一项且 data 全零，其余选项不回显。
+    seen_padding = False
+    for code, data in opt[3]:
+        if code != _OPT_CODE_PADDING:
+            continue
+        if seen_padding:
+            raise EDNSError("duplicate PADDING option")
+        if any(data):
+            raise EDNSError("PADDING data must be all zeros")
+        seen_padding = True
+    truncated = False
+    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
+    max_ar = _MAX_SECTION_RECORDS - 1
+    if len(ar) > max_ar:
+        del ar[max_ar:]
+        truncated = True
+    for section in (ns, an):
+        if len(section) > _MAX_SECTION_RECORDS:
+            del section[_MAX_SECTION_RECORDS:]
+            truncated = True
+    opt_class, _opt_version, do, _query_opts = opt
+    limit = min(limit, opt_class)
+    ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
+    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
+        msg, an, ns, ar, rcode & 0xF)
+    # OPT 固定部分（根 owner、TYPE41、CLASS、TTL）与零长 TLV 的字节数。
+    opt_fixed = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+                 + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big"))
+    zero_tlv_len = len(opt_fixed) + 2 + 4  # RDLENGTH 字段 + 零长 TLV
+    # 候选按 ar、ns、an 尾删顺序枚举，优先保留最多普通 RR。
+    candidates = (
+        [(len(an), len(ns), nr) for nr in range(len(ar), -1, -1)]
+        + [(len(an), nn, 0) for nn in range(len(ns) - 1, -1, -1)]
+        + [(na, 0, 0) for na in range(len(an) - 1, -1, -1)])
+    chosen = None
+    for na, nn, nr in candidates:
+        if nr:
+            end = ar_ends[nr - 1]
+        elif nn:
+            end = ns_ends[nn - 1]
+        elif na:
+            end = an_ends[na - 1]
+        else:
+            end = body_base
+        msg_len = end + zero_tlv_len  # B：候选含零长 TLV 时的报文长度
+        pad = (-msg_len) % block
+        if msg_len + pad <= limit:
+            chosen = (na, nn, nr, end, pad)
+            break
+    if chosen is None:
+        raise EncodeError("no padding candidate fits the limit")
+    na, nn, nr, end, pad = chosen
+    if (na, nn, nr) != (len(an), len(ns), len(ar)):
+        truncated = True
+    tlv = (_OPT_CODE_PADDING.to_bytes(2, "big") + pad.to_bytes(2, "big")
+           + b"\x00" * pad)
+    opt_wire = opt_fixed + (4 + pad).to_bytes(2, "big") + tlv
+    result = bytearray(out[:end])
+    result += opt_wire
+    result[6:8] = na.to_bytes(2, "big")
+    result[8:10] = nn.to_bytes(2, "big")
+    result[10:12] = (nr + 1).to_bytes(2, "big")
+    if truncated:
+        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
+    return bytes(result)
 
 
 def _labels_to_name(labels):
