@@ -29,11 +29,12 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/CNAME/AAAA/SOA、class=1、rdata 为 bytes；末尾允许无
-  换行或一个换行）为规范化 zone。
-- export_master(zone: dict) -> str: 把仅含 A/CNAME/AAAA/SOA、
+  TYPE 为 A/NS/CNAME/SOA/MX/TXT/AAAA、class=1、rdata 为 bytes；
+  NS 数据为 "@" 或小写绝对名，MX 为十进制 uint16 preference 加该名，
+  TXT 为 1..255 个双引号串；末尾允许无换行或一个换行）为规范化 zone。
+- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/SOA/MX/TXT/AAAA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
-  规范域名/IP/整数、末尾换行）。
+  规范域名/IP/整数、目标等于 origin 写 "@"、TXT 逐段加引号、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
 - migrate_zones(text: str) -> str: 把 schema=0/1 的区域历史配置文本
@@ -536,8 +537,11 @@ _FLAGS_RESPONSE = 0x8400  # QR | AA
 _FLAGS_KEPT = 0x7910  # opcode | RD | CD
 _FLAG_TC = 0x0200
 _TYPE_A = 1
+_TYPE_NS = 2
 _TYPE_CNAME = 5
 _TYPE_SOA = 6
+_TYPE_MX = 15
+_TYPE_TXT = 16
 _TYPE_AAAA = 28
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
@@ -2150,9 +2154,15 @@ def export_zone(zone: dict) -> str:
 
 _MASTER_DIRECTIVE = "$ORIGIN"
 _MASTER_CLASS = "IN"
-_MASTER_TYPES = {"A": _TYPE_A, "CNAME": _TYPE_CNAME,
-                 "AAAA": _TYPE_AAAA, "SOA": _TYPE_SOA}
+_MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
+                 "SOA": _TYPE_SOA, "MX": _TYPE_MX, "TXT": _TYPE_TXT,
+                 "AAAA": _TYPE_AAAA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
+# 与 str.split() 在 ASCII 下一致的空白字符（记录行不含换行）。
+_MASTER_WHITESPACE = frozenset(" \t\n\v\f\r")
+_MAX_UINT16 = 65535
+_MAX_TXT_STRINGS = 255
+_MAX_TXT_STRING_LEN = 255
 
 
 def _master_parse_uint32(token):
@@ -2168,6 +2178,85 @@ def _master_parse_uint32(token):
     if value > _MAX_TTL:
         raise ConfigError("uint32 out of range")
     return value
+
+
+def _master_parse_uint16(token):
+    """把十进制 token 解析为 uint16；允许任意前导零，非纯 ASCII 数字
+    或越界抛 ConfigError。"""
+    if not token or not token.isascii() or not token.isdigit():
+        raise ConfigError("invalid uint16 decimal")
+    digits = token.lstrip("0") or "0"
+    if len(digits) > 5:
+        raise ConfigError("uint16 out of range")
+    value = int(digits)
+    if value > _MAX_UINT16:
+        raise ConfigError("uint16 out of range")
+    return value
+
+
+def _master_split_rdata_txt(remainder):
+    """扫描记录行 TYPE 之后的 TXT rdata 子串为逐字节串列表。
+
+    TXT 须含 1..255 个以 ASCII 空白分隔的双引号串；串内仅接受可打印
+    ASCII（0x20..0x7E，含空格，制表等其余空白非法），转义仅为 \\\\、
+    \\" 或三位十进制 \\DDD（000..255），引号必须配对、相邻串间须有
+    空白。空引号串解码为 0 字节段，每段解码后 0..255 字节。语法层
+    错误（字段数、引号、转义、段数、段长）抛 ConfigError。"""
+    strings = []
+    pos = 0
+    length = len(remainder)
+    while True:
+        while pos < length and remainder[pos] in _MASTER_WHITESPACE:
+            pos += 1
+        if pos >= length:
+            break
+        if remainder[pos] != '"':
+            raise ConfigError("TXT strings must be quoted")
+        pos += 1
+        segment = bytearray()
+        while True:
+            if pos >= length:
+                raise ConfigError("unterminated quoted string")
+            ch = remainder[pos]
+            if ch == '"':
+                pos += 1
+                break
+            if ch == "\\":
+                decoded, pos = _master_read_escape(remainder, pos)
+                segment.extend(decoded)
+                continue
+            if not (" " <= ch <= "~"):
+                raise ConfigError("invalid TXT character")
+            segment.append(ord(ch))
+            pos += 1
+        if len(segment) > _MAX_TXT_STRING_LEN:
+            raise ConfigError("TXT string length must be at most 255")
+        strings.append(bytes(segment))
+        if len(strings) > _MAX_TXT_STRINGS:
+            raise ConfigError("TXT rdata must contain at most 255 strings")
+        if pos < length and remainder[pos] not in _MASTER_WHITESPACE:
+            raise ConfigError("whitespace required between TXT strings")
+    if not strings:
+        raise ConfigError("TXT rdata must contain at least one string")
+    return strings
+
+
+def _master_read_escape(text, pos):
+    """读取 text[pos] 处的反斜杠转义（\\\\、\\"、\\DDD）。
+
+    返回 (解码后字节串, 转义结束后的下一偏移)；任何非法转义抛
+    ConfigError。"""
+    if pos + 1 >= len(text):
+        raise ConfigError("trailing backslash in TXT field")
+    ch = text[pos + 1]
+    if ch == "\\" or ch == '"':
+        return ch.encode("ascii"), pos + 2
+    code = text[pos + 1:pos + 4]
+    if len(code) == 3 and code.isascii() and code.isdigit():
+        value = int(code)
+        if value <= 255:
+            return bytes((value,)), pos + 4
+    raise ConfigError("invalid TXT escape")
 
 
 def _master_parse_name(token, allow_wildcard=False):
@@ -2207,6 +2296,68 @@ def _master_wire_name(labels):
     return bytes(out)
 
 
+def _master_txt_rdata(strings):
+    """把逐字节串列表编码为 TXT rdata：每段一字节长度后随内容。"""
+    out = bytearray()
+    for segment in strings:
+        out.append(len(segment))
+        out.extend(segment)
+    return bytes(out)
+
+
+def _master_decode_mx_rdata(rdata):
+    """解码 MX rdata 为 (preference, exchange 标签列表)。
+
+    rdata 须恰为网络序 uint16 preference 加一个未压缩、0 结尾且无尾随
+    的小写绝对名；任何不符抛 RecordError。"""
+    if len(rdata) < 3:
+        raise RecordError("mx rdata too short")
+    preference = int.from_bytes(rdata[:2], "big")
+    exchange = _decode_cname_target(rdata[2:])
+    return preference, exchange
+
+
+def _master_decode_txt_rdata(rdata):
+    """解码 TXT rdata 为逐字节串列表：依次一字节长度后随该长度内容。
+
+    段数 1..255、每段 0..255 字节、总长 ≤65535 且长度计数必须恰好用尽
+    rdata；任何截断、尾随或越界抛 RecordError。"""
+    strings = []
+    pos = 0
+    while pos < len(rdata):
+        length = rdata[pos]
+        pos += 1
+        if pos + length > len(rdata):
+            raise RecordError("txt rdata truncated")
+        strings.append(bytes(rdata[pos:pos + length]))
+        pos += length
+        if len(strings) > _MAX_TXT_STRINGS:
+            raise RecordError("txt rdata too many strings")
+    if pos != len(rdata) or not strings:
+        raise RecordError("txt rdata malformed")
+    return strings
+
+
+def _master_quote_txt_string(segment):
+    """把一个 TXT 字节段按主文件规范加引号输出。
+
+    双引号与反斜杠写 \\"、\\\\，其他可打印 ASCII 原样写，非打印字节写
+    三位十进制 \\DDD；空段输出一对空引号。"""
+    out = ['"']
+    for value in segment:
+        ch = chr(value)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif 0x20 <= value <= 0x7E:
+            out.append(ch)
+        else:
+            out.append("\\%03d" % value)
+    out.append('"')
+    return "".join(out)
+
+
 def import_master(text: str) -> dict:
     """把确定性 DNS 主文件文本导入为规范化 zone dict（键序 origin,records）。
 
@@ -2214,19 +2365,26 @@ def import_master(text: str) -> dict:
     1..65535 行记录 "owner ttl IN TYPE rdata"，按 ASCII 空白分词；末尾
     允许无换行或恰一个换行，其余任何空行（含连续换行）均非法。owner
     可为 "@"（代表 origin）、小写绝对名或最左标签恰为 "*" 且后缀在
-    origin 内的通配绝对名；SOA 的 mname/rname 与 CNAME 目标仅可为
-    "@" 或不含通配的小写绝对名；TYPE 为 "A"（1）、"CNAME"（5）、
-    "AAAA"（28）或 "SOA"（6），仅接受 class "IN"；ttl 及 SOA 的
+    origin 内的通配绝对名；SOA 的 mname/rname、CNAME/NS 目标及 MX
+    exchange 仅可为 "@" 或不含通配的小写绝对名；TYPE 为 "A"（1）、
+    "NS"（2）、"CNAME"（5）、"SOA"（6）、"MX"（15）、"TXT"（16）或
+    "AAAA"（28），仅接受 class "IN"；ttl 及 SOA 的
     serial/refresh/retry/expire/minimum 为允许前导零的十进制 uint32
-    （0..4294967295）；A 的 rdata 为点分十进制 IPv4（导入为 4 字节），
-    AAAA 的 rdata 为一个 IPv6 文本（导入为 16 字节），CNAME 目标写入
-    未压缩、0 结尾且无尾随的线格式，SOA 的两个域名以未压缩线格式写入
-    rdata、后接五个网络序 uint32。返回记录键序
-    name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
-    并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、
+    （0..4294967295），MX preference 为允许前导零的十进制 uint16
+    （0..65535）；A 的 rdata 为点分十进制 IPv4（导入为 4 字节），
+    AAAA 的 rdata 为一个 IPv6 文本（导入为 16 字节），CNAME/NS 目标
+    与 MX exchange 写入未压缩、0 结尾且无尾随的线格式，MX 先写网络序
+    uint16 preference；SOA 的两个域名以未压缩线格式写入 rdata、后接
+    五个网络序 uint32。TXT rdata 为 1..255 个以空白分隔的双引号串，
+    串内仅接受可打印 ASCII（0x20..0x7E），转义仅为 \\\\、\\" 或三位
+    十进制 \\DDD（000..255），空串解码为 0 字节段，每段解码后
+    0..255 字节，rdata 依次写一字节长度及内容、总长 ≤65535。返回记录
+    键序 name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录
+    保序并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、
     CNAME 不与同 owner 其他类型并存且不重复等）。
     text 非 str 抛 TypeError；超长、非 ASCII、语法、未知 TYPE、非 IN、
-    整数或 IP 错误抛 ConfigError；名称/rdata 错误抛 RecordError；
+    字段数、引号、转义、preference/其他整数或 IP 错误抛 ConfigError；
+    名称及（MX exchange 等）rdata 线格式错误抛 RecordError；
     zone 约束错误抛 ZoneError。时空复杂度为 O(字符数+记录数)。
     """
     if not isinstance(text, str):
@@ -2251,16 +2409,19 @@ def import_master(text: str) -> dict:
     origin_text = _labels_to_name(origin_labels)
     records = []
     for line in lines[1:]:
-        tokens = line.split()
-        if len(tokens) < _MASTER_HEADER_TOKENS + 1:
+        # 以 maxsplit 保留 TYPE 之后的原始子串：TXT 的引号与引号内空白
+        # 有意义，不能整体 split；其余类型再自行 split 分词。
+        parts = line.split(None, _MASTER_HEADER_TOKENS)
+        if len(parts) < _MASTER_HEADER_TOKENS + 1:
             raise ConfigError("malformed record line")
-        owner_token, ttl_token, class_token, type_token = tokens[:4]
-        rdata_tokens = tokens[4:]
+        owner_token, ttl_token, class_token, type_token = parts[:4]
+        rdata_text = parts[4]
         ttl = _master_parse_uint32(ttl_token)
         if class_token != _MASTER_CLASS:
             raise ConfigError("class must be IN")
         if type_token not in _MASTER_TYPES:
-            raise ConfigError("type must be A, CNAME, AAAA or SOA")
+            raise ConfigError(
+                "type must be A, NS, CNAME, SOA, MX, TXT or AAAA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2268,6 +2429,7 @@ def import_master(text: str) -> dict:
             owner_labels = _master_parse_name(
                 owner_token, allow_wildcard=True)
         if rrtype == _TYPE_A:
+            rdata_tokens = rdata_text.split()
             if len(rdata_tokens) != 1:
                 raise ConfigError("A rdata must be one address")
             try:
@@ -2275,6 +2437,7 @@ def import_master(text: str) -> dict:
             except ValueError:
                 raise ConfigError("invalid IPv4 address") from None
         elif rrtype == _TYPE_AAAA:
+            rdata_tokens = rdata_text.split()
             if len(rdata_tokens) != 1:
                 raise ConfigError("AAAA rdata must be one address")
             address_token = rdata_tokens[0]
@@ -2286,7 +2449,18 @@ def import_master(text: str) -> dict:
                 raise ConfigError("invalid IPv6 address") from None
             if len(rdata) != 16:
                 raise ConfigError("invalid IPv6 address")
+        elif rrtype == _TYPE_NS:
+            rdata_tokens = rdata_text.split()
+            if len(rdata_tokens) != 1:
+                raise ConfigError("NS rdata must be one name")
+            target_token = rdata_tokens[0]
+            if target_token == "@":
+                target_labels = origin_labels
+            else:
+                target_labels = _master_parse_name(target_token)
+            rdata = _master_wire_name(target_labels)
         elif rrtype == _TYPE_CNAME:
+            rdata_tokens = rdata_text.split()
             if len(rdata_tokens) != 1:
                 raise ConfigError("CNAME rdata must be one name")
             target_token = rdata_tokens[0]
@@ -2295,7 +2469,24 @@ def import_master(text: str) -> dict:
             else:
                 target_labels = _master_parse_name(target_token)
             rdata = _master_wire_name(target_labels)
+        elif rrtype == _TYPE_MX:
+            rdata_tokens = rdata_text.split()
+            if len(rdata_tokens) != 2:
+                raise ConfigError("MX rdata must contain preference and name")
+            preference = _master_parse_uint16(rdata_tokens[0])
+            if rdata_tokens[1] == "@":
+                exchange_labels = origin_labels
+            else:
+                exchange_labels = _master_parse_name(rdata_tokens[1])
+            rdata = (preference.to_bytes(2, "big")
+                     + _master_wire_name(exchange_labels))
+        elif rrtype == _TYPE_TXT:
+            # 255 段、每段至多 255 字节内容时总长至多 65280，必在
+            # 65535 以内；字段/转义/段数错误由扫描器抛 ConfigError。
+            strings = _master_split_rdata_txt(rdata_text)
+            rdata = _master_txt_rdata(strings)
         else:
+            rdata_tokens = rdata_text.split()
             if len(rdata_tokens) != 7:
                 raise ConfigError("SOA rdata must contain 7 fields")
             name_labels = []
@@ -2365,16 +2556,20 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/CNAME/AAAA/SOA 的记录。输出首行 "$ORIGIN 绝对名"，字段以单空格
-    分隔、末尾恰一个换行，记录保序；owner、SOA 域名与 CNAME 目标等于
-    origin 时输出 "@"，否则输出小写绝对名（owner 允许最左标签恰为 "*"
-    的通配名，SOA 域名与 CNAME 目标不压缩亦不含通配）；A 地址、AAAA
-    地址（IPv6Address 的小写压缩形式）与 SOA/TTL 整数均按规范形式
-    输出（无前导零）；CNAME rdata 须为未压缩、0 结尾且无尾随的线格式，
-    AAAA rdata 须恰为 16 字节。对导出结果再 import_master 得到等价
-    zone；同一 zone 多次导出逐字节一致。zone 非 dict 抛 TypeError；
-    名称/rdata 错误抛 RecordError，zone 约束错误抛 ZoneError；类型或
-    class 不受支持、记录超 65535 条或文本超 1048576 字符抛 ConfigError。
+    A/NS/CNAME/SOA/MX/TXT/AAAA 的记录。输出首行 "$ORIGIN 绝对名"，字段
+    以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、CNAME/NS
+    目标与 MX exchange 等于 origin 时输出 "@"，否则输出小写绝对名
+    （owner 允许最左标签恰为 "*" 的通配名，各 rdata 域名不压缩亦不含
+    通配）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、MX
+    preference 与 SOA/TTL 整数均按规范形式输出（无前导零）；CNAME/NS
+    rdata 须为未压缩、0 结尾且无尾随的线格式，MX rdata 须为网络序
+    uint16 加该线格式名，AAAA rdata 须恰为 16 字节。TXT rdata 依次为
+    1..255 段长度+内容，逐段加双引号输出，段间单空格：双引号与反斜杠
+    写 \\"、\\\\，其他可打印字节原样写，非打印字节写三位 \\DDD，空段
+    写 ""。对导出结果再 import_master 得到等价 zone；同一 zone 多次导出
+    逐字节一致。zone 非 dict 抛 TypeError；名称或上述 rdata 格式、长度、
+    尾随错误抛 RecordError，zone 约束错误抛 ZoneError；类型或 class
+    不受支持、记录超 65535 条或文本超 1048576 字符抛 ConfigError。
     """
     if not isinstance(zone, dict):
         raise TypeError("zone must be dict")
@@ -2404,11 +2599,27 @@ def export_master(zone: dict) -> str:
             except ValueError:
                 raise RecordError("invalid AAAA rdata") from None
             lines.append(prefix + "AAAA " + address)
+        elif rrtype == _TYPE_NS:
+            target = _decode_cname_target(rdata)
+            target_text = ("@" if target == origin_labels
+                           else _labels_to_name(target))
+            lines.append(prefix + "NS " + target_text)
         elif rrtype == _TYPE_CNAME:
             target = _decode_cname_target(rdata)
             target_text = ("@" if target == origin_labels
                            else _labels_to_name(target))
             lines.append(prefix + "CNAME " + target_text)
+        elif rrtype == _TYPE_MX:
+            preference, exchange = _master_decode_mx_rdata(rdata)
+            exchange_text = ("@" if exchange == origin_labels
+                             else _labels_to_name(exchange))
+            lines.append(prefix + "MX " + str(preference) + " "
+                         + exchange_text)
+        elif rrtype == _TYPE_TXT:
+            strings = _master_decode_txt_rdata(rdata)
+            fields = " ".join(_master_quote_txt_string(segment)
+                              for segment in strings)
+            lines.append(prefix + "TXT " + fields)
         elif rrtype == _TYPE_SOA:
             mname, rname, numbers = _master_decode_soa_rdata(rdata)
             mname_text = ("@" if mname == origin_labels
@@ -2420,7 +2631,8 @@ def export_master(zone: dict) -> str:
             lines.append(prefix + "SOA " + fields)
         else:
             raise ConfigError(
-                "master export only supports A, CNAME, AAAA and SOA")
+                "master export only supports A, NS, CNAME, SOA, MX, TXT "
+                "and AAAA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
