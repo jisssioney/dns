@@ -29,11 +29,11 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA、
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/CAA/SOA、
   class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
 - export_master(zone: dict) -> str: 把仅含
-  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA、
+  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/CAA/SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数/Base64、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
@@ -547,7 +547,9 @@ _TYPE_TXT = 16
 _TYPE_AAAA = 28
 _TYPE_SRV = 33
 _TYPE_NAPTR = 35
+_TYPE_DS = 43
 _TYPE_DNSKEY = 48
+_TYPE_CDS = 59
 _TYPE_CDNSKEY = 60
 _TYPE_CAA = 257
 _TYPE_OPT = 41
@@ -2164,7 +2166,8 @@ _MASTER_CLASS = "IN"
 _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
                  "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
-                 "NAPTR": _TYPE_NAPTR, "DNSKEY": _TYPE_DNSKEY,
+                 "NAPTR": _TYPE_NAPTR, "DS": _TYPE_DS,
+                 "DNSKEY": _TYPE_DNSKEY, "CDS": _TYPE_CDS,
                  "CDNSKEY": _TYPE_CDNSKEY, "CAA": _TYPE_CAA,
                  "SOA": _TYPE_SOA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
@@ -2308,6 +2311,10 @@ _CAA_MAX_TAG_LEN = 15
 _DNSKEY_PROTOCOL = 3
 _DNSKEY_MIN_KEY_LEN = 1
 _DNSKEY_MAX_KEY_LEN = 65531
+# DS/CDS：digesttype 仅 1（SHA-1，40 hex）、2（SHA-256，64 hex）、
+# 4（SHA-384，96 hex）；CDS 另允许 RFC8078 删除标记 "0 0 0 00"。
+_DS_DIGEST_TYPES = (1, 2, 4)
+_DS_DIGEST_HEX_LEN = {1: 40, 2: 64, 4: 96}
 
 
 def _master_valid_caa_tag(tag):
@@ -2422,28 +2429,30 @@ def _master_parse_canonical_b64(token):
     return key
 
 
-def _master_parse_dnskey_rdata(rest):
+def _master_parse_dnskey_rdata(rest, type_name="DNSKEY"):
     """把 DNSKEY/CDNSKEY rdata 原文解析为 (flags, protocol, algorithm, key)。
 
     rest 为行中 TYPE 之后的原文，恰为四个以 ASCII 空白分隔的 token：
     'flags protocol algorithm publickey'。flags 为允许前导零的 uint16，
     algorithm 为允许前导零的 uint8，protocol 须恰为 3，publickey 为无
     空白的规范 RFC4648 Base64（解码再编码不变），解码后 1..65531 字节。
-    字段数、整数、值域或 Base64 错抛 ConfigError。
+    type_name 仅用于诊断（DNSKEY 或 CDNSKEY）。字段数、整数、值域或
+    Base64 错抛 ConfigError。
     """
     parts = rest.split()
     if len(parts) != 4:
         raise ConfigError(
-            "DNSKEY rdata must be flags protocol algorithm and publickey")
+            type_name
+            + " rdata must be flags protocol algorithm and publickey")
     flags_token, protocol_token, algorithm_token, key_token = parts
     flags = _master_parse_uint16(flags_token)
     protocol = _master_parse_uint8(protocol_token)
     if protocol != _DNSKEY_PROTOCOL:
-        raise ConfigError("DNSKEY protocol must be 3")
+        raise ConfigError(type_name + " protocol must be 3")
     algorithm = _master_parse_uint8(algorithm_token)
     key = _master_parse_canonical_b64(key_token)
     if not _DNSKEY_MIN_KEY_LEN <= len(key) <= _DNSKEY_MAX_KEY_LEN:
-        raise ConfigError("DNSKEY public key must be 1..65531 bytes")
+        raise ConfigError(type_name + " public key must be 1..65531 bytes")
     return flags, protocol, algorithm, key
 
 
@@ -2451,6 +2460,59 @@ def _master_dnskey_rdata(flags, protocol, algorithm, key):
     """把 DNSKEY/CDNSKEY 字段编码为 rdata：网络序两字节 flags、一字节
     protocol、一字节 algorithm，后接公钥原始字节。"""
     return (flags.to_bytes(2, "big") + bytes((protocol, algorithm)) + key)
+
+
+def _master_parse_hex(token):
+    """把 token 解析为原始字节：仅接受偶数长度的 ASCII 十六进制（导入
+    接受大小写），空串非法；字符集或长度错抛 ConfigError。"""
+    if not token or len(token) % 2:
+        raise ConfigError("invalid hexadecimal")
+    if not token.isascii() or any(ch not in _HEXDIGITS for ch in token):
+        raise ConfigError("invalid hexadecimal")
+    return bytes.fromhex(token)
+
+
+def _master_parse_ds_rdata(rest, type_name="DS", allow_delete=False):
+    """把 DS/CDS rdata 原文解析为 (keytag, algorithm, digesttype, digest)。
+
+    rest 为行中 TYPE 之后的原文，恰为四个以 ASCII 空白分隔的 token：
+    'keytag algorithm digesttype digest'，keytag 为允许前导零的 uint16，
+    algorithm、digesttype 为允许前导零的 uint8，digest 为偶数长度的
+    ASCII 十六进制（大小写均可）。DS 的 digesttype 仅 1、2、4，digest
+    须分别为 40、64、96 个十六进制字符；CDS（allow_delete）另允许删除
+    标记：三项整数解析后均为 0 且 digest 恰为一个 0 字节（规范原文
+    "0 0 0 00"）。type_name（DS 或 CDS）仅用于诊断。字段数、整数、
+    删除标记、digesttype、十六进制字符或长度错抛 ConfigError。
+    """
+    parts = rest.split()
+    if len(parts) != 4:
+        raise ConfigError(
+            type_name
+            + " rdata must be keytag algorithm digesttype and digest")
+    keytag_token, algorithm_token, digesttype_token, digest_token = parts
+    keytag = _master_parse_uint16(keytag_token)
+    algorithm = _master_parse_uint8(algorithm_token)
+    digesttype = _master_parse_uint8(digesttype_token)
+    if allow_delete and keytag == 0 and algorithm == 0 and digesttype == 0:
+        # 删除标记：三项整数为零（允许前导零写法），digest 须恰为一个
+        # 0 字节；DS 不允许，digesttype 0 在其下按普通 digesttype 错处理。
+        digest = _master_parse_hex(digest_token)
+        if digest != b"\x00":
+            raise ConfigError("CDS delete marker must be '0 0 0 00'")
+        return 0, 0, 0, b"\x00"
+    if digesttype not in _DS_DIGEST_TYPES:
+        raise ConfigError(type_name + " digesttype must be 1, 2 or 4")
+    digest = _master_parse_hex(digest_token)
+    if len(digest_token) != _DS_DIGEST_HEX_LEN[digesttype]:
+        raise ConfigError(type_name + " digest length does not match digesttype")
+    return keytag, algorithm, digesttype, digest
+
+
+def _master_ds_rdata(keytag, algorithm, digesttype, digest):
+    """把 DS/CDS 字段编码为 rdata：网络序两字节 keytag、一字节
+    algorithm、一字节 digesttype，后接 digest 原始字节。"""
+    return (keytag.to_bytes(2, "big")
+            + bytes((algorithm, digesttype)) + digest)
 
 
 def _master_parse_name(token, allow_wildcard=False):
@@ -2500,8 +2562,9 @@ def import_master(text: str) -> dict:
     名或最左标签恰为 "*" 且后缀在 origin 内的通配绝对名；SOA 的
     mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
     的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
-    "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
-    "DNSKEY"（48）、"CDNSKEY"（60）、"CAA"（257）或 "SOA"（6），
+    "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、"DS"（43）、
+    "DNSKEY"（48）、"CDS"（59）、"CDNSKEY"（60）、"CAA"（257）或
+    "SOA"（6），
     仅接受 class "IN"；ttl、MX preference、SRV 的 priority/weight/port
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
     整数（uint32 为 0..4294967295，uint16 为 0..65535）；A 的 rdata
@@ -2520,7 +2583,13 @@ def import_master(text: str) -> dict:
     反斜杠、反斜杠双引号或三位十进制反斜杠加 DDD（000..255），TXT
     每段解码后 ≤255 字节、依次写一字节长度及内容，CAA 依次写 flags
     一字节、tag 长度一字节、tag 与 value，NAPTR 依次写两个网络序
-    uint16、三个一字节长度及内容、未压缩 0 结尾 replacement，DNSKEY/
+    uint16、三个一字节长度及内容、未压缩 0 结尾 replacement；
+    DS/CDS rdata 为 'keytag algorithm digesttype digest'：keytag 为
+    允许前导零的 uint16、algorithm 与 digesttype 为允许前导零的 uint8
+    十进制，digest 为偶数长度十六进制（大小写均可），DS 的 digesttype
+    仅 1、2、4，digest 须分别为 40、64、96 个十六进制字符，CDS 另允许
+    删除标记原文恰为 "0 0 0 00"，rdata 依次为网络序两字节 keytag、
+    一字节 algorithm、一字节 digesttype 与 digest 原始字节；DNSKEY/
     CDNSKEY rdata 为 'flags protocol algorithm publickey'：flags 为
     允许前导零的 uint16、algorithm 为允许前导零的 uint8、protocol 须
     恰为 3，publickey 无空白且为规范 RFC4648 Base64（解码再编码不变）、
@@ -2530,7 +2599,8 @@ def import_master(text: str) -> dict:
     name,type,class,ttl,rdata，class 恒为 1、rdata 为 bytes，记录保序
     并沿用 zone 约束（origin 恰一条 SOA、owner 均在 origin 内、CNAME
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
-    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、Base64、
+    非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、删除标记、
+    digesttype、十六进制或 digest 长度、Base64、
     tag 或 IP 错误抛 ConfigError；名称及 rdata 错误抛 RecordError；zone 约束
     错误抛 ZoneError。时空复杂度为 O(字符数+记录数)。
     """
@@ -2569,7 +2639,7 @@ def import_master(text: str) -> dict:
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
                 "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
-                "DNSKEY, CDNSKEY, CAA or SOA")
+                "DS, DNSKEY, CDS, CDNSKEY, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2651,9 +2721,15 @@ def import_master(text: str) -> dict:
                 replacement_labels = _master_parse_name(replacement_token)
             rdata = _master_naptr_rdata(order, preference, flags, services,
                                         regexp, replacement_labels)
+        elif rrtype in (_TYPE_DS, _TYPE_CDS):
+            type_name = "DS" if rrtype == _TYPE_DS else "CDS"
+            keytag, algorithm, digesttype, digest = _master_parse_ds_rdata(
+                rdata_rest, type_name, allow_delete=(rrtype == _TYPE_CDS))
+            rdata = _master_ds_rdata(keytag, algorithm, digesttype, digest)
         elif rrtype in (_TYPE_DNSKEY, _TYPE_CDNSKEY):
+            type_name = ("DNSKEY" if rrtype == _TYPE_DNSKEY else "CDNSKEY")
             flags, protocol, algorithm, key = _master_parse_dnskey_rdata(
-                rdata_rest)
+                rdata_rest, type_name)
             rdata = _master_dnskey_rdata(flags, protocol, algorithm, key)
         elif rrtype == _TYPE_CAA:
             flags, tag, value = _master_parse_caa_rdata(rdata_rest)
@@ -2889,31 +2965,61 @@ def _master_decode_naptr_rdata(rdata):
             replacement)
 
 
-def _master_decode_dnskey_rdata(rdata):
+def _master_decode_dnskey_rdata(rdata, type_name="dnskey"):
     """解码 DNSKEY/CDNSKEY rdata 为 (flags, protocol, algorithm, key bytes)。
 
     rdata 须恰为网络序两字节 flags、一字节 protocol、一字节 algorithm 与
     1..65531 字节公钥；protocol 须恰为 3；不足 4 字节（截断）、密钥
-    为空或超长（长度错）、protocol 错抛 RecordError。
+    为空或超长（长度错）、protocol 错抛 RecordError。type_name（dnskey
+    或 cdnskey）仅用于诊断。
     """
     if len(rdata) < 4:
-        raise RecordError("dnskey rdata truncated")
+        raise RecordError(type_name + " rdata truncated")
     flags = int.from_bytes(rdata[0:2], "big")
     protocol = rdata[2]
     algorithm = rdata[3]
     key = bytes(rdata[4:])
     if protocol != _DNSKEY_PROTOCOL:
-        raise RecordError("dnskey protocol must be 3")
+        raise RecordError(type_name + " protocol must be 3")
     if not _DNSKEY_MIN_KEY_LEN <= len(key) <= _DNSKEY_MAX_KEY_LEN:
-        raise RecordError("dnskey public key must be 1..65531 bytes")
+        raise RecordError(type_name + " public key must be 1..65531 bytes")
     return flags, protocol, algorithm, key
+
+
+def _master_decode_ds_rdata(rdata, type_name="ds", allow_delete=False):
+    """解码 DS/CDS rdata 为 (keytag, algorithm, digesttype, digest bytes)。
+
+    rdata 须恰为网络序两字节 keytag、一字节 algorithm、一字节 digesttype
+    与 digest；不足 4 字节为截断。DS 的 digesttype 须为 1、2、4，digest
+    字节长度须分别恰为 20、32、48；CDS（allow_delete）另允许删除标记
+    keytag/algorithm/digesttype 均为 0 且 digest 恰为一个 0 字节。
+    type_name（ds 或 cds）仅用于诊断。截断、空 digest、digesttype 或
+    长度（含非法删除标记）语义错抛 RecordError。
+    """
+    if len(rdata) < 4:
+        raise RecordError(type_name + " rdata truncated")
+    keytag = int.from_bytes(rdata[0:2], "big")
+    algorithm = rdata[2]
+    digesttype = rdata[3]
+    digest = bytes(rdata[4:])
+    if (allow_delete and keytag == 0 and algorithm == 0
+            and digesttype == 0):
+        if digest != b"\x00":
+            raise RecordError("cds delete marker digest must be 00")
+        return 0, 0, 0, b"\x00"
+    if digesttype not in _DS_DIGEST_TYPES:
+        raise RecordError(type_name + " digesttype must be 1, 2 or 4")
+    if len(digest) != _DS_DIGEST_HEX_LEN[digesttype] // 2:
+        raise RecordError(
+            type_name + " digest length does not match digesttype")
+    return keytag, algorithm, digesttype, digest
 
 
 def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DNSKEY/CDNSKEY/CAA/SOA 的记录。
+    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/DNSKEY/CDS/CDNSKEY/CAA/SOA 的记录。
     输出首行
     "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
@@ -2924,7 +3030,8 @@ def export_master(zone: dict) -> str:
     RecordError，不得小写化）；A 地址、AAAA 地址（IPv6Address 的小写
     压缩形式）、TTL、
     SOA、MX preference、SRV priority/weight/port、NAPTR order/preference
-    与 CAA flags、DNSKEY/CDNSKEY flags/algorithm 整数均
+    与 CAA flags、DS/CDS keytag/algorithm/digesttype、DNSKEY/CDNSKEY
+    flags/algorithm 整数均
     按规范形式输出（无前导零）；NS/CNAME rdata 须为未压缩、0 结尾且
     无尾随的线格式，MX rdata 须恰为网络序 uint16 preference 加该线
     格式名，SRV rdata 须恰为三个网络序 uint16 加该线格式名，AAAA
@@ -2933,7 +3040,12 @@ def export_master(zone: dict) -> str:
     两个网络序 uint16、三个各以一字节长度开头的 0..255 字节字符串与
     未压缩、0 结尾且无尾随的 replacement（标签仅小写），按
     'order preference "flags" "services" "regexp" replacement' 输出，
-    三个字符串均可为空；DNSKEY/CDNSKEY rdata 须恰为网络序两字节 flags、
+    三个字符串均可为空；DS/CDS rdata 须恰为网络序两字节 keytag、一字节
+    algorithm、一字节 digesttype 与 digest，digesttype 须为 1、2、4 且
+    digest 字节长度分别恰为 20、32、48（CDS 另允许 keytag/algorithm/
+    digesttype 均为 0 且 digest 恰为一个 0 字节的删除标记），按
+    'keytag algorithm digesttype digest' 输出，整数无前导零、digest 以
+    小写十六进制输出；DNSKEY/CDNSKEY rdata 须恰为网络序两字节 flags、
     一字节 protocol（须恰为 3）、一字节 algorithm 与 1..65531 字节密钥，
     按 'flags protocol algorithm publickey' 输出，整数无前导零、密钥以
     规范 RFC4648 Base64（无空白）输出；CAA rdata 须恰为
@@ -2941,8 +3053,10 @@ def export_master(zone: dict) -> str:
     'flags tag "value"' 输出，value 可为空。引号串内双引号与反斜杠
     写转义形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD。
     对导出结果再 import_master 得到等价 zone；同一 zone 多次导出逐字节
-    一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误
-    （含截断、尾随、protocol、tag/长度或编码错）抛 RecordError，zone
+    一致。zone 非 dict 抛 TypeError；名称及各 rdata 的格式、截断、尾随或
+    语义错误
+    （含 DS/CDS digesttype 与 digest 长度及删除标记、protocol、tag/长度
+    或编码错）抛 RecordError，zone
     约束错误抛
     ZoneError；类型或 class 不受支持、记录超 65535 条或文本超 1048576
     字符抛 ConfigError。
@@ -3014,10 +3128,18 @@ def export_master(zone: dict) -> str:
                          + '"' + _master_format_quoted(services) + '"' + " "
                          + '"' + _master_format_quoted(regexp) + '"' + " "
                          + replacement_text)
+        elif rrtype in (_TYPE_DS, _TYPE_CDS):
+            type_name = "DS" if rrtype == _TYPE_DS else "CDS"
+            keytag, algorithm, digesttype, digest = _master_decode_ds_rdata(
+                rdata, type_name.lower(),
+                allow_delete=(rrtype == _TYPE_CDS))
+            lines.append(prefix + type_name + " "
+                         + str(keytag) + " " + str(algorithm) + " "
+                         + str(digesttype) + " " + digest.hex())
         elif rrtype in (_TYPE_DNSKEY, _TYPE_CDNSKEY):
-            flags, protocol, algorithm, key = _master_decode_dnskey_rdata(
-                rdata)
             type_name = ("DNSKEY" if rrtype == _TYPE_DNSKEY else "CDNSKEY")
+            flags, protocol, algorithm, key = _master_decode_dnskey_rdata(
+                rdata, type_name.lower())
             lines.append(prefix + type_name + " "
                          + str(flags) + " " + str(protocol) + " "
                          + str(algorithm) + " "
@@ -3039,7 +3161,7 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA, SRV, NAPTR, DNSKEY, CDNSKEY, CAA and SOA")
+                "AAAA, SRV, NAPTR, DS, DNSKEY, CDS, CDNSKEY, CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
