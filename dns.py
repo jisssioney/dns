@@ -29,11 +29,11 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SOA、class=1、rdata 为 bytes；
-  末尾允许无换行或一个换行）为规范化 zone。
-- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/MX/TXT/AAAA/SOA、
-  class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
-  规范域名/IP/整数、末尾换行）。
+  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/CAA/SOA、class=1、rdata 为
+  bytes；末尾允许无换行或一个换行）为规范化 zone。
+- export_master(zone: dict) -> str: 把仅含 A/NS/CNAME/MX/TXT/AAAA/
+  SRV/CAA/SOA、class=1 记录的 zone 按原序导出为确定性主文件文本
+  （单空格、规范域名/IP/整数、末尾换行）。
 - migrate_zone(text: str) -> str: 把 v0/v1/v2 配置文本完整校验、规范化
   并迁移为 v2 配置文本（紧凑 ASCII JSON，末尾单换行）。
 - migrate_zones(text: str) -> str: 把 schema=0/1 的区域历史配置文本
@@ -542,6 +542,8 @@ _TYPE_SOA = 6
 _TYPE_MX = 15
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
+_TYPE_SRV = 33
+_TYPE_CAA = 257
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
 _FLAG_DO = 0x8000
@@ -2155,7 +2157,8 @@ _MASTER_DIRECTIVE = "$ORIGIN"
 _MASTER_CLASS = "IN"
 _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
-                 "AAAA": _TYPE_AAAA, "SOA": _TYPE_SOA}
+                 "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV, "CAA": _TYPE_CAA,
+                 "SOA": _TYPE_SOA}
 _MASTER_HEADER_TOKENS = 4  # owner ttl IN TYPE
 
 
@@ -2185,6 +2188,20 @@ def _master_parse_uint16(token):
     value = int(digits)
     if value > 0xFFFF:
         raise ConfigError("uint16 out of range")
+    return value
+
+
+def _master_parse_uint8(token):
+    """把十进制 token 解析为 uint8；允许任意前导零，非纯 ASCII 数字
+    （含符号、空白、Unicode 数字）或越界抛 ConfigError。"""
+    if not token or not token.isascii() or not token.isdigit():
+        raise ConfigError("invalid uint8 decimal")
+    digits = token.lstrip("0") or "0"
+    if len(digits) > 3:
+        raise ConfigError("uint8 out of range")
+    value = int(digits)
+    if value > 0xFF:
+        raise ConfigError("uint8 out of range")
     return value
 
 
@@ -2267,6 +2284,115 @@ def _master_txt_rdata(segments):
     return bytes(rdata)
 
 
+def _master_parse_caa_rdata(rest):
+    """把 CAA rdata 原文解析并编码为 CAA rdata bytes。
+
+    文本为 flags tag "value"：flags 为可带前导零的 uint8 十进制，tag
+    为 1..15 字节小写 [a-z0-9-]，value 为恰一对双引号串（可空），串内
+    仅接受可打印 ASCII（0x20..0x7E），转义仅 "\\"、"\"" 或三位
+    十进制 "\\DDD"（000..255）；编码为一字节 flags、一字节 tag 长度、
+    tag 与 value 字节。字段数、整数、tag、引号或转义非法抛
+    ConfigError；rdata 总长上限 65535 由 zone 校验统一抛 RecordError。
+    """
+    tokens = rest.split(None, 2)
+    if len(tokens) != 3:
+        raise ConfigError("CAA rdata must be flags tag and value")
+    flags_token, tag, value_rest = tokens
+    flags = _master_parse_uint8(flags_token)
+    if not 1 <= len(tag) <= 15 or not tag.isascii():
+        raise ConfigError("CAA tag must be 1..15 bytes")
+    if any(not ("a" <= ch <= "z" or "0" <= ch <= "9" or ch == "-")
+           for ch in tag):
+        raise ConfigError("CAA tag must be lowercase [a-z0-9-]")
+    if not value_rest or value_rest[0] != '"':
+        raise ConfigError("CAA value must be a quoted string")
+    pos = 1
+    out = bytearray()
+    while True:
+        if pos >= len(value_rest):
+            raise ConfigError("CAA value not terminated")
+        ch = value_rest[pos]
+        if ch == '"':
+            pos += 1
+            break
+        if ch == "\\":
+            if pos + 1 >= len(value_rest):
+                raise ConfigError("bad CAA escape")
+            escaped = value_rest[pos + 1]
+            if escaped == "\\" or escaped == '"':
+                out.append(ord(escaped))
+                pos += 2
+            else:
+                if pos + 4 > len(value_rest):
+                    raise ConfigError("bad CAA escape")
+                digits = value_rest[pos + 1:pos + 4]
+                if not digits.isascii() or not digits.isdigit():
+                    raise ConfigError("bad CAA escape")
+                value = int(digits)
+                if value > 0xFF:
+                    raise ConfigError("CAA escape out of range")
+                out.append(value)
+                pos += 4
+            continue
+        if not _master_is_printable(ch):
+            raise ConfigError("CAA value must be printable ASCII")
+        out.append(ord(ch))
+        pos += 1
+    # 与其他类型一致：引号后至行末仅允许 ASCII 空白（行末空白忽略）。
+    while pos < len(value_rest) and value_rest[pos].isspace():
+        pos += 1
+    if pos != len(value_rest):
+        raise ConfigError("CAA value must be a single quoted string")
+    rdata = bytes((flags, len(tag))) + tag.encode("ascii") + bytes(out)
+    return rdata
+
+
+def _master_decode_caa_rdata(rdata):
+    """解码 CAA rdata 为 (flags, tag, value)。
+
+    rdata 须恰为一字节 flags、一字节 tag 长度、该长度的 ASCII tag 与
+    value 字节；tag 长度为 0 或超 15、tag 非小写 [a-z0-9-] 抛
+    RecordError（总长上限 65535 已由 zone 校验保证）。
+    """
+    if len(rdata) < 2:
+        raise RecordError("caa rdata truncated")
+    flags = rdata[0]
+    tag_len = rdata[1]
+    if not 1 <= tag_len <= 15:
+        raise RecordError("caa rdata bad tag length")
+    if 2 + tag_len > len(rdata):
+        raise RecordError("caa rdata truncated")
+    try:
+        tag = rdata[2:2 + tag_len].decode("ascii")
+    except UnicodeDecodeError:
+        raise RecordError("caa rdata tag not ascii") from None
+    if any(not ("a" <= ch <= "z" or "0" <= ch <= "9" or ch == "-")
+           for ch in tag):
+        raise RecordError("caa rdata invalid tag character")
+    value = bytes(rdata[2 + tag_len:])
+    return flags, tag, value
+
+
+def _master_format_caa_value(value):
+    """把 CAA value bytes 渲染为带双引号的主文件字符串。
+
+    双引号与反斜杠写 \\"、\\\\，其余可打印字节（0x20..0x7E）原样写，
+    非打印字节写三位十进制 \\DDD；空 value 渲染为 ""。
+    """
+    out = ['"']
+    for byte in value:
+        if byte == 0x22:
+            out.append('\\"')
+        elif byte == 0x5C:
+            out.append("\\\\")
+        elif 0x20 <= byte <= 0x7E:
+            out.append(chr(byte))
+        else:
+            out.append("\\%03d" % byte)
+    out.append('"')
+    return "".join(out)
+
+
 def _master_parse_name(token, allow_wildcard=False):
     """把主文件中的绝对域名（"@" 由调用方先行处理）解析为小写标签列表。
 
@@ -2309,27 +2435,34 @@ def import_master(text: str) -> dict:
 
     文本限 1048576 码点且须为 ASCII：首行仅 "$ORIGIN 绝对名"，其后
     1..65535 行记录 "owner ttl IN TYPE rdata"，头部按 ASCII 空白分词
-    （TXT 的引号串内允许空白）；末尾允许无换行或恰一个换行，其余任何
-    空行（含连续换行）均非法。owner 可为 "@"（代表 origin）、小写绝对
-    名或最左标签恰为 "*" 且后缀在 origin 内的通配绝对名；SOA 的
-    mname/rname、CNAME/NS 目标与 MX 交换名仅可为 "@" 或不含通配的
-    小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
-    "TXT"（16）、"AAAA"（28）或 "SOA"（6），仅接受 class "IN"；ttl、
-    MX preference 及 SOA 的 serial/refresh/retry/expire/minimum 为
-    允许前导零的十进制整数（uint32 为 0..4294967295，MX preference
-    为 0..65535）；A 的 rdata 为点分十进制 IPv4（导入为 4 字节），
+    （TXT 的引号串内及 CAA value 引号串内允许空白）；末尾允许无换行或
+    恰一个换行，其余任何空行（含连续换行）均非法。owner 可为 "@"
+    （代表 origin）、小写绝对名或最左标签恰为 "*" 且后缀在 origin 内
+    的通配绝对名；SOA 的 mname/rname、CNAME/NS 目标、MX 交换名与 SRV
+    target 仅可为 "@" 或不含通配的小写绝对名；TYPE 为 "A"（1）、
+    "NS"（2）、"CNAME"（5）、"MX"（15）、"TXT"（16）、"AAAA"（28）、
+    "SRV"（33）、"CAA"（257）或 "SOA"（6），仅接受 class "IN"；ttl、
+    MX preference、SRV priority/weight/port 及 SOA 的
+    serial/refresh/retry/expire/minimum 为允许前导零的十进制整数
+    （uint32 为 0..4294967295，MX preference 与 SRV 三项为
+    0..65535）；A 的 rdata 为点分十进制 IPv4（导入为 4 字节），
     AAAA 的 rdata 为一个 IPv6 文本（导入为 16 字节），NS/CNAME 目标
     与 MX 交换名写入未压缩、0 结尾且无尾随的线格式（MX 前加网络序
-    uint16 preference），SOA 的两个域名以未压缩线格式写入 rdata、后接
-    五个网络序 uint32；TXT rdata 为 1..255 个双引号串，串内仅接受
-    可打印 ASCII，转义仅反斜杠反斜杠、反斜杠双引号或三位十进制反斜杠
-    加 DDD（000..255），每段解码后 ≤255 字节，rdata 依次写一字节
-    长度及内容，总长 ≤65535。返回记录键序 name,type,class,ttl,rdata，class 恒为
+    uint16 preference），SRV rdata 为三个网络序 uint16（priority、
+    weight、port）加该线格式 target，SOA 的两个域名以未压缩线格式
+    写入 rdata、后接五个网络序 uint32；TXT rdata 为 1..255 个双引号串，
+    串内仅接受可打印 ASCII，转义仅反斜杠反斜杠、反斜杠双引号或三位
+    十进制反斜杠加 DDD（000..255），每段解码后 ≤255 字节，rdata
+    依次写一字节长度及内容，总长 ≤65535；CAA 文本为 flags tag
+    "value"，flags 为可带前导零的 uint8，tag 为 1..15 字节小写
+    [a-z0-9-]，value 为恰一对可空双引号串、转义规则同 TXT，rdata
+    为一字节 flags、一字节 tag 长度、tag 与 value 字节，总长 ≤65535。
+    返回记录键序 name,type,class,ttl,rdata，class 恒为
     1、rdata 为 bytes，记录保序并沿用 zone 约束（origin 恰一条 SOA、
     owner 均在 origin 内、CNAME 不与同 owner 其他类型并存等）。
     text 非 str 抛 TypeError；超长、非 ASCII、语法、未知 TYPE、非 IN、
-    字段数/引号/转义、整数或 IP 错误抛 ConfigError；名称及 rdata 错误
-    抛 RecordError；zone 约束错误抛 ZoneError。时空复杂度为
+    字段数/引号/转义、整数、tag 或 IP 错误抛 ConfigError；名称及
+    rdata 错误抛 RecordError；zone 约束错误抛 ZoneError。时空复杂度为
     O(字符数+记录数)。
     """
     if not isinstance(text, str):
@@ -2354,8 +2487,8 @@ def import_master(text: str) -> dict:
     origin_text = _labels_to_name(origin_labels)
     records = []
     for line in lines[1:]:
-        # 以 maxsplit=4 保留 rdata 原文：TXT 的引号串内允许 ASCII 空白，
-        # 其余类型对原文再 split() 与逐字段计数。
+        # 以 maxsplit=4 保留 rdata 原文：TXT 与 CAA 的引号串内允许
+        # ASCII 空白，其余类型对原文再 split() 与逐字段计数。
         parts = line.split(None, 4)
         if len(parts) < _MASTER_HEADER_TOKENS + 1:
             raise ConfigError("malformed record line")
@@ -2366,7 +2499,7 @@ def import_master(text: str) -> dict:
             raise ConfigError("class must be IN")
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
-                "type must be A, NS, CNAME, MX, TXT, AAAA or SOA")
+                "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
             owner_labels = origin_labels
@@ -2424,6 +2557,22 @@ def import_master(text: str) -> dict:
         elif rrtype == _TYPE_TXT:
             segments = _master_parse_txt_rdata(rdata_rest)
             rdata = _master_txt_rdata(segments)
+        elif rrtype == _TYPE_SRV:
+            if len(rdata_tokens) != 4:
+                raise ConfigError("SRV rdata must be priority weight port target")
+            priority = _master_parse_uint16(rdata_tokens[0])
+            weight = _master_parse_uint16(rdata_tokens[1])
+            port = _master_parse_uint16(rdata_tokens[2])
+            target_token = rdata_tokens[3]
+            if target_token == "@":
+                target_labels = origin_labels
+            else:
+                target_labels = _master_parse_name(target_token)
+            rdata = (priority.to_bytes(2, "big") + weight.to_bytes(2, "big")
+                     + port.to_bytes(2, "big")
+                     + _master_wire_name(target_labels))
+        elif rrtype == _TYPE_CAA:
+            rdata = _master_parse_caa_rdata(rdata_rest)
         else:
             if len(rdata_tokens) != 7:
                 raise ConfigError("SOA rdata must contain 7 fields")
@@ -2503,6 +2652,21 @@ def _master_decode_mx_rdata(rdata):
     return preference, exchange
 
 
+def _master_decode_srv_rdata(rdata):
+    """解码 SRV rdata 为 (priority, weight, port, target 标签列表)。
+
+    rdata 须恰为三个网络序 uint16（priority、weight、port）加一个
+    未压缩、0 结尾且无尾随的小写绝对名；任何不符抛 RecordError。
+    """
+    if len(rdata) < 7:
+        raise RecordError("srv rdata truncated")
+    priority = int.from_bytes(rdata[0:2], "big")
+    weight = int.from_bytes(rdata[2:4], "big")
+    port = int.from_bytes(rdata[4:6], "big")
+    target = _decode_cname_target(rdata[6:])
+    return priority, weight, port, target
+
+
 def _master_decode_txt_rdata(rdata):
     """解码 TXT rdata 为 1..255 个 bytes 段（允许空段）。
 
@@ -2549,21 +2713,27 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SOA 的记录。输出首行 "$ORIGIN 绝对名"，
+    A/NS/CNAME/MX/TXT/AAAA/SRV/CAA/SOA 的记录。输出首行 "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
-    NS/CNAME 目标与 MX 交换名等于 origin 时输出 "@"，否则输出小写
-    绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不压缩亦
-    不含通配）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、TTL、
-    SOA 与 MX preference 整数均按规范形式输出（无前导零）；NS/CNAME
-    rdata 须为未压缩、0 结尾且无尾随的线格式，MX rdata 须恰为网络序
-    uint16 preference 加该线格式名，AAAA rdata 须恰为 16 字节；TXT
-    rdata 依次为一字节长度及内容，逐段加双引号输出（1..255 段），
-    双引号与反斜杠写转义形式、其余可打印字节原样写、非打印字节写
-    三位十进制 \\DDD，空段写 ""，段间单空格。对导出结果再 import_master
-    得到等价 zone；同一 zone 多次导出逐字节一致。zone 非 dict 抛
-    TypeError；名称及三类 rdata 的格式或长度错误（含尾随）抛
-    RecordError，zone 约束错误抛 ZoneError；类型或 class 不受支持、
-    记录超 65535 条或文本超 1048576 字符抛 ConfigError。
+    NS/CNAME 目标、MX 交换名与 SRV target 等于 origin 时输出 "@"，否则
+    输出小写绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不
+    压缩亦不含通配）；A 地址、AAAA 地址（IPv6Address 的小写压缩形式）、
+    TTL、SOA、MX preference 与 SRV priority/weight/port 整数均按规范
+    形式输出（无前导零）；NS/CNAME rdata 须为未压缩、0 结尾且无尾随的
+    线格式，MX rdata 须恰为网络序 uint16 preference 加该线格式名，
+    SRV rdata 须恰为三个网络序 uint16（priority、weight、port）加该
+    线格式 target，AAAA rdata 须恰为 16 字节；TXT rdata 依次为一字节
+    长度及内容，逐段加双引号输出（1..255 段），双引号与反斜杠写转义
+    形式、其余可打印字节原样写、非打印字节写三位十进制 \\DDD，空段写
+    ""，段间单空格；CAA rdata 须恰为一字节 flags、一字节 tag 长度
+    （1..15）、tag（小写 [a-z0-9-]）与 value 字节（总长 ≤65535），
+    输出为 flags（无前导零）、tag 与一对双引号串，value 的引号/反斜杠
+    转义、可打印原样与非打印 \\DDD 规则同 TXT，空 value 写 ""。对导出
+    结果再 import_master 得到等价 zone；同一 zone 多次导出逐字节一致。
+    zone 非 dict 抛 TypeError；名称及各 rdata 的格式或长度错误（含
+    截断、尾随、tag/长度错）抛 RecordError，zone 约束错误抛 ZoneError；
+    类型或 class 不受支持、记录超 65535 条或文本超 1048576 字符抛
+    ConfigError。
     """
     if not isinstance(zone, dict):
         raise TypeError("zone must be dict")
@@ -2614,6 +2784,17 @@ def export_master(zone: dict) -> str:
             txt = " ".join(_master_format_txt_segment(segment)
                            for segment in segments)
             lines.append(prefix + "TXT " + txt)
+        elif rrtype == _TYPE_SRV:
+            priority, weight, port, target = _master_decode_srv_rdata(rdata)
+            target_text = ("@" if target == origin_labels
+                           else _labels_to_name(target))
+            lines.append(prefix + "SRV "
+                         + str(priority) + " " + str(weight) + " "
+                         + str(port) + " " + target_text)
+        elif rrtype == _TYPE_CAA:
+            flags, tag, value = _master_decode_caa_rdata(rdata)
+            lines.append(prefix + "CAA " + str(flags) + " " + tag + " "
+                         + _master_format_caa_value(value))
         elif rrtype == _TYPE_SOA:
             mname, rname, numbers = _master_decode_soa_rdata(rdata)
             mname_text = ("@" if mname == origin_labels
@@ -2626,7 +2807,7 @@ def export_master(zone: dict) -> str:
         else:
             raise ConfigError(
                 "master export only supports A, NS, CNAME, MX, TXT, "
-                "AAAA and SOA")
+                "AAAA, SRV, CAA and SOA")
     text = "\n".join(lines) + "\n"
     if len(text) > _MAX_MASTER_TEXT_LEN:
         raise ConfigError("master text exceeds 1048576 characters")
