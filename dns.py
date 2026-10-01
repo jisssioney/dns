@@ -386,7 +386,17 @@
   操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，
   结果上限 16777216 字节。
 
-命令行：python dns.py decode HEX
+命令行：
+- python dns.py decode HEX：解码查询报文为紧凑 ASCII JSON（末尾换行）。
+- python dns.py answer ZONE_PATH QUERY_HEX [LIMIT]：读取 v0/v1/v2 区域
+  文件（至多 1048576 字节、须为 ASCII），对单问题查询给出权威应答；
+  stdout 仅写应答原始字节、无追加换行，stderr 恒为空。参数数量、空路径
+  或含 NUL、非法十六进制或 LIMIT（12..65535 的 ASCII 十进制整数）以
+  ArgumentError 退出 2 且不打开区域文件；文件不存在、不可读、超限、
+  非 ASCII 或配置结构非法以 ConfigError 退出 4，区域/记录语义非法分别
+  以 ZoneError/RecordError 退出 4；查询报文非法以 MessageError 退出 3；
+  不可应答、超 LIMIT 等编码失败以 EncodeError 退出 5，CNAME 名称重复
+  或超跳数以 CNAMEError 退出 5。
 """
 
 from bisect import bisect_right
@@ -758,6 +768,9 @@ _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
 _MIN_LIMIT = 12
 _MAX_LIMIT = 65535
+# answer 子命令区域文件读取上限（字节）；多读一字节即可判定超限，
+# 避免把超限文件整体读入内存。
+_MAX_ANSWER_ZONE_BYTES = 1048576
 _MAX_POINTER_TARGET = 0x3FFF
 _MAX_SECTION_RECORDS = 65535
 _FLAGS_RESPONSE = 0x8400  # QR | AA
@@ -10286,7 +10299,87 @@ def replay_cache(zone: dict, ops: list, expected=None) -> str:
     return result
 
 
+def _run_answer_cli(zone_path, hextext, limit_text):
+    """answer 子命令实现：参数通过后才打开区域文件。
+
+    返回 (退出码, stdout bytes, stderr 异常名或 None)；失败时 stdout 为
+    b""，由调用方向 stderr 写一个异常类型名加换行，不输出 traceback。
+    区域文件上限 1048576 字节、查询报文上限 512 字节、应答不超 LIMIT
+    （12..65535）。
+    """
+    # 参数校验：路径非空且不含 NUL，查询为非空偶长十六进制，LIMIT 缺省
+    # 512 或 12..65535 的 ASCII 十进制整数；失败不打开区域文件。
+    if zone_path == "" or "\x00" in zone_path:
+        return 2, b"", "ArgumentError"
+    if (not hextext or len(hextext) % 2
+            or any(c not in _HEXDIGITS for c in hextext)):
+        return 2, b"", "ArgumentError"
+    if limit_text is None:
+        limit = 512
+    elif (not limit_text or not limit_text.isascii()
+            or not limit_text.isdigit()):
+        return 2, b"", "ArgumentError"
+    else:
+        limit = int(limit_text)
+        if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
+            return 2, b"", "ArgumentError"
+    query = bytes.fromhex(hextext)
+    # 读取并导入区域：文件/配置结构错误归 ConfigError，区域/记录语义
+    # 错误沿用 ZoneError、RecordError，均退出 4。
+    try:
+        with open(zone_path, "rb") as stream:
+            data = stream.read(_MAX_ANSWER_ZONE_BYTES + 1)
+    except OSError:
+        return 4, b"", "ConfigError"
+    if len(data) > _MAX_ANSWER_ZONE_BYTES:
+        return 4, b"", "ConfigError"
+    if not data.isascii():
+        return 4, b"", "ConfigError"
+    text = data.decode("ascii")
+    try:
+        try:
+            config = json.loads(text, object_pairs_hook=_config_pairs)
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            # json 对超长整数抛非 JSONDecodeError 的 ValueError、对超深
+            # 嵌套抛 RecursionError，统一归为 ConfigError，不泄漏 json 异常。
+            raise ConfigError("invalid JSON") from None
+        zone, _version = _check_zone_config(config)
+        origin, rrs, _zone_class = _validate_zone(zone)
+        zone = {"origin": _labels_to_name(origin, wildcard=False),
+                "records": [_rr_to_model(rr) for rr in rrs]}
+    except ConfigError:
+        return 4, b"", "ConfigError"
+    except ZoneError:
+        return 4, b"", "ZoneError"
+    except RecordError:
+        return 4, b"", "RecordError"
+    # 区域导入后处理查询：报文格式错误 3；不可应答、超 LIMIT 等编码错误
+    # 与 CNAME 链错误 5。
+    try:
+        reply = answer(query, zone, limit)
+    except MessageError:
+        return 3, b"", "MessageError"
+    except CNAMEError:
+        return 5, b"", "CNAMEError"
+    except EncodeError:
+        return 5, b"", "EncodeError"
+    return 0, reply, None
+
+
 def main(argv):
+    if len(argv) >= 2 and argv[1] == "answer":
+        if len(argv) not in (4, 5):
+            sys.stderr.write("ArgumentError\n")
+            return 2
+        code, reply, error = _run_answer_cli(argv[2], argv[3],
+                                             argv[4] if len(argv) == 5
+                                             else None)
+        if error is not None:
+            sys.stderr.write(error + "\n")
+            return code
+        # 成功：仅应答原始字节，无追加换行，stderr 为空。
+        sys.stdout.buffer.write(reply)
+        return 0
     if len(argv) != 3 or argv[1] != "decode":
         sys.stderr.write("ArgumentError\n")
         return 2
