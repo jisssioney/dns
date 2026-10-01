@@ -28,7 +28,9 @@
 - ReplayError: 回放操作序列非法或回放记录与期望不符（ValueError 子类）。
 - PolicyError: 授权规则数量、键序或字段值非法（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
-- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文。
+- encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文；
+  超限或区段计数超 16 位时按 RRset 原子截断（规范化 owner、数值 type、
+  class 同一集合整组删除，键不含 TTL/rdata；ar、ns、an 优先级，置 TC）。
 - edns(query: bytes, model: dict, rcode: int = 0, options: list | None = None)
   -> bytes: 编码可含 OPT（查询 RDATA 按选项 TLV 解析）的 EDNS 应答报文；
   OPT 版本 1..255 时返回 BADVERS 版本协商应答。
@@ -39,8 +41,9 @@
 - edns_padded(query: bytes, model: dict, block: int = 128, rcode: int = 0)
   -> bytes: 编码 EDNS(0) Padding（选项码 12）应答；查询须恰有一个 OPT，
   版本 0 时 Padding 至多一项且 data 全零，应答 OPT 仅含一个 Padding
-  TLV，按 ar、ns、an 尾删候选取首个 B+(-B)%block≤min(limit, CLASS)
-  者填零；版本 1..255 在全部参数校验后返回 BADVERS 且不填充。
+  TLV，按 ar、ns、an 的 RRset 整组淘汰枚举候选取首个
+  B+(-B)%block≤min(limit, CLASS) 者填零；版本 1..255 在全部参数校验后
+  返回 BADVERS 且不填充。
 - edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
   rcode: int = 0) -> bytes: 编码 EDNS(0) EDE（选项码 15）应答；查询须
   恰含一个版本 0 的 OPT（缺失或版本非 0 抛 EDEError），查询选项不
@@ -399,7 +402,6 @@
   或超跳数以 CNAMEError 退出 5。
 """
 
-from bisect import bisect_right
 from collections import deque
 import base64
 import copy
@@ -817,9 +819,9 @@ _MIN_COOKIE_SECRET_LEN = 16
 _MAX_COOKIE_SECRET_LEN = 64
 _RCODE_BADCOOKIE = 23
 # EDNS(0) Padding（选项码 12）：版本 0 查询至多一个 Padding 且 data
-# 全零；应答 OPT 仅含一个 Padding TLV，按 ar、ns、an 尾删候选取首个
-# B+(-B)%block≤min(limit, CLASS) 者填零（B 为候选含零长 TLV 的报文
-# 长度，n=0 仍保留 TLV）。block 限 16..512 内 2 的幂。
+# 全零；应答 OPT 仅含一个 Padding TLV，按 ar、ns、an 的 RRset 整组淘汰
+# 枚举候选取首个 B+(-B)%block≤min(limit, CLASS) 者填零（B 为候选含零长
+# TLV 的报文长度，n=0 仍保留 TLV）。block 限 16..512 内 2 的幂。
 _OPT_CODE_PADDING = 12
 _MIN_PADDING_BLOCK = 16
 _MAX_PADDING_BLOCK = 512
@@ -1422,8 +1424,12 @@ def _validate_zone(zone):
     return origin, rrs, rrclass
 
 
-def _write_name(out, labels, offsets):
-    """把域名写入 out；offsets 记录已出现的标签边界（后缀 -> 最小偏移）。"""
+def _write_name(out, labels, offsets, log=None):
+    """把域名写入 out；offsets 记录已出现的标签边界（后缀 -> 最小偏移）。
+
+    log 非 None 时，实际新插入 offsets 的 (位置, 后缀) 追加其中，供
+    RRset 截断按起始偏移回滚压缩表。
+    """
     match = 0
     target = None
     for i in range(len(labels)):
@@ -1437,7 +1443,12 @@ def _write_name(out, labels, offsets):
         if i >= stop:
             break
         if len(out) <= _MAX_POINTER_TARGET:
-            offsets.setdefault(tuple(labels[i:]), len(out))
+            suffix = tuple(labels[i:])
+            position = len(out)
+            if suffix not in offsets:
+                offsets[suffix] = position
+                if log is not None:
+                    log.append((position, suffix))
         out.append(len(label))
         out.extend(label)
     if target is not None:
@@ -1446,39 +1457,268 @@ def _write_name(out, labels, offsets):
         out.append(0)
 
 
-def _build_message(msg, an, ns, ar, rcode):
-    """一次性编码完整报文，返回 (out, body_base, 各区段 RR 结束偏移, flags)。
+def _name_wire_len(labels, offsets):
+    """以只读 offsets（压缩表在偏移 16383 后冻结）计算名字编码字节数。
 
-    尾删只保留报文前缀：压缩指针只指向更早写入的名字，保留的前缀
-    自身即合法报文，故按结束偏移切片即可，无需反复重新编码。
+    与 _write_name 的压缩判定一致，但不写缓冲、不改表，用于冷区记录的
+    长度记账：压缩指针只能指向 <= 0x3FFF 的偏移，offsets 已为该冻结表，
+    故冷区记录编码只取决于此表，不随其后冷区记录的增删而变。
     """
-    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT) | rcode
-    out = bytearray()
-    out += msg["id"].to_bytes(2, "big")
-    out += flags.to_bytes(2, "big")
-    out += len(msg["questions"]).to_bytes(2, "big")
-    out += len(an).to_bytes(2, "big")
-    out += len(ns).to_bytes(2, "big")
-    out += len(ar).to_bytes(2, "big")
-    offsets = {}
-    for question in msg["questions"]:
-        _write_name(out, _normalize_name(question["name"]), offsets)
-        out += question["type"].to_bytes(2, "big")
-        out += question["class"].to_bytes(2, "big")
-    body_base = len(out)
-    section_ends = []
-    for section in (an, ns, ar):
-        ends = []
-        for labels, rrtype, rrclass, ttl, rdata in section:
-            _write_name(out, labels, offsets)
-            out += rrtype.to_bytes(2, "big")
-            out += rrclass.to_bytes(2, "big")
-            out += ttl.to_bytes(4, "big")
-            out += len(rdata).to_bytes(2, "big")
-            out += rdata
-            ends.append(len(out))
-        section_ends.append(ends)
-    return out, body_base, section_ends, flags
+    match = 0
+    for i in range(len(labels)):
+        if tuple(labels[i:]) in offsets:
+            match = len(labels) - i
+            break
+    if match:
+        matched = sum(len(labels[i]) + 1
+                      for i in range(len(labels) - match))
+        return matched + 2
+    return sum(len(label) + 1 for label in labels) + 1
+
+
+def _rrset_unit(rr, position):
+    """RR 在所属区段内的 RRset 单元键：规范化 owner、数值 type、数值 class。
+
+    键不含 TTL 与 rdata；OPT（TYPE41）不属于 RRset，每条各自为独立
+    单元（以位置区分），不与任何其他记录成组。
+    """
+    if rr[1] == _TYPE_OPT:
+        return ("opt", position)
+    return (tuple(rr[0]), rr[1], rr[2])
+
+
+class _RRsetPlan:
+    """RRset 原子截断的线性编码器，供 encode_response/edns/edns_padded 共用。
+
+    三段按 an、ns、ar 线序编码；淘汰按 ar、ns、an 优先级，每次删除当前
+    区段最后一条保留记录所属整个 RRset 在该区段的全部成员（即使原顺序
+    不相邻），其余记录保持相对顺序。应答 OPT 不进入模型区段（ar 计数
+    预算相应减一），由调用方在定稿时作为附加段末项追加。
+
+    长度淘汰利用名字压缩的 16 位指针边界（目标偏移只可能 <= 0x3FFF）：
+    名字起始偏移超过该边界的“冷”记录不会在压缩表注册任何后缀，其编码
+    只取决于边界前约 16KB“热”前缀冻结下来的压缩表，故删除一个全部成员
+    皆冷的 RRset 时热前缀与其他冷记录编码都不变，只需按其记录长度记账
+    （O(成员数)）；只有触及热前缀的 RRset 才重建热前缀（至多约 16KB，
+    与输入总记录数无关）并刷新受影响冷记录长度。每个 RRset 至多删除
+    一次，单次处理时间与额外内存受区段记录数及编码总量的线性上界约束。
+    """
+
+    def __init__(self, msg, sections, rcode_low, caps):
+        self.msg = msg
+        self.rcode_low = rcode_low
+        self.flags = (_FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+                      | rcode_low)
+        self.sections = [list(section) for section in sections]
+        self.caps = caps
+        self.nexts = []
+        self.prevs = []
+        self.heads = []
+        self.tails = []
+        self.counts = []
+        self.key_at = []
+        self.groups = []
+        self.hot = []
+        self.cold_len = []
+        for section in self.sections:
+            size = len(section)
+            self.nexts.append((list(range(1, size)) + [-1]) if size else [])
+            self.prevs.append(([-1] + list(range(0, size - 1)))
+                              if size else [])
+            self.heads.append(0 if size else -1)
+            self.tails.append(size - 1 if size else -1)
+            self.counts.append(size)
+            keys = [None] * size
+            membership = {}
+            for position, rr in enumerate(section):
+                key = _rrset_unit(rr, position)
+                keys[position] = key
+                membership.setdefault(key, []).append(position)
+            self.key_at.append(keys)
+            self.groups.append(membership)
+            self.hot.append([False] * size)
+            self.cold_len.append([0] * size)
+        self.truncated = False
+        # 计数为 16 位：超上限先按同一 RRset 规则尾删，被删记录不编码。
+        while True:
+            section = next((i for i in (2, 1, 0)
+                            if self.counts[i] > self.caps[i]), None)
+            if section is None:
+                break
+            self._drop_tail_group(section)
+        # 冷记录长度依赖索引：名字后缀 -> 含该后缀的保留记录集合，键为
+        # (section, position)。冻结压缩后缀集合变化时只重测这些记录；
+        # 每条记录每轮经 stamp 去重至多计一次。
+        self.refs = {}
+        for section in (0, 1, 2):
+            position = self.heads[section]
+            while position != -1:
+                token = (section, position)
+                labels = self.sections[section][position][0]
+                for i in range(len(labels) + 1):
+                    self.refs.setdefault(tuple(labels[i:]), set()).add(token)
+                position = self.nexts[section][position]
+        self.stamp = [[0] * len(section) for section in self.sections]
+        self.gen = 0
+        self.head = bytearray()
+        self.offsets = {}
+        self.frozen = frozenset()
+        self.cold_total = 0
+        self._encode_head()
+
+    def _unlink(self, section, position):
+        previous = self.prevs[section][position]
+        following = self.nexts[section][position]
+        if previous != -1:
+            self.nexts[section][previous] = following
+        else:
+            self.heads[section] = following
+        if following != -1:
+            self.prevs[section][following] = previous
+        else:
+            self.tails[section] = previous
+
+    def _drop_tail_group(self, section):
+        """删除该区段最后一条保留记录所属的整个 RRset（仅断链与计数）。"""
+        tail = self.tails[section]
+        key = self.key_at[section][tail]
+        members = self.groups[section].pop(key)
+        for position in members:
+            self._unlink(section, position)
+        self.counts[section] -= len(members)
+        self.truncated = True
+        return members
+
+    def _write_questions(self, out, offsets, log):
+        for question in self.msg["questions"]:
+            _write_name(out, _normalize_name(question["name"]),
+                        offsets, log)
+            out += question["type"].to_bytes(2, "big")
+            out += question["class"].to_bytes(2, "big")
+
+    def _encode_head(self, removed=()):
+        """重新编码热前缀（名字起始 <= 0x3FFF）。
+
+        removed 为本轮删除的 (section, position)：其中原冷成员先从冷长度
+        合计扣除；越界后被提升为热成员的原冷记录同样扣除其旧冷长度。
+        仅当冻结压缩后缀集合确有变化时才重算其余冷记录长度——热前缀
+        恒为约 16KB，而问题段锚定的共享后缀（如同区 owner 的公共后缀）
+        通常不变，纯冷 RRset 淘汰根本不进入本函数。
+        """
+        for section, position in removed:
+            if not self.hot[section][position]:
+                self.cold_total -= self.cold_len[section][position]
+                self.hot[section][position] = False
+        out = bytearray()
+        out += self.msg["id"].to_bytes(2, "big")
+        out += self.flags.to_bytes(2, "big")
+        out += len(self.msg["questions"]).to_bytes(2, "big")
+        out += (0).to_bytes(6)  # 三段计数占位，定稿前回填
+        offsets = {}
+        log = []
+        self._write_questions(out, offsets, log)
+        new_hot = [[False] * len(section) for section in self.sections]
+        cold_len = self.cold_len
+        in_cold = False
+        for section in (0, 1, 2):
+            position = self.heads[section]
+            while position != -1:
+                rr = self.sections[section][position]
+                if not in_cold and len(out) <= _MAX_POINTER_TARGET:
+                    _write_name(out, rr[0], offsets, log)
+                    out += rr[1].to_bytes(2, "big")
+                    out += rr[2].to_bytes(2, "big")
+                    out += rr[3].to_bytes(4, "big")
+                    out += len(rr[4]).to_bytes(2, "big")
+                    out += rr[4]
+                    new_hot[section][position] = True
+                    if self.hot[section] and not self.hot[section][position]:
+                        # 原冷记录提升为热：其旧冷长度不再计入合计。
+                        self.cold_total -= cold_len[section][position]
+                else:
+                    in_cold = True  # 越过指针边界后全部为冷记录
+                position = self.nexts[section][position]
+        new_frozen = frozenset(offsets)
+        self.head = out
+        self.offsets = offsets
+        self.hot = new_hot
+        changed = new_frozen.symmetric_difference(self.frozen)
+        if changed:
+            # 冻结后缀集合变化：只重测名字含新增/消失后缀的保留冷记录，
+            # 经 stamp 去重每条记录本轮至多计一次。根后缀恒在冻结表，
+            # 故首轮即可覆盖全部冷记录。
+            self.frozen = new_frozen
+            self.gen += 1
+            gen = self.gen
+            for suffix in changed:
+                for section, position in self.refs.get(suffix, ()):
+                    if self.stamp[section][position] == gen:
+                        continue
+                    self.stamp[section][position] = gen
+                    if new_hot[section][position]:
+                        continue
+                    rr = self.sections[section][position]
+                    new_len = (_name_wire_len(rr[0], offsets) + 10
+                               + len(rr[4]))
+                    self.cold_total += (new_len
+                                        - cold_len[section][position])
+                    cold_len[section][position] = new_len
+
+    def drop_last_group(self, section):
+        """删除该区段尾记录所属 RRset，并维护热前缀/冷长度记账。"""
+        members = self._drop_tail_group(section)
+        for position in members:
+            labels = self.sections[section][position][0]
+            for i in range(len(labels) + 1):
+                refs = self.refs.get(tuple(labels[i:]))
+                if refs is not None:
+                    refs.discard((section, position))
+        if all(not self.hot[section][position] for position in members):
+            # 全冷 RRset：热前缀与冻结压缩表不变，仅扣除成员冷长度。
+            for position in members:
+                self.cold_total -= self.cold_len[section][position]
+            return
+        # 组内含热前缀成员：热前缀改变，重编码并按需刷新冷记录长度。
+        self._encode_head([(section, position) for position in members])
+
+    def body_len(self):
+        return len(self.head) + self.cold_total
+
+    def fit(self, body_limit):
+        """按 ar、ns、an 优先级整体淘汰 RRset，直到编码体不长于上限。"""
+        while self.body_len() > body_limit:
+            section = next((i for i in (2, 1, 0)
+                            if self.counts[i] > 0), None)
+            if section is None:
+                # 三段已空仍超限：只剩头部与问题段，无法再淘汰。
+                raise EncodeError("header and question exceed limit")
+            self.drop_last_group(section)
+
+    def finalize(self, suffix=b"", ar_extra=0):
+        """一次性写出热前缀与全部冷记录，追加 suffix（应答 OPT），回填
+        区段计数与（删除过普通 RR 时的）TC，返回应答字节。"""
+        out = self.head
+        offsets = self.offsets
+        for section in (0, 1, 2):
+            position = self.heads[section]
+            while position != -1:
+                if not self.hot[section][position]:
+                    rr = self.sections[section][position]
+                    _write_name(out, rr[0], offsets, None)
+                    out += rr[1].to_bytes(2, "big")
+                    out += rr[2].to_bytes(2, "big")
+                    out += rr[3].to_bytes(4, "big")
+                    out += len(rr[4]).to_bytes(2, "big")
+                    out += rr[4]
+                position = self.nexts[section][position]
+        out += suffix
+        na, nn, nr = self.counts
+        out[6:8] = na.to_bytes(2, "big")
+        out[8:10] = nn.to_bytes(2, "big")
+        out[10:12] = (nr + ar_extra).to_bytes(2, "big")
+        if self.truncated:
+            out[2:4] = (self.flags | _FLAG_TC).to_bytes(2, "big")
+        return bytes(out)
 
 
 def _encode_response(query, model, rcode):
@@ -1494,43 +1734,14 @@ def _encode_response(query, model, rcode):
         raise EncodeError("query has QR set")
     if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
         raise EncodeError("limit out of range")
-    truncated = False
-    # 区段计数为 16 位：超过 65535 条时按 ar、ns、an 尾删整条并置 TC，
-    # 不得让计数溢出。
-    for section in (ar, ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode)
-    na, nn, nr = len(an), len(ns), len(ar)
-    total_end = ar_ends[-1] if ar_ends else (
-        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
-    if total_end > limit:
-        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
-        truncated = True
-        nr = bisect_right(ar_ends, limit)
-        if nr == 0:
-            nn = bisect_right(ns_ends, limit)
-            if nn == 0:
-                na = bisect_right(an_ends, limit)
-                if na == 0 and body_base > limit:
-                    raise EncodeError("header and question exceed limit")
-    if nr:
-        end = ar_ends[nr - 1]
-    elif nn:
-        end = ns_ends[nn - 1]
-    elif na:
-        end = an_ends[na - 1]
-    else:
-        end = body_base
-    result = bytearray(out[:end])
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = nr.to_bytes(2, "big")
-    if truncated:
-        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
-    return bytes(result)
+    # RRset 原子截断：计数超 16 位或总长超限时按 ar、ns、an 优先级，
+    # 每次整组删除当前区段尾记录所属 RRset（规范化 owner、type、class，
+    # 不含 TTL/rdata），其余记录保持相对顺序；删过普通 RR 集即置 TC。
+    # 三段清空后仍超限时仅头部与问题段，抛 EncodeError。
+    caps = (_MAX_SECTION_RECORDS,) * 3
+    plan = _RRsetPlan(msg, (an, ns, ar), rcode, caps)
+    plan.fit(limit)
+    return plan.finalize()
 
 
 def encode_response(query: bytes, model: dict) -> bytes:
@@ -1593,9 +1804,10 @@ def edns(query: bytes, model: dict, rcode: int = 0,
     flags&0x7910)，问题重编码，AN=NS=0、AR=1，OPT 为根 owner、
     TYPE41、回显 CLASS 与 DO，TTL=DO?0x01008000:0x01000000，
     RDLENGTH=0），上限 min(model.limit, CLASS)，超限抛 EncodeError
-    且不置 TC。版本 0 时编码其余同 encode_response：超限普通 RR 按
-    ar、ns、an 尾删并置 TC，OPT 固定不删不截；问题与 OPT 超限抛
-    EncodeError。
+    且不置 TC。版本 0 时编码其余同 encode_response：超限或区段计数超
+    16 位时按 RRset 原子截断（每区按规范化 owner、type、class 成组，
+    不含 TTL/rdata；ar、ns、an 优先级整组删除并置 TC），OPT 固定保留
+    为附加段末项不删不截、其空间先行预留；问题与 OPT 超限抛 EncodeError。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1637,48 +1849,15 @@ def edns(query: bytes, model: dict, rcode: int = 0,
         opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
                     + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
                     + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
-    truncated = False
-    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
-    max_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
-    if len(ar) > max_ar:
-        del ar[max_ar:]
-        truncated = True
-    for section in (ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode & 0xF)
-    body_limit = limit - len(opt_wire)  # 为 OPT 预留，OPT 不参与尾删
-    na, nn, nr = len(an), len(ns), len(ar)
-    total_end = ar_ends[-1] if ar_ends else (
-        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
-    if total_end > body_limit:
-        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
-        truncated = True
-        nr = bisect_right(ar_ends, body_limit)
-        if nr == 0:
-            nn = bisect_right(ns_ends, body_limit)
-            if nn == 0:
-                na = bisect_right(an_ends, body_limit)
-                if na == 0 and body_base > body_limit:
-                    raise EncodeError("header and question exceed limit")
-    if nr:
-        end = ar_ends[nr - 1]
-    elif nn:
-        end = ns_ends[nn - 1]
-    elif na:
-        end = an_ends[na - 1]
-    else:
-        end = body_base
-    result = bytearray(out[:end])
-    result += opt_wire
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = (nr + (1 if opt_wire else 0)).to_bytes(2, "big")
-    if truncated:
-        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
-    return bytes(result)
+    # RRset 原子截断：OPT 占 ar 一席且固定为末项不删，model ar 的计数
+    # 预算相应减一；先为 OPT 预留空间，普通 RR 按 ar、ns、an 整组淘汰。
+    cap_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
+    caps = (_MAX_SECTION_RECORDS, _MAX_SECTION_RECORDS, cap_ar)
+    body_limit = limit - len(opt_wire)
+    plan = _RRsetPlan(msg, (an, ns, ar), rcode & 0xF, caps)
+    plan.fit(body_limit)
+    # OPT 固定为附加段末项，不参与 RRset 重组，定稿时追加。
+    return plan.finalize(opt_wire, 1 if opt_wire else 0)
 
 
 def _server_cookie(secret, family, packed, client_cookie):
@@ -1703,7 +1882,7 @@ def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
     应答；不匹配时先完成 model 校验，再以空 an/ns/ar 与扩展 RCODE 23
     应答。应答 OPT 回显 CLASS、DO、版本 0，RDATA 仅含码 10，data 为
     8 字节客户端值加新算的 16 字节服务端值；OPT 固定不删，超限与普通
-    RR 尾删规则沿用 edns。相同参数逐字节一致。
+    RR 的 RRset 原子截断规则沿用 edns。相同参数逐字节一致。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1771,12 +1950,14 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
     校验后返回既有 BADVERS 应答（同 edns 的版本协商契约：model 三段
     须空、rcode 须为 0），不填充。版本 0 查询中 Padding 选项至多一
     项且 data 全零，否则抛 EDNSError；其余选项一律忽略、不回显。
-    应答 OPT 仅含一个 Padding TLV：按 ar、ns、an 尾删顺序枚举候选
-    （优先保留最多普通 RR），B 为候选含零长 TLV 时的报文长度，
-    n=(-B)%block，取首个 B+n≤min(model.limit, OPT CLASS) 的候选并
-    写 n 个零（n=0 仍保留 TLV）；无候选抛 EncodeError。OPT 不删不
-    截，仅删过普通 RR 才置 TC；标志、扩展 RCODE、名称压缩与其余异
-    常沿用 edns。相同参数逐字节一致，时空 O(报文长+RR 数)。
+    应答 OPT 仅含一个 Padding TLV：按 ar、ns、an 的 RRset 整组淘汰顺序
+    枚举候选（优先保留最多普通 RR，每区按规范化 owner、type、class
+    成组，不含 TTL/rdata，删除该组在区内全部成员即使不相邻），B 为
+    候选含零长 TLV 时的报文长度，n=(-B)%block，取首个
+    B+n≤min(model.limit, OPT CLASS) 的候选并写 n 个零（n=0 仍保留
+    TLV）；无候选抛 EncodeError。OPT 不删不截，仅删过普通 RRset 才置
+    TC；标志、扩展 RCODE、名称压缩与其余异常沿用 edns。相同参数逐字节
+    一致，时空 O(报文长+RR 数)。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1815,61 +1996,37 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
         if any(data):
             raise EDNSError("PADDING data must be all zeros")
         seen_padding = True
-    truncated = False
-    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
-    max_ar = _MAX_SECTION_RECORDS - 1
-    if len(ar) > max_ar:
-        del ar[max_ar:]
-        truncated = True
-    for section in (ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
     opt_class, _opt_version, do, _query_opts = opt
     limit = min(limit, opt_class)
     ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode & 0xF)
+    # OPT 占 ar 一席且固定为末项；计数超限时先做 RRset 原子预修剪。
+    caps = (_MAX_SECTION_RECORDS, _MAX_SECTION_RECORDS,
+            _MAX_SECTION_RECORDS - 1)
+    plan = _RRsetPlan(msg, (an, ns, ar), rcode & 0xF, caps)
     # OPT 固定部分（根 owner、TYPE41、CLASS、TTL）与零长 TLV 的字节数。
     opt_fixed = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
                  + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big"))
     zero_tlv_len = len(opt_fixed) + 2 + 4  # RDLENGTH 字段 + 零长 TLV
-    # 候选按 ar、ns、an 尾删顺序枚举，优先保留最多普通 RR。
-    candidates = (
-        [(len(an), len(ns), nr) for nr in range(len(ar), -1, -1)]
-        + [(len(an), nn, 0) for nn in range(len(ns) - 1, -1, -1)]
-        + [(na, 0, 0) for na in range(len(an) - 1, -1, -1)])
-    chosen = None
-    for na, nn, nr in candidates:
-        if nr:
-            end = ar_ends[nr - 1]
-        elif nn:
-            end = ns_ends[nn - 1]
-        elif na:
-            end = an_ends[na - 1]
-        else:
-            end = body_base
-        msg_len = end + zero_tlv_len  # B：候选含零长 TLV 时的报文长度
+    # 候选按 ar、ns、an 的 RRset 整组淘汰顺序枚举，优先保留最多普通 RR：
+    # 每淘汰一组维护一次热前缀/冷长度记账，B 为候选含零长 TLV 时的
+    # 报文长度（=热前缀+冷记录+零长 TLV）。
+    chosen_pad = None
+    while True:
+        msg_len = plan.body_len() + zero_tlv_len  # B
         pad = (-msg_len) % block
         if msg_len + pad <= limit:
-            chosen = (na, nn, nr, end, pad)
+            chosen_pad = pad
             break
-    if chosen is None:
-        raise EncodeError("no padding candidate fits the limit")
-    na, nn, nr, end, pad = chosen
-    if (na, nn, nr) != (len(an), len(ns), len(ar)):
-        truncated = True
-    tlv = (_OPT_CODE_PADDING.to_bytes(2, "big") + pad.to_bytes(2, "big")
-           + b"\x00" * pad)
-    opt_wire = opt_fixed + (4 + pad).to_bytes(2, "big") + tlv
-    result = bytearray(out[:end])
-    result += opt_wire
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = (nr + 1).to_bytes(2, "big")
-    if truncated:
-        result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
-    return bytes(result)
+        section = next((i for i in (2, 1, 0)
+                        if plan.counts[i] > 0), None)
+        if section is None:
+            raise EncodeError("no padding candidate fits the limit")
+        plan.drop_last_group(section)
+    tlv = (_OPT_CODE_PADDING.to_bytes(2, "big")
+           + chosen_pad.to_bytes(2, "big") + b"\x00" * chosen_pad)
+    opt_wire = opt_fixed + (4 + chosen_pad).to_bytes(2, "big") + tlv
+    # OPT 固定为附加段末项，不参与 RRset 重组，定稿时追加。
+    return plan.finalize(opt_wire, 1)
 
 
 def edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
@@ -1884,8 +2041,9 @@ def edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
     0，扩展 RCODE 取 rcode>>4、头部低 4 位取 rcode&15，RDATA 仅含一
     个 EDE TLV：code=15、length=2+text 的 UTF-8 字节数、data 为网络
     序 uint16 info_code 后接 text 的 UTF-8 字节（可为空）。上限
-    min(model.limit, OPT CLASS)；超限普通 RR 按 ar、ns、an 尾删并置
-    TC，OPT 不删不截，删空仍超限抛 EncodeError。其余错误沿用 edns。
+    min(model.limit, OPT CLASS)；超限或区段计数超 16 位时按 RRset 原子
+    截断（ar、ns、an 优先级，整组删除并置 TC），OPT 不删不截，删空仍
+    超限抛 EncodeError。其余错误沿用 edns。
     相同参数逐字节一致，时空 O(报文长+RR 数)。
     """
     if not isinstance(query, bytes):
@@ -3910,9 +4068,11 @@ class PositiveCache:
     ECS 时仅回写码 8 选项（family、source 不变，scope=source，
     address 同查询，其他选项不回显；ECS 使报文超 min(limit,OPT
     CLASS) 抛 EncodeError），无 ECS 时扩展码、版本及 RDLENGTH 为 0，
-    普通 RR 超限按既有顺序整条尾删并置 TC、OPT
+    普通 RR 超限或区段计数超 16 位时按 RRset 原子截断整组删除并置
+    TC（规范化 owner、type、class 同组，不含 TTL/rdata；ar、ns、an
+    优先级）、OPT
     不删，头部、问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计
-    或最后时刻，成功原子提交；无 ECS 输出与既有逐字节相同。
+    或最后时刻，成功原子提交；未触发截断时输出与既有逐字节相同。
 
     stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
     h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
