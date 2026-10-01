@@ -1,5 +1,17 @@
 """DNS 问题报文解码与确定性权威应答编码（仅标准库、离线）。
 
+名称统一使用绝对名文本，支持端到端的八位组转义：线格式标签可为任意
+八位组；文本输入除既有字符外接受反斜杠后三位十进制 \\DDD（000..255）
+以及 \\.、\\\\ 两种简写，未转义的点分隔标签。规范输出把 ASCII 大写折
+为小写，字母、数字、下划线与连字符原样保留，其余八位组统一写成三位
+十进制 \\DDD，根名恒为 "."。线格式等价（仅大小写或合法转义拼写不同）
+的名称在 answer、缓存、Resolver、authorize 与两类限流器中视为同一键；
+比较仅对 ASCII 字母忽略大小写，其他八位组逐字节比较。解码后首标签
+恰为单字节星号的 owner 沿用通配语义。主文件中反斜杠残缺、非三位数
+字转义或数值超过 255 抛 ConfigError，合法转义后违反名称长度抛
+RecordError；模型中的同类错误抛 RecordError，策略与限流规则中的非
+规范名称抛 PolicyError。
+
 公开接口：
 - MessageError: 报文格式错误（ValueError 子类）。
 - EDNSError: EDNS 查询截断、尾随、名字非法、AN/NS 非空或 AR/OPT
@@ -676,12 +688,339 @@ _RECURSIVE_UP_KEYS = ["l", "t"]
 _RECURSIVE_UP_ROWS = _MAX_RECURSION_LEVELS
 _RECURSIVE_UP_COLS = 7
 
+# 名称八位组：
+# - 线格式标签可为任意八位组；0x2E（"."）仅在转义文本中以 \. 出现，
+#   未转义的点永远是标签分隔符；0x2A（"*"）仅作为 owner 最左整标签时
+#   才具通配语义（标签恰为单字节 0x2A）。
+# - 规范文本：ASCII 大写折为小写；字母、数字、下划线、连字符原样；其余
+#   八位组（含点、星、反斜杠等）统一写三位十进制 \DDD；根名恒为 "."。
+_OCTET_DOT = 0x2E
+_OCTET_STAR = 0x2A
+_OCTET_BACKSLASH = 0x5C
+# 原样保留的 ASCII 八位组：小写字母、数字、下划线、连字符；大写字母
+# 规范化时折为小写后亦原样。
+_NAME_SAFE_OCTETS = frozenset(
+    b"abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _canonical_label_text(label: bytes) -> str:
+    """把单个线格式标签（任意八位组）渲染为规范文本（不含分隔点）。
+
+    大写 ASCII 折小写；小写字母、数字、下划线、连字符原样；其余八位组
+    （含点、星、反斜杠）写三位十进制 \\DDD。
+    """
+    out = []
+    for octet in label:
+        if 0x41 <= octet <= 0x5A:
+            out.append(chr(octet + 0x20))
+        elif octet in _NAME_SAFE_OCTETS:
+            out.append(chr(octet))
+        else:
+            out.append("\\%03d" % octet)
+    return "".join(out)
+
+
+def _canonical_octet(octet):
+    """名称键规范化：ASCII 大写字母折小写，其余八位组原样。"""
+    if 0x41 <= octet <= 0x5A:
+        return octet + 0x20
+    return octet
+
+
+def _canonical_wire_label(label: bytes) -> bytes:
+    """单个标签的规范线格式：仅折 ASCII 大写字母，其余八位组逐字节保留。"""
+    return bytes(_canonical_octet(octet) for octet in label)
+
+
+def _labels_to_name(labels):
+    """把线格式标签列表（bytes）还原为规范绝对名文本（根为 "."）。"""
+    if not labels:
+        return "."
+    return ".".join(_canonical_label_text(label) for label in labels) + "."
+
+
+def _owner_to_name(labels):
+    """owner 的规范绝对名文本：最左标签恰为单字节星号时沿用 "*" 拼写，
+    其余同 _labels_to_name。"""
+    if labels and labels[0] == b"*":
+        suffix = labels[1:]
+        if not suffix:
+            return "*."
+        return "*." + ".".join(_canonical_label_text(label)
+                               for label in suffix) + "."
+    return _labels_to_name(labels)
+
+
+def _parse_escaped_label(text, start, error_cls, bare_chars=None):
+    """解析转义名称文本中的一个标签，返回 (标签 bytes, 下一偏移)。
+
+    未转义的 0x2E 为标签结束（不消费该点）；普通字符须在 bare_chars 中
+    （None 表示任意 ASCII 字符），反斜杠后仅接受三位十进制 \\DDD
+    （000..255）、"\\." 与 "\\\\"。文本须为纯 ASCII（调用方先行保证，
+    非 ASCII 视为非法字符）。残缺转义、非三位数字或数值超过 255 抛
+    error_cls。
+    """
+    length = len(text)
+    out = bytearray()
+    pos = start
+    while pos < length:
+        ch = text[pos]
+        if ch == ".":
+            return bytes(out), pos
+        if ch == "\\":
+            if pos + 1 >= length:
+                raise error_cls("dangling backslash in name")
+            escaped = text[pos + 1]
+            if escaped == ".":
+                out.append(_OCTET_DOT)
+                pos += 2
+            elif escaped == "\\":
+                out.append(_OCTET_BACKSLASH)
+                pos += 2
+            else:
+                digits = text[pos + 1:pos + 4]
+                if (len(digits) != 3 or not digits.isascii()
+                        or not digits.isdigit()):
+                    raise error_cls("name escape must be \\DDD, \\. or \\\\")
+                value = int(digits)
+                if value > 0xFF:
+                    raise error_cls("name escape out of range")
+                out.append(value)
+                pos += 4
+            continue
+        if not ch.isascii() or (bare_chars is not None and ch not in bare_chars):
+            raise error_cls("invalid label character")
+        out.append(ord(ch))
+        pos += 1
+    return bytes(out), pos
+
+
+def _parse_escaped_name(name, error_cls, star_mode="reject"):
+    """把转义绝对名文本解析为线格式标签 bytes 列表（根为 []）。
+
+    未转义的点分隔标签；普通字符沿用既有集合（大小写字母、数字、下划线、
+    连字符），反斜杠转义可引入任意八位组（规则见 _parse_escaped_label）。
+    每个标签解码后须为 1..63 字节，整名线格式不超过 255 字节。
+
+    star_mode 控制星号八位组（0x2A）："reject" 时任何标签含星号均非法
+    （zone origin、应答模型 RR owner）；"owner" 时允许首个标签恰为单字节
+    "*"（zone owner 通配，含 "\\042" 拼写），其余星号非法；"allow" 时
+    星号按普通八位组接受（查询问题名）。非绝对名、非 str、非法转义、
+    裸非法字符或长度违规一律抛 error_cls（name 非 str 抛 TypeError）。
+    """
+    if not isinstance(name, str):
+        raise TypeError("name must be str")
+    if not name.endswith("."):
+        raise error_cls("name not absolute")
+    if not name.isascii():
+        raise error_cls("name must be ASCII")
+    if name == ".":
+        return []  # 根名
+    pieces_text = name[:-1]
+    labels = []
+    wire_len = 1  # 根终止符占 1 字节
+    pos = 0
+    index = 0
+    total = len(pieces_text)
+    while True:
+        # 裸 "*" 仅在 owner 模式下允许作为最左整标签；allow 模式（查询问题
+        # 名）把星号当普通八位组接受——owner 计划文本会把单字节星号首标签
+        # 渲染为裸 "*"。非规范拼写仍由调用方的规范文本比较拒绝。
+        if star_mode == "allow" and pos < total and pieces_text[pos] == "*":
+            label_chars = _LABEL_CHARS | frozenset("*")
+            label, pos = _parse_escaped_label(
+                pieces_text, pos, error_cls, label_chars)
+        elif (star_mode == "owner" and index == 0
+                and pos < total and pieces_text[pos] == "*"
+                and (pos + 1 == total or pieces_text[pos + 1] == ".")):
+            label = b"*"
+            pos += 1
+        else:
+            label, pos = _parse_escaped_label(
+                pieces_text, pos, error_cls, _LABEL_CHARS)
+        if not 1 <= len(label) <= _MAX_LABEL_LEN:
+            raise error_cls("bad label length")
+        if star_mode == "owner" and index == 0 and label == b"*":
+            pass  # 唯一合法的通配形态：最左标签解码后恰为单字节星号
+        elif star_mode != "allow" and _OCTET_STAR in label:
+            raise error_cls("invalid label character")
+        # 名称键与线格式唯一规范化：ASCII 大写折小写，其余八位组逐字节
+        # 保留（大小写折叠不改变标签长度）。
+        label = _canonical_wire_label(label)
+        labels.append(label)
+        wire_len += len(label) + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise error_cls("name too long")
+        index += 1
+        if pos == total:
+            break
+        # _parse_escaped_label 停在未转义的分隔点上。
+        pos += 1
+    return labels
+
+
+def _read_wire_name(data, offset, end, error_cls):
+    """从 data[offset] 起按未压缩、0 结尾线格式解码绝对名。
+
+    接受标签中的任意八位组；返回 (标签 bytes 列表, 名后偏移)。标签
+    1..63 字节、整名 ≤255；长度字节的压缩/保留形态、截断或越界抛
+    error_cls。end 为可选的 rdata 上界（None 表示整段 data）。
+    """
+    bound = len(data) if end is None else end
+    labels = []
+    pos = offset
+    wire_len = 1  # 根终止符占 1 字节
+    while True:
+        if pos >= bound:
+            raise error_cls("embedded name not terminated")
+        length = data[pos]
+        kind = length & 0xC0
+        if kind != 0x00:
+            raise error_cls("embedded name bad label length")
+        pos += 1
+        if length == 0:
+            return labels, pos
+        if not 1 <= length <= _MAX_LABEL_LEN or pos + length > bound:
+            raise error_cls("embedded name truncated")
+        labels.append(bytes(data[pos:pos + length]))
+        pos += length
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise error_cls("embedded name too long")
+
+
+def _write_wire_name(labels):
+    """把线格式标签 bytes 列表编码为未压缩绝对名（0 结尾）。"""
+    out = bytearray()
+    for label in labels:
+        out.append(len(label))
+        out.extend(label)
+    out.append(0)
+    return bytes(out)
+
+
+def _fold_wire_name(data, offset, end=None):
+    """把 data[offset] 起的未压缩名折为规范线格式，返回 (新名 bytes, 偏移)。
+
+    仅折 ASCII 大写字母；标签可为任意八位组。结构非法抛 RecordError。
+    """
+    labels, pos = _read_wire_name(data, offset, end, RecordError)
+    folded = [_canonical_wire_label(label) for label in labels]
+    return _write_wire_name(folded), pos
+
+
+def _read_char_string(data, pos):
+    """读取一个一字节长度前缀的字符串，返回 (bytes, 下一偏移)。"""
+    if pos >= len(data):
+        raise RecordError("character string truncated")
+    count = data[pos]
+    pos += 1
+    if pos + count > len(data):
+        raise RecordError("character string truncated")
+    return bytes(data[pos:pos + count]), pos + count
+
+
+def _canonicalize_rdata_names(rrtype, rdata):
+    """把 rdata 中嵌入的未压缩名折为规范线格式（ASCII 大写折小写）。
+
+    覆盖 CNAME、NS、MX、SOA、SRV；CNAME 结构非法抛 RecordError（沿用既有
+    契约），其余类型结构无法按其布局解析时原样返回 rdata（保持不透明字节
+    的既有容忍度），解析成功则嵌入名唯一规范拼写、其他字段逐字节保留。
+    NAPTR、NSEC、RRSIG 由各自的专用规范化函数处理。
+    """
+    try:
+        if rrtype == _TYPE_CNAME:
+            name, pos = _fold_wire_name(rdata, 0)
+            if pos != len(rdata):
+                raise RecordError("cname rdata trailing bytes")
+            return name
+        if rrtype == _TYPE_NS:
+            name, pos = _fold_wire_name(rdata, 0)
+            return name if pos == len(rdata) else rdata
+        if rrtype == _TYPE_MX:
+            if len(rdata) < 2:
+                return rdata
+            name, pos = _fold_wire_name(rdata, 2)
+            return rdata[:2] + name if pos == len(rdata) else rdata
+        if rrtype == _TYPE_SOA:
+            name1, pos = _fold_wire_name(rdata, 0)
+            name2, pos = _fold_wire_name(rdata, pos)
+            if len(rdata) - pos != 20:
+                return rdata
+            return name1 + name2 + bytes(rdata[pos:])
+        if rrtype == _TYPE_SRV:
+            if len(rdata) < 6:
+                return rdata
+            name, pos = _fold_wire_name(rdata, 6)
+            return rdata[:6] + name if pos == len(rdata) else rdata
+    except RecordError:
+        if rrtype == _TYPE_CNAME:
+            raise
+        return rdata
+    return rdata
+
+
+def _canonicalize_naptr_rdata(rdata):
+    """NAPTR 专用规范化：保留两个 uint16 与三个字符串，折 replacement 名。"""
+    try:
+        pos = 4
+        spans = []
+        for _ in range(3):
+            start = pos
+            _value, pos = _read_char_string(rdata, pos)
+            spans.append((start, pos))
+        name, end = _fold_wire_name(rdata, pos)
+        if end != len(rdata):
+            return rdata
+        strings = b"".join(bytes(rdata[start:stop])
+                           for start, stop in spans)
+        return bytes(rdata[:4]) + strings + name
+    except RecordError:
+        return rdata
+
+
+def _canonicalize_nsec_rdata(rdata):
+    """NSEC 专用规范化：折 next 名，位图逐字节保留。"""
+    try:
+        name, pos = _fold_wire_name(rdata, 0)
+        if pos == len(rdata):
+            return rdata  # 位图为空：属非法 NSEC，原样保留
+        return name + bytes(rdata[pos:])
+    except RecordError:
+        return rdata
+
+
+def _canonicalize_rrsig_rdata(rdata):
+    """RRSIG 专用规范化：保留 18 字节头与签名，折 signer 名。"""
+    try:
+        if len(rdata) < 18:
+            return rdata
+        name, pos = _fold_wire_name(rdata, 18)
+        if pos == len(rdata):
+            return rdata  # 签名为空：属非法 RRSIG，原样保留
+        return bytes(rdata[:18]) + name + bytes(rdata[pos:])
+    except RecordError:
+        return rdata
+
+
+def _canonicalize_zone_rdata(rrtype, rdata):
+    """zone 记录 rdata 中嵌入名的统一规范化入口。"""
+    if rrtype == _TYPE_NAPTR:
+        return _canonicalize_naptr_rdata(rdata)
+    if rrtype == _TYPE_NSEC:
+        return _canonicalize_nsec_rdata(rdata)
+    if rrtype == _TYPE_RRSIG:
+        return _canonicalize_rrsig_rdata(rdata)
+    return _canonicalize_rdata_names(rrtype, rdata)
+
 
 def _read_name(data, offset, boundaries):
-    """解码 offset 处的域名，返回 (name, 主流程下一个偏移)。
+    """解码 offset 处的域名，返回 (规范绝对名文本, 主流程下一个偏移)。
 
-    boundaries 为已知标签边界偏移集合，随解析就地补充；
-    压缩指针目标必须是其中向后的边界。
+    标签可为任意八位组，规范输出见 _canonical_label_text；boundaries 为
+    已知标签边界偏移集合，随解析就地补充；压缩指针目标必须是其中向后的
+    边界。截断、越界、循环、保留标签类型或指针不指向标签边界一律抛
+    MessageError。
     """
     labels = []
     pos = offset
@@ -724,19 +1063,13 @@ def _read_name(data, offset, boundaries):
             break
         if pos + length > len(data):
             raise MessageError("label truncated")
-        try:
-            label = data[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            raise MessageError("label not ascii") from None
-        if any(ch not in _LABEL_CHARS for ch in label):
-            raise MessageError("invalid label character")
-        labels.append(label.lower())
+        # 标签可为任意八位组；仅按长度与线格式总长约束。
+        labels.append(bytes(data[pos:pos + length]))
         wire_len += length + 1
         if wire_len > _MAX_NAME_WIRE_LEN:
             raise MessageError("name too long")
         pos += length
-    name = ".".join(labels) + "." if labels else "."
-    return name, end
+    return _labels_to_name(labels), end
 
 
 def decode_query(data: bytes) -> dict:
@@ -857,52 +1190,28 @@ def _decode_edns_query(data):
 
 
 def _normalize_name(name):
-    """按解码规则把 name 规范为小写绝对名，返回标签列表（根为 []）。"""
-    if not isinstance(name, str):
-        raise TypeError("name must be str")
-    if not name.endswith("."):
-        raise RecordError("name not absolute")
-    parts = name[:-1].split(".") if name != "." else []
-    labels = []
-    wire_len = 1  # 根终止符占 1 字节
-    for part in parts:
-        label = part.lower()
-        if not 1 <= len(label) <= _MAX_LABEL_LEN:
-            raise RecordError("bad label length")
-        if any(ch not in _LABEL_CHARS for ch in label):
-            raise RecordError("invalid label character")
-        labels.append(label)
-        wire_len += len(label) + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            raise RecordError("name too long")
-    return labels
+    """按解码规则把 name 规范为线格式标签 bytes 列表（根为 []）。
+
+    接受反斜杠三位十进制 \\DDD（000..255）及 \\.、\\\\ 简写；未转义的点
+    分隔标签，标签解码后 1..63 字节、整名线格式 ≤255；标签中不得含星号
+    八位组（zone origin 与应答模型 owner）。任何不符抛 RecordError。
+    """
+    return _parse_escaped_name(name, RecordError, star_mode="reject")
+
+
+def _normalize_question_name(name):
+    """规范查询问题名：星号八位组按普通八位组接受（解码后可能为单字节
+    星号标签，通配语义在应答计划中判别）。其余规则同 _normalize_name。"""
+    return _parse_escaped_name(name, RecordError, star_mode="allow")
 
 
 def _normalize_owner_name(name):
-    """规范 zone 记录 owner，允许最左标签恰为 "*" 的通配名。
+    """规范 zone 记录 owner，允许最左标签恰为单字节 "*"（0x2A）的通配名。
 
-    返回标签列表；通配与否可由 labels[0] == "*" 判别。
+    返回线格式标签 bytes 列表；通配与否可由 labels[0] == b"*" 判别。
+    转义与长度规则同 _normalize_name；其余错误抛 RecordError。
     """
-    if not isinstance(name, str):
-        raise TypeError("name must be str")
-    if not name.endswith("."):
-        raise RecordError("name not absolute")
-    parts = name[:-1].split(".") if name != "." else []
-    labels = []
-    wire_len = 1  # 根终止符占 1 字节
-    for index, part in enumerate(parts):
-        label = part.lower()
-        if not 1 <= len(label) <= _MAX_LABEL_LEN:
-            raise RecordError("bad label length")
-        if index == 0 and label == "*":
-            pass  # 唯一合法的通配形态：最左标签为单字符 "*"
-        elif "*" in label or any(ch not in _LABEL_CHARS for ch in label):
-            raise RecordError("invalid label character")
-        labels.append(label)
-        wire_len += len(label) + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            raise RecordError("name too long")
-    return labels
+    return _parse_escaped_name(name, RecordError, star_mode="owner")
 
 
 def _check_int(value, field):
@@ -910,13 +1219,19 @@ def _check_int(value, field):
         raise TypeError(field + " must be int")
 
 
-def _validate_rr(rr, allow_wildcard=False):
-    """校验单条 RR，返回 (labels, type, class, ttl, rdata)。"""
+def _validate_rr(rr, allow_wildcard=False, allow_star=False):
+    """校验单条 RR，返回 (labels, type, class, ttl, rdata)。
+
+    allow_wildcard 时 owner 最左标签允许恰为单字节星号；allow_star 时星号
+    八位组按普通八位组接受（上游应答 RR 的 owner 可为含星号的查询名）。
+    """
     if not isinstance(rr, dict):
         raise TypeError("rr must be dict")
     if list(rr.keys()) != _RR_KEYS:
         raise RecordError("rr keys must be name,type,class,ttl,rdata")
-    if allow_wildcard:
+    if allow_star:
+        labels = _normalize_question_name(rr["name"])
+    elif allow_wildcard:
         labels = _normalize_owner_name(rr["name"])
     else:
         labels = _normalize_name(rr["name"])
@@ -940,8 +1255,12 @@ def _validate_rr(rr, allow_wildcard=False):
     return labels, rrtype, rrclass, ttl, rdata
 
 
-def _validate_model(model):
-    """校验应答模型，返回 (an, ns, ar, limit)，RR 已规范化。"""
+def _validate_model(model, allow_star=False):
+    """校验应答模型，返回 (an, ns, ar, limit)，RR 已规范化。
+
+    allow_star 仅供内部应答计划使用：计划 RR owner 取自查询名，可含星号
+    八位组；公开编码入口恒为 False。
+    """
     if not isinstance(model, dict):
         raise TypeError("model must be dict")
     if list(model.keys()) != _MODEL_KEYS:
@@ -951,7 +1270,7 @@ def _validate_model(model):
         rrs = model[key]
         if not isinstance(rrs, list):
             raise TypeError(key + " must be list")
-        sections.append([_validate_rr(rr) for rr in rrs])
+        sections.append([_validate_rr(rr, allow_star=allow_star) for rr in rrs])
     limit = model["limit"]
     _check_int(limit, "limit")
     return sections[0], sections[1], sections[2], limit
@@ -1033,76 +1352,27 @@ def _encode_ecs_option(family, source, scope, address):
 
 
 def _decode_cname_target(rdata):
-    """把 CNAME rdata 按未压缩绝对名线格式解码为小写标签列表。
+    """把 CNAME rdata 按未压缩绝对名线格式解码为标签 bytes 列表。
 
-    标签 1–63 字节、0 结尾、总长 ≤255；禁止压缩指针、尾随内容与非法字符。
+    标签可为任意八位组，1–63 字节、0 结尾、总长 ≤255；禁止压缩指针、
+    尾随内容与截断。
     """
-    if len(rdata) > _MAX_NAME_WIRE_LEN:
-        raise RecordError("cname rdata too long")
-    labels = []
-    pos = 0
-    while True:
-        if pos >= len(rdata):
-            raise RecordError("cname rdata not terminated")
-        length = rdata[pos]
-        if length == 0:
-            pos += 1
-            break
-        if length > _MAX_LABEL_LEN:
-            raise RecordError("cname rdata bad label length")
-        pos += 1
-        if pos + length > len(rdata):
-            raise RecordError("cname rdata truncated")
-        try:
-            label = rdata[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            raise RecordError("cname rdata label not ascii") from None
-        if any(ch not in _LABEL_CHARS for ch in label):
-            raise RecordError("cname rdata invalid label character")
-        labels.append(label.lower())
-        pos += length
+    labels, pos = _read_wire_name(rdata, 0, None, RecordError)
     if pos != len(rdata):
         raise RecordError("cname rdata trailing bytes")
     return labels
 
 
-def _encode_cname_target(labels):
-    """把标签列表重编码为未压缩绝对名线格式。"""
-    out = bytearray()
-    for label in labels:
-        out.append(len(label))
-        out.extend(label.encode("ascii"))
-    out.append(0)
-    return bytes(out)
-
-
 def _read_soa_name(rdata, pos):
     """按 CNAME 目标规范解码 rdata pos 处的未压缩绝对名，返回下一偏移。
 
-    任何格式问题都返回 None，不抛异常。
+    标签可为任意八位组；任何格式问题都返回 None，不抛异常。
     """
-    wire_len = 1  # 根终止符占 1 字节
-    while True:
-        if pos >= len(rdata):
-            return None
-        length = rdata[pos]
-        if length == 0:
-            return pos + 1
-        if length > _MAX_LABEL_LEN:  # 含压缩指针形态
-            return None
-        pos += 1
-        if pos + length > len(rdata):
-            return None
-        try:
-            label = rdata[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            return None
-        if any(ch not in _LABEL_CHARS for ch in label):
-            return None
-        wire_len += length + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            return None
-        pos += length
+    try:
+        _labels, next_pos = _read_wire_name(rdata, pos, None, RecordError)
+    except RecordError:
+        return None
+    return next_pos
 
 
 def _parse_soa_minimum(rdata):
@@ -1170,9 +1440,9 @@ def _validate_zone(zone):
     for rr in records:
         labels, rrtype, rrclass, ttl, rdata = _validate_rr(
             rr, allow_wildcard=True)
-        if rrtype == _TYPE_CNAME:
-            # 目标规范成小写绝对名，rdata 据此重编码。
-            rdata = _encode_cname_target(_decode_cname_target(rdata))
+        # 嵌入的未压缩名（NS/CNAME/MX/SOA/SRV/NAPTR/NSEC/RRSIG）按线格式
+        # 规范化（ASCII 大写折小写），owner 已在 _validate_rr 规范化。
+        rdata = _canonicalize_zone_rdata(rrtype, rdata)
         rrs.append((labels, rrtype, rrclass, ttl, rdata))
     if not rrs:
         raise ZoneError("zone must contain a SOA record")
@@ -1183,7 +1453,7 @@ def _validate_zone(zone):
     if len(origin_soa) != 1:
         raise ZoneError("origin must have exactly one SOA record")
     for labels, _rrtype, _cls, _ttl, _rdata in rrs:
-        if labels and labels[0] == "*":
+        if labels and labels[0] == b"*":
             suffix = labels[1:]
             if (len(suffix) < len(origin)
                     or suffix[len(suffix) - len(origin):] != origin):
@@ -1217,7 +1487,7 @@ def _write_name(out, labels, offsets):
         if len(out) <= _MAX_POINTER_TARGET:
             offsets.setdefault(tuple(labels[i:]), len(out))
         out.append(len(label))
-        out.extend(label.encode("ascii"))
+        out.extend(label)
     if target is not None:
         out.extend((0xC000 | target).to_bytes(2, "big"))
     else:
@@ -1240,7 +1510,7 @@ def _build_message(msg, an, ns, ar, rcode):
     out += len(ar).to_bytes(2, "big")
     offsets = {}
     for question in msg["questions"]:
-        _write_name(out, _normalize_name(question["name"]), offsets)
+        _write_name(out, _normalize_question_name(question["name"]), offsets)
         out += question["type"].to_bytes(2, "big")
         out += question["class"].to_bytes(2, "big")
     body_base = len(out)
@@ -1259,14 +1529,17 @@ def _build_message(msg, an, ns, ar, rcode):
     return out, body_base, section_ends, flags
 
 
-def _encode_response(query, model, rcode):
-    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。"""
+def _encode_response(query, model, rcode, allow_star=False):
+    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。
+
+    allow_star 仅供内部应答计划使用（owner 取自查询名，可含星号八位组）。
+    """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
     if not 0 <= rcode <= 0xF:
         raise EncodeError("rcode out of range")
-    an, ns, ar, limit = _validate_model(model)
+    an, ns, ar, limit = _validate_model(model, allow_star=allow_star)
     msg = decode_query(query)
     if msg["flags"] & 0x8000:
         raise EncodeError("query has QR set")
@@ -1335,7 +1608,7 @@ def _encode_badvers(msg, opt, limit):
     out += (1).to_bytes(2)  # ARCOUNT=1（末项 OPT）
     offsets = {}
     for question in msg["questions"]:
-        _write_name(out, _normalize_name(question["name"]), offsets)
+        _write_name(out, _normalize_question_name(question["name"]), offsets)
         out += question["type"].to_bytes(2, "big")
         out += question["class"].to_bytes(2, "big")
     ttl = ((_RCODE_BADVERS >> 4) << 24) | (_FLAG_DO if do else 0)
@@ -1348,7 +1621,7 @@ def _encode_badvers(msg, opt, limit):
 
 
 def edns(query: bytes, model: dict, rcode: int = 0,
-         options: list | None = None) -> bytes:
+         options: list | None = None, _allow_star: bool = False) -> bytes:
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
     query/model 的解码与编码契约同 decode_query/encode_response；查询
@@ -1378,7 +1651,7 @@ def edns(query: bytes, model: dict, rcode: int = 0,
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
-    an, ns, ar, limit = _validate_model(model)
+    an, ns, ar, limit = _validate_model(model, allow_star=_allow_star)
     msg, opt = _decode_edns_query(query)
     for section in (an, ns, ar):
         if any(rr[1] == _TYPE_OPT for rr in section):
@@ -1700,15 +1973,10 @@ def edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
     return edns(query, model, rcode, options)
 
 
-def _labels_to_name(labels):
-    """标签列表还原为小写绝对名（根为 "."）。"""
-    return ".".join(labels) + "." if labels else "."
-
-
 def _rr_to_model(rr):
     """把规范化 RR 元组还原为键序固定的模型 dict。"""
     labels, rrtype, rrclass, ttl, rdata = rr
-    return {"name": _labels_to_name(labels), "type": rrtype,
+    return {"name": _owner_to_name(labels), "type": rrtype,
             "class": rrclass, "ttl": ttl, "rdata": rdata}
 
 
@@ -1716,7 +1984,7 @@ def _transfer_rr_model(rr):
     """把规范化 RR 元组还原为传送用 dict：键序 name,type,class,ttl,rdata，
     rdata 为偶长小写十六进制字符串。"""
     labels, rrtype, rrclass, ttl, rdata = rr
-    return {"name": _labels_to_name(labels), "type": rrtype,
+    return {"name": _owner_to_name(labels), "type": rrtype,
             "class": rrclass, "ttl": ttl, "rdata": rdata.hex()}
 
 
@@ -1768,7 +2036,7 @@ def _hop(records, nodes, origin, current, qtype):
         if tuple(current[i:]) in nodes:
             encloser = current[i:]
             break
-    wildcard = ["*"] + encloser
+    wildcard = [b"*"] + encloser
     if qtype != _TYPE_CNAME:
         for rr in records:
             if rr[0] == wildcard and rr[1] == _TYPE_CNAME:
@@ -1827,7 +2095,7 @@ def _answer_plan(msg, origin, records, zone_class):
     RR 均为规范化元组。
     """
     question = msg["questions"][0]
-    qlabels = _normalize_name(question["name"])
+    qlabels = _normalize_question_name(question["name"])
     qtype = question["type"]
     an = []
     ns = []
@@ -1851,7 +2119,8 @@ def _answer_plan(msg, origin, records, zone_class):
 def _encode_plan(query, rcode, an, ns, limit, ecs=None):
     """把完整应答计划编码为权威应答报文。
 
-    ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。
+    ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。计划 RR owner 可
+    取自查询名（含星号等任意八位组），故模型校验放开星号。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -1859,14 +2128,15 @@ def _encode_plan(query, rcode, an, ns, limit, ecs=None):
         "ar": [],
         "limit": limit,
     }
-    return _encode_response(query, model, rcode)
+    return _encode_response(query, model, rcode, allow_star=True)
 
 
 def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None):
     """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
 
     ecs 非 None 时应答 OPT 仅回写该 ECS（码 8）选项：family、source
-    不变，scope=source，address 同查询；查询携带的其他选项不回显。
+    不变，scope=source，address 同查询；查询携带的其他选项不回显。计划
+    RR owner 可取自查询名（含星号八位组），模型校验放开星号。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -1875,12 +2145,14 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None):
         "limit": limit,
     }
     options = None
-    if ecs is not None:
+    if ecs is None:
+        pass
+    else:
         family, source, address = ecs
         options = [{"code": _OPT_CODE_ECS,
                     "data": _encode_ecs_option(family, source, source,
                                                address)}]
-    return edns(query, model, rcode, options)
+    return edns(query, model, rcode, options, _allow_star=True)
 
 
 def _encode_policy_refusal(query, limit):
@@ -1902,7 +2174,7 @@ def _encode_policy_refusal(query, limit):
     out += flags.to_bytes(2, "big")
     out += (1).to_bytes(2, "big")
     out += (0).to_bytes(6)  # ANCOUNT/NSCOUNT/ARCOUNT 均为 0
-    _write_name(out, _normalize_name(msg["questions"][0]["name"]), {})
+    _write_name(out, _normalize_question_name(msg["questions"][0]["name"]), {})
     question = msg["questions"][0]
     out += question["type"].to_bytes(2, "big")
     out += question["class"].to_bytes(2, "big")
@@ -2780,44 +3052,20 @@ def _master_nsec_rdata(next_labels, type_codes):
 
 
 def _master_decode_nsec_name(rdata):
-    """从 rdata[0] 起解码未压缩、0 结尾的小写绝对名，返回 (标签列表, 名后偏移)。
+    """从 rdata[0] 起解码未压缩、0 结尾的绝对名，返回 (标签 bytes 列表,
+    名后偏移)。
 
-    标签 1..63、总长 ≤255、仅小写字母/数字/下划线/连字符，含大写 ASCII
-    即抛 RecordError（不得小写化，否则破坏逐字节往返）；压缩指针（长度
-    字节 >63）、截断与非法字符均抛 RecordError。名后的位图不在此解码。
+    标签可为任意八位组，1..63、总长 ≤255；压缩指针（长度字节 >63）、
+    截断或超长均抛 RecordError。名后的位图不在此解码。
     """
-    labels = []
-    pos = 0
-    wire_len = 1
-    while True:
-        if pos >= len(rdata):
-            raise RecordError("nsec next name not terminated")
-        length = rdata[pos]
-        if length == 0:
-            return labels, pos + 1
-        if length > _MAX_LABEL_LEN:
-            raise RecordError("nsec next name bad label length")
-        pos += 1
-        if pos + length > len(rdata):
-            raise RecordError("nsec next name truncated")
-        try:
-            label = rdata[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            raise RecordError("nsec next name label not ascii") from None
-        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
-               for ch in label):
-            raise RecordError("nsec next name invalid label character")
-        labels.append(label)
-        pos += length
-        wire_len += length + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            raise RecordError("nsec next name too long")
+    return _read_wire_name(rdata, 0, None, RecordError)
 
 
 def _master_decode_nsec_rdata(rdata):
     """解码 NSEC rdata 为 (next 标签列表, 按数值升序的类型码列表)。
 
-    rdata 须恰为一个未压缩、0 结尾的小写绝对名后接至少一个位图块；
+    rdata 须恰为一个未压缩、0 结尾的绝对名（标签可为任意八位组，导出按
+    规范转义拼写）后接至少一个位图块；
     每块为窗口号、长度各一字节与 1..32 字节位图，窗口严格升序且不
     重复，长度恰覆盖该窗最高类型（末字节非 0），置位类型须为当前已
     支持类型或 NSEC。压缩名、截断、尾随、未知类型、空位图、窗口不
@@ -2975,14 +3223,13 @@ def _master_rrsig_rdata(covered, algorithm, labels, original_ttl,
 
 def _master_decode_rrsig_rdata(rdata):
     """解码 RRSIG rdata 为 (覆盖类型码, algorithm, labels, originalttl,
-    expiration, inception, keytag, signer 标签列表, signature bytes)。
+    expiration, inception, keytag, signer 标签 bytes 列表, signature bytes)。
 
     rdata 须恰为 18 字节固定头（网络序两字节覆盖类型、一字节
     algorithm、一字节 labels、三个网络序 uint32、网络序两字节
-    keytag）、一个未压缩、0 结尾的小写绝对名（标签仅小写，含大写
-    ASCII 即抛 RecordError，不得小写化）与非空签名；覆盖类型码须为
-    当前已支持类型（RRSIG 除外）。截断、压缩名、非法字符、空签名或
-    覆盖类型不受支持抛 RecordError。
+    keytag）、一个未压缩、0 结尾的绝对名（标签可为任意八位组）与非空
+    签名；覆盖类型码须为当前已支持类型（RRSIG 除外）。截断、压缩名、
+    名称超长或空签名抛 RecordError。
     """
     if len(rdata) < 18:
         raise RecordError("rrsig rdata truncated")
@@ -2995,33 +3242,7 @@ def _master_decode_rrsig_rdata(rdata):
     keytag = int.from_bytes(rdata[16:18], "big")
     if covered not in _NSEC_TYPE_NAMES or covered == _TYPE_RRSIG:
         raise RecordError("rrsig covered type not supported")
-    signer = []
-    pos = 18
-    wire_len = 1
-    while True:
-        if pos >= len(rdata):
-            raise RecordError("rrsig signer not terminated")
-        length = rdata[pos]
-        if length == 0:
-            pos += 1
-            break
-        if length > _MAX_LABEL_LEN:
-            raise RecordError("rrsig signer bad label length")
-        pos += 1
-        if pos + length > len(rdata):
-            raise RecordError("rrsig signer truncated")
-        try:
-            label = rdata[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            raise RecordError("rrsig signer label not ascii") from None
-        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
-               for ch in label):
-            raise RecordError("rrsig signer invalid label character")
-        signer.append(label)
-        pos += length
-        wire_len += length + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            raise RecordError("rrsig signer name too long")
+    signer, pos = _read_wire_name(rdata, 18, None, RecordError)
     signature = bytes(rdata[pos:])
     if not signature:
         raise RecordError("rrsig signature empty")
@@ -3030,40 +3251,63 @@ def _master_decode_rrsig_rdata(rdata):
 
 
 def _master_parse_name(token, allow_wildcard=False):
-    """把主文件中的绝对域名（"@" 由调用方先行处理）解析为小写标签列表。
+    """把主文件中的绝对域名（"@" 由调用方先行处理）解析为标签 bytes 列表。
 
-    仅接受小写绝对名：标签 1..63、字符为小写字母/数字/下划线/连字符，
-    根名 "." 为 []，线格式总长 ≤255；allow_wildcard 时允许最左标签恰为
-    "*"（owner 专用，SOA 域名不允许）；任何不符抛 RecordError。
+    未转义的点分隔标签；普通字符沿用既有集合（小写字母、数字、下划线、
+    连字符，不接受裸大写或其他符号），另接受反斜杠三位十进制 \\DDD
+    （000..255）及 \\.、\\\\ 简写；根名 "." 为 []。标签解码后 1..63
+    字节、线格式总长 ≤255；allow_wildcard 时允许首个标签解码后恰为单
+    字节 "*"（0x2A，含 "\\042" 拼写），其余名称任何标签含星号均非法。
+    反斜杠残缺、非三位数字转义或数值超过 255 抛 ConfigError；非绝对名、
+    裸非法字符、标签或整名长度违规等名称错误抛 RecordError。
     """
+    if not isinstance(token, str):
+        raise TypeError("name must be str")
     if not token.endswith("."):
         raise RecordError("name not absolute")
-    parts = token[:-1].split(".") if token != "." else []
+    if token == ".":
+        return []  # 根名
+    pieces_text = token[:-1]
+    total = len(pieces_text)
     labels = []
     wire_len = 1
-    for index, part in enumerate(parts):
-        if not 1 <= len(part) <= _MAX_LABEL_LEN:
+    pos = 0
+    index = 0
+    while True:
+        # 裸 "*" 仅允许作为最左整标签（通配 owner）；"\042" 等星号转义
+        # 由通用转义解析处理。
+        if (allow_wildcard and index == 0
+                and pos < total and pieces_text[pos] == "*"
+                and (pos + 1 == total or pieces_text[pos + 1] == ".")):
+            label = b"*"
+            pos += 1
+        else:
+            # 转义语法错误（残缺、非三位数字、>255）统一为 ConfigError；
+            # 裸字符仅接受既有的小写字母/数字/下划线/连字符，长度规则在
+            # 标签解码完成后按 RecordError 校验。
+            label, pos = _parse_escaped_label(
+                pieces_text, pos, ConfigError,
+                frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-"))
+        if not 1 <= len(label) <= _MAX_LABEL_LEN:
             raise RecordError("bad label length")
-        if allow_wildcard and index == 0 and part == "*":
+        if allow_wildcard and index == 0 and label == b"*":
             pass
-        elif any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
-                 for ch in part):
+        elif _OCTET_STAR in label:
             raise RecordError("invalid label character")
-        labels.append(part)
-        wire_len += len(part) + 1
+        labels.append(label)
+        wire_len += len(label) + 1
         if wire_len > _MAX_NAME_WIRE_LEN:
             raise RecordError("name too long")
+        index += 1
+        if pos == total:
+            break
+        pos += 1
     return labels
 
 
 def _master_wire_name(labels):
-    """把标签列表编码为未压缩绝对名线格式。"""
-    out = bytearray()
-    for label in labels:
-        out.append(len(label))
-        out.extend(label.encode("ascii"))
-    out.append(0)
-    return bytes(out)
+    """把标签 bytes 列表编码为未压缩绝对名线格式。"""
+    return _write_wire_name(labels)
 
 
 def import_master(text: str) -> dict:
@@ -3309,7 +3553,7 @@ def import_master(text: str) -> dict:
                              for labels in name_labels)
             for number in rdata_tokens[2:]:
                 rdata += _master_parse_uint32(number).to_bytes(4, "big")
-        records.append({"name": _labels_to_name(owner_labels),
+        records.append({"name": _owner_to_name(owner_labels),
                         "type": rrtype, "class": 1, "ttl": ttl,
                         "rdata": rdata})
     # 结构层解析通过后统一套用 zone 约束：origin 恰一条 SOA、owner 在
@@ -3323,37 +3567,13 @@ def import_master(text: str) -> dict:
 def _master_decode_soa_rdata(rdata):
     """解码 SOA rdata 为 (mname 标签, rname 标签, 五个 uint32)。
 
-    rdata 须恰为两个未压缩小写绝对名加 20 字节五个网络序 uint32；
-    任何不符抛 RecordError。
+    rdata 须恰为两个未压缩绝对名（标签可为任意八位组）加 20 字节五个
+    网络序 uint32；任何不符抛 RecordError。
     """
     names = []
     pos = 0
     for _ in range(2):
-        labels = []
-        wire_len = 1
-        while True:
-            if pos >= len(rdata):
-                raise RecordError("soa rdata not terminated")
-            length = rdata[pos]
-            if length == 0:
-                pos += 1
-                break
-            if length > _MAX_LABEL_LEN:
-                raise RecordError("soa rdata bad label length")
-            pos += 1
-            if pos + length > len(rdata):
-                raise RecordError("soa rdata truncated")
-            try:
-                label = rdata[pos:pos + length].decode("ascii")
-            except UnicodeDecodeError:
-                raise RecordError("soa rdata label not ascii") from None
-            if any(ch not in _LABEL_CHARS for ch in label):
-                raise RecordError("soa rdata invalid label character")
-            labels.append(label.lower())
-            pos += length
-            wire_len += length + 1
-            if wire_len > _MAX_NAME_WIRE_LEN:
-                raise RecordError("soa rdata name too long")
+        labels, pos = _read_wire_name(rdata, pos, None, RecordError)
         names.append(labels)
     if len(rdata) - pos != 20:
         raise RecordError("soa rdata must end with five uint32")
@@ -3460,40 +3680,14 @@ def _master_decode_caa_rdata(rdata):
 
 
 def _master_decode_naptr_name(rdata, pos):
-    """从 rdata[pos] 起解码未压缩、0 结尾且无尾随的小写绝对名。
+    """从 rdata[pos] 起解码未压缩、0 结尾且无尾随的绝对名。
 
-    返回 (标签列表, 名后偏移)；标签 1..63、总长 ≤255；标签仅接受小写
-    字母/数字/下划线/连字符，含大写 ASCII 即抛 RecordError（不得小写化，
-    否则破坏逐字节往返）；禁止压缩指针、截断、尾随与非法字符，任何
-    不符抛 RecordError。
+    返回 (标签 bytes 列表, 名后偏移)；标签可为任意八位组，1..63、总长
+    ≤255；禁止压缩指针、截断与超长，任何不符抛 RecordError。
     """
     if len(rdata) - pos > _MAX_NAME_WIRE_LEN:
         raise RecordError("naptr replacement too long")
-    labels = []
-    wire_len = 1
-    while True:
-        if pos >= len(rdata):
-            raise RecordError("naptr replacement not terminated")
-        length = rdata[pos]
-        if length == 0:
-            return labels, pos + 1
-        if length > _MAX_LABEL_LEN:
-            raise RecordError("naptr replacement bad label length")
-        pos += 1
-        if pos + length > len(rdata):
-            raise RecordError("naptr replacement truncated")
-        try:
-            label = rdata[pos:pos + length].decode("ascii")
-        except UnicodeDecodeError:
-            raise RecordError("naptr replacement label not ascii") from None
-        if any(ch not in _LABEL_CHARS or ("A" <= ch <= "Z")
-               for ch in label):
-            raise RecordError("naptr replacement invalid label character")
-        labels.append(label)
-        pos += length
-        wire_len += length + 1
-        if wire_len > _MAX_NAME_WIRE_LEN:
-            raise RecordError("naptr replacement name too long")
+    return _read_wire_name(rdata, pos, None, RecordError)
 
 
 def _master_decode_naptr_rdata(rdata):
@@ -3582,15 +3776,15 @@ def export_master(zone: dict) -> str:
     'keytag algorithm digesttype digest' 输出，整数无前导零、digest 以
     小写十六进制输出；CDS 另允许恰为五字节 00 00 00 00 00 的删除标记，
     输出 '0 0 0 00'，DS 不允许 digesttype 0；NSEC rdata 须恰为一个
-    未压缩、0 结尾且无尾随的小写绝对名（标签仅小写，含大写即
-    RecordError）后接至少一个 RFC4034 位图块：每块为窗口号、长度各
+    未压缩、0 结尾且无尾随的绝对名（标签可为任意八位组，按规范
+    转义拼写输出）后接至少一个 RFC4034 位图块：每块为窗口号、长度各
     一字节与 1..32 字节位图，窗口严格升序且不重复、末字节非 0，置位
     类型须为当前已支持类型或 NSEC；按 'next types...' 输出，next 等于
     origin 时写 "@"，类型按类型码升序写助记符；RRSIG rdata 须恰为
     18 字节固定头（网络序两字节覆盖类型、一字节 algorithm、一字节
     labels、三个网络序 uint32 originalttl/expiration/inception、
-    网络序两字节 keytag）、一个未压缩、0 结尾且无尾随的小写绝对名
-    signer（标签仅小写，含大写即 RecordError）与非空签名，覆盖类型
+    网络序两字节 keytag）、一个未压缩、0 结束且无尾随的绝对名
+    signer（标签可为任意八位组，按规范转义拼写输出）与非空签名，覆盖类型
     码须为当前已支持类型（RRSIG 除外）；按
     'typecovered algorithm labels originalttl expiration inception
     keytag signer signature' 输出，整数无前导零，两个时间按 uint32
@@ -3617,7 +3811,8 @@ def export_master(zone: dict) -> str:
     for labels, rrtype, rrclass, ttl, rdata in rrs:
         if rrclass != 1:
             raise ZoneError("master export only supports class IN")
-        owner = "@" if labels == origin_labels else _labels_to_name(labels)
+        owner = ("@" if labels == origin_labels
+                 else _owner_to_name(labels))
         prefix = owner + " " + str(ttl) + " " + _MASTER_CLASS + " "
         if rrtype == _TYPE_A:
             if len(rdata) != 4:
@@ -3771,7 +3966,9 @@ def compare_serial(left: int, right: int) -> str:
 class PositiveCache:
     """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
-    正缓存键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
+    正缓存键为 (规范绝对 qname, qtype, qclass)，与 ID、flags、limit 无关；
+    qname 为任意八位组按转义规范拼写的绝对名，大小写或合法转义拼写不同
+    但线格式等价的名称共用同一键。
     仅缓存 RCODE=0、ns 空、an 非空且各原始 TTL 均为正的完整有序应答；
     条目保存插入时刻与原始 RR，输出 TTL 随经过时间递减，到期即删除。
 
@@ -4426,7 +4623,7 @@ def _check_resolve_inputs(query, now, limit, last_end):
 
 def _name_in_origin(question, origin, zone_class):
     """qclass 等于 zone 类且规范化 qname 在 origin 内（含 origin 自身）。"""
-    qlabels = _normalize_name(question["name"])
+    qlabels = _normalize_question_name(question["name"])
     return (question["class"] == zone_class
             and len(qlabels) >= len(origin)
             and qlabels[len(qlabels) - len(origin):] == origin)
@@ -4455,8 +4652,9 @@ def _validate_recursive_reply(reply):
         raise TypeError("an must be list")
     if not isinstance(ns, list):
         raise TypeError("ns must be list")
-    an = [_validate_rr(rr) for rr in an]
-    ns = [_validate_rr(rr) for rr in ns]
+    # 上游应答 RR 的 owner 取自查询名，可含任意八位组（含单字节星号）。
+    an = [_validate_rr(rr, allow_star=True) for rr in an]
+    ns = [_validate_rr(rr, allow_star=True) for rr in ns]
     if kind == 0:
         if an or not ns:
             raise ValueError("referral requires empty an and non-empty ns")
@@ -4678,11 +4876,11 @@ def _check_rec_config(config):
         if not isinstance(qname, str):
             raise ConfigError("q must be str")
         try:
-            qlabels = _normalize_name(qname)
+            qlabels = _normalize_question_name(qname)
         except RecordError:
             raise ConfigError("q must be an absolute name") from None
         if _labels_to_name(qlabels) != qname:
-            raise ConfigError("q must be a lowercase absolute name")
+            raise ConfigError("q must be a canonical absolute name")
         qtype = item["t"]
         if kind == "nx":
             # NXDOMAIN 条目匹配任意 qtype：t 必须为 null。
@@ -4741,7 +4939,7 @@ def _validate_rec_rr(rr):
     model = {"name": rr["n"], "type": rr["t"], "class": rr["c"],
              "ttl": rr["ttl"], "rdata": bytes.fromhex(hextext)}
     try:
-        return _validate_rr(model)
+        return _validate_rr(model, allow_star=True)
     except TypeError as exc:
         # JSON 层无 bytes/int 类型保证：RR 字段类型错同样归为 RecordError。
         raise RecordError(str(exc)) from None
@@ -6379,8 +6577,8 @@ class Resolver:
                 change["record"], allow_wildcard=True)
             if rrtype == _TYPE_SOA:
                 raise ZoneError("change record must not be SOA")
-            if rrtype == _TYPE_CNAME:
-                rdata = _encode_cname_target(_decode_cname_target(rdata))
+            # 嵌入名按 zone 规则规范化（CNAME 非法抛 RecordError）。
+            rdata = _canonicalize_zone_rdata(rrtype, rdata)
             parsed.append((op, (labels, rrtype, rrclass, ttl, rdata)))
         # 当前区域 SOA 的 rdata 须完整为两个未压缩绝对名与五个 uint32。
         origin = self._cache._origin
@@ -8805,11 +9003,11 @@ def _validate_policy_rules(rules):
         net_kind, net = _parse_policy_network(client)
         if name != "*":
             try:
-                normalized = _labels_to_name(_normalize_name(name))
+                normalized = _labels_to_name(_normalize_question_name(name))
             except RecordError as exc:
                 raise PolicyError(str(exc)) from None
             if normalized != name:
-                raise PolicyError("name must be a lowercase absolute name")
+                raise PolicyError("name must be a canonical absolute name")
         if qtype is not None and not 0 <= qtype <= 0xFFFF:
             raise PolicyError("type out of range")
         if action not in _POLICY_ACTIONS:
@@ -8908,11 +9106,11 @@ def _validate_rate_rules(rules):
         net_kind, net = _parse_policy_network(client)
         if name != "*":
             try:
-                normalized = _labels_to_name(_normalize_name(name))
+                normalized = _labels_to_name(_normalize_question_name(name))
             except RecordError as exc:
                 raise PolicyError(str(exc)) from None
             if normalized != name:
-                raise PolicyError("name must be a lowercase absolute name")
+                raise PolicyError("name must be a canonical absolute name")
         if qtype is not None and not 0 <= qtype <= 0xFFFF:
             raise PolicyError("type out of range")
         if not _MIN_RATE_WINDOW <= window <= _MAX_RATE_WINDOW:
