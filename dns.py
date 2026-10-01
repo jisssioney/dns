@@ -39,8 +39,9 @@
 - edns_padded(query: bytes, model: dict, block: int = 128, rcode: int = 0)
   -> bytes: 编码 EDNS(0) Padding（选项码 12）应答；查询须恰有一个 OPT，
   版本 0 时 Padding 至多一项且 data 全零，应答 OPT 仅含一个 Padding
-  TLV，按 ar、ns、an 尾删候选取首个 B+(-B)%block≤min(limit, CLASS)
-  者填零；版本 1..255 在全部参数校验后返回 BADVERS 且不填充。
+  TLV，按附加段、授权段、回答段的 RRset 整组淘汰候选取首个
+  B+(-B)%block≤min(limit, CLASS) 者填零；版本 1..255 在全部参数
+  校验后返回 BADVERS 且不填充。
 - edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
   rcode: int = 0) -> bytes: 编码 EDNS(0) EDE（选项码 15）应答；查询须
   恰含一个版本 0 的 OPT（缺失或版本非 0 抛 EDEError），查询选项不
@@ -399,7 +400,6 @@
   或超跳数以 CNAMEError 退出 5。
 """
 
-from bisect import bisect_right
 from collections import deque
 import base64
 import copy
@@ -817,9 +817,10 @@ _MIN_COOKIE_SECRET_LEN = 16
 _MAX_COOKIE_SECRET_LEN = 64
 _RCODE_BADCOOKIE = 23
 # EDNS(0) Padding（选项码 12）：版本 0 查询至多一个 Padding 且 data
-# 全零；应答 OPT 仅含一个 Padding TLV，按 ar、ns、an 尾删候选取首个
-# B+(-B)%block≤min(limit, CLASS) 者填零（B 为候选含零长 TLV 的报文
-# 长度，n=0 仍保留 TLV）。block 限 16..512 内 2 的幂。
+# 全零；应答 OPT 仅含一个 Padding TLV，按附加段、授权段、回答段的
+# RRset 整组淘汰候选取首个 B+(-B)%block≤min(limit, CLASS) 者填零
+# （B 为候选含零长 TLV 的报文长度，n=0 仍保留 TLV）。block 限
+# 16..512 内 2 的幂。
 _OPT_CODE_PADDING = 12
 _MIN_PADDING_BLOCK = 16
 _MAX_PADDING_BLOCK = 512
@@ -1449,8 +1450,9 @@ def _write_name(out, labels, offsets):
 def _build_message(msg, an, ns, ar, rcode):
     """一次性编码完整报文，返回 (out, body_base, 各区段 RR 结束偏移, flags)。
 
-    尾删只保留报文前缀：压缩指针只指向更早写入的名字，保留的前缀
-    自身即合法报文，故按结束偏移切片即可，无需反复重新编码。
+    RRset 原子截断的每个候选都以当前保留的三段重新调用本函数生成；
+    候选编码长度关于整组删除单调不增，故只需对保留组数二分、每次按
+    既有名字压缩规则重新编码，而非逐条枚举。
     """
     flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT) | rcode
     out = bytearray()
@@ -1481,8 +1483,169 @@ def _build_message(msg, an, ns, ar, rcode):
     return out, body_base, section_ends, flags
 
 
+def _rrset_key(rr):
+    """RRset 识别键：规范化 owner（小写标签元组）、数值 type、数值 class。
+
+    TTL 与 rdata 不参与；同一 owner/type/class 的所有记录属于同一
+    RRset，截断时整体保留或整体删除。OPT（TYPE41）由调用方排除，
+    不参与 RRset 分组。
+    """
+    return tuple(rr[0]), rr[1], rr[2]
+
+
+def _rrset_groups(section):
+    """返回 (组键列表, 每记录所属组序号)，组按末次出现位置升序排列。
+
+    截断反复删除“当前最后一条保留记录”所属的组，故组的淘汰次序为其
+    末次出现位置从后往前；保留的组恰为末次出现位置最靠前的若干组
+    （其成员在原顺序中可不相邻），即该序的一个前缀。
+    """
+    last_pos = {}
+    for pos, rr_item in enumerate(section):
+        last_pos[_rrset_key(rr_item)] = pos
+    keys = sorted(last_pos, key=last_pos.get)
+    group_of = {key: gi for gi, key in enumerate(keys)}
+    indices = [group_of[_rrset_key(rr_item)] for rr_item in section]
+    return keys, indices
+
+
+def _cap_sections(an, ns, ar, max_ar, max_ns, max_an):
+    """各区段独立按 RRset 原子裁到 16 位计数上限内，返回是否动过。
+
+    与长度路径一致地按 ar、ns、an 顺序处理；保留的是该区段按末次
+    出现位置升序排列的若干个完整 RRset 前缀（同组记录即使不相邻也
+    一并保留或删除），按淘汰序逐组删除直到计数不超限。
+    """
+    changed = False
+    for section, cap in ((ar, max_ar), (ns, max_ns), (an, max_an)):
+        if len(section) <= cap:
+            continue
+        _keys, indices = _rrset_groups(section)
+        group_sizes = [0] * len(_keys)
+        for gi in indices:
+            group_sizes[gi] += 1
+        # 淘汰序为组序的逆序（末次出现最靠后者先删）：从末尾逐组
+        # 扣除，直到保留记录数不超 cap；保留的是组序的前缀。
+        kept_count = len(section)
+        drop_groups = 0
+        for size in reversed(group_sizes):
+            if kept_count <= cap:
+                break
+            kept_count -= size
+            drop_groups += 1
+        keep_groups = len(group_sizes) - drop_groups
+        section[:] = [rr_item for rr_item, gi in zip(section, indices)
+                      if gi < keep_groups]
+        changed = True
+    return changed
+
+
+def _section_total_end(ends, body_base):
+    """当前候选最后一条保留记录的全局结束偏移（无记录则为问题段末）。"""
+    for section_ends in reversed(ends):
+        if section_ends:
+            return section_ends[-1]
+    return body_base
+
+
+def _rrset_select(msg, an, ns, ar, rcode, acceptable, body_limit_error,
+                  max_ar=_MAX_SECTION_RECORDS,
+                  max_ns=_MAX_SECTION_RECORDS,
+                  max_an=_MAX_SECTION_RECORDS):
+    """按 RRset 原子截断选择首个可接受候选。
+
+    acceptable(total_end) 判定当前编码候选（以最后一条保留记录的全局
+    结束偏移为准）是否可用。先按各区段 16 位计数上限做 RRset 淘汰，
+    再在候选不可接受时按附加段、授权段、回答段的优先级，反复删除当前
+    区段最后一条保留记录所属的完整 RRset（同 owner/type/class 的全部
+    成员，即使在原顺序中不相邻），其余记录保持相对顺序，并按既有名字
+    压缩规则重新生成候选，直到 acceptable 为真；三段清空仍不可接受时
+    以 body_limit_error 抛 EncodeError（头部与问题段无法装入）。
+
+    单调性：按此规则逐组删除时候选编码长度不增——被删集合只有一个
+    owner 名，保留记录因失去压缩源而膨胀的字节不超过该名线长，而被删
+    的每条记录自身至少含一个完整名字，故总长不增。块对齐长度
+    ceil(B/block)*block 关于 B 同样单调，故长度与填充两种判定都可在
+    每区段对保留组数二分搜索，时间 O((RR 数+编码量)*log RR 数)、
+    空间 O(RR 数+编码量)；无截断时仅编码一次，与旧路径逐字节一致。
+
+    返回 (an, ns, ar, truncated, out, total_end, flags)：保留记录的三个
+    新列表、是否删除过普通 RRset、最终候选编码、最后一条保留记录的全局
+    结束偏移（无记录时为问题段末 body_base）与报文 flags。
+    """
+    an, ns, ar = list(an), list(ns), list(ar)
+    original_counts = (len(an), len(ns), len(ar))
+    truncated = _cap_sections(an, ns, ar, max_ar, max_ns, max_an)
+
+    def build():
+        out_b, base_b, ends_b, flags_b = _build_message(
+            msg, an, ns, ar, rcode)
+        return (out_b, base_b, ends_b, flags_b,
+                _section_total_end(ends_b, base_b))
+
+    out, body_base, ends, flags, total_end = build()
+    if acceptable(total_end):
+        return (an, ns, ar, truncated, out, total_end, flags)
+
+    truncated = True
+    # 淘汰优先级 (ar, ns, an)；_build_message 的区段序为 (an, ns, ar)。
+    for index, section in enumerate((ar, ns, an)):
+        _keys, indices = _rrset_groups(section)
+        group_count = len(_keys)
+        current_list = section[:]
+
+        def candidate_ok(keep_groups, _src=current_list, _idx=indices):
+            kept = [rr_item for rr_item, gi in zip(_src, _idx)
+                    if gi < keep_groups]
+            section[:] = kept
+            try:
+                end_value = build()[4]
+            finally:
+                section[:] = _src
+            return acceptable(end_value)
+
+        if candidate_ok(group_count):
+            # 本段（及更低优先级区段的现有记录）已使候选合法：整段保留。
+            break
+        if not candidate_ok(0):
+            # 本段清空仍不合法：整段省略，转下一优先级区段；最低优先级
+            # （回答段）清空后仍超限即头部与问题段无法装入。
+            section[:] = []
+            if index == 2:
+                raise EncodeError(body_limit_error)
+            continue
+        # 谓词关于保留组数单调：二分求最大可接受组数（lo 可接受、
+        # hi 不可接受）。
+        lo, hi = 0, group_count
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if candidate_ok(mid):
+                lo = mid
+            else:
+                hi = mid
+        section[:] = [rr_item for rr_item, gi in zip(current_list, indices)
+                      if gi < lo]
+        break
+    else:
+        raise EncodeError(body_limit_error)
+    out, body_base, ends, flags, total_end = build()
+    if (len(an), len(ns), len(ar)) != original_counts:
+        truncated = True
+    return an, ns, ar, truncated, out, total_end, flags
+
+
 def _encode_response(query, model, rcode):
-    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。"""
+    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。
+
+    截断以 RRset 为原子单位：RRset 按规范化 owner、数值 type、数值
+    class 识别（不含 TTL 与 rdata），回答、授权、附加三段分别分组。
+    完整应答超过有效上限，或任一段记录数无法用 16 位表示时，按附加段、
+    授权段、回答段的优先级，每次删除当前区段最后一条保留记录所属的整
+    个 RRset（该区段内的全部同组成员，即使不相邻），其余记录保持相对
+    顺序，再按既有名字压缩规则生成候选，直到长度与计数合法；删除过普
+    通 RRset 即置 TC，各区段计数精确反映保留记录。单个 RRset 无法装入
+    时整个集合省略。仅头部与问题段仍超限时抛 EncodeError。
+    """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
@@ -1494,40 +1657,14 @@ def _encode_response(query, model, rcode):
         raise EncodeError("query has QR set")
     if not _MIN_LIMIT <= limit <= _MAX_LIMIT:
         raise EncodeError("limit out of range")
-    truncated = False
-    # 区段计数为 16 位：超过 65535 条时按 ar、ns、an 尾删整条并置 TC，
-    # 不得让计数溢出。
-    for section in (ar, ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode)
-    na, nn, nr = len(an), len(ns), len(ar)
-    total_end = ar_ends[-1] if ar_ends else (
-        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
-    if total_end > limit:
-        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
-        truncated = True
-        nr = bisect_right(ar_ends, limit)
-        if nr == 0:
-            nn = bisect_right(ns_ends, limit)
-            if nn == 0:
-                na = bisect_right(an_ends, limit)
-                if na == 0 and body_base > limit:
-                    raise EncodeError("header and question exceed limit")
-    if nr:
-        end = ar_ends[nr - 1]
-    elif nn:
-        end = ns_ends[nn - 1]
-    elif na:
-        end = an_ends[na - 1]
-    else:
-        end = body_base
+    an, ns, ar, truncated, out, end, flags = _rrset_select(
+        msg, an, ns, ar, rcode,
+        lambda total_end: total_end <= limit,
+        "header and question exceed limit")
     result = bytearray(out[:end])
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = nr.to_bytes(2, "big")
+    result[6:8] = len(an).to_bytes(2, "big")
+    result[8:10] = len(ns).to_bytes(2, "big")
+    result[10:12] = len(ar).to_bytes(2, "big")
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
@@ -1593,8 +1730,9 @@ def edns(query: bytes, model: dict, rcode: int = 0,
     flags&0x7910)，问题重编码，AN=NS=0、AR=1，OPT 为根 owner、
     TYPE41、回显 CLASS 与 DO，TTL=DO?0x01008000:0x01000000，
     RDLENGTH=0），上限 min(model.limit, CLASS)，超限抛 EncodeError
-    且不置 TC。版本 0 时编码其余同 encode_response：超限普通 RR 按
-    ar、ns、an 尾删并置 TC，OPT 固定不删不截；问题与 OPT 超限抛
+    且不置 TC。版本 0 时编码其余同 encode_response：普通 RR 的 RRset
+    按规范化 owner/type/class 识别，超限时按附加段、授权段、回答段
+    整组淘汰并置 TC，OPT 固定不删不截；问题与预留 OPT 超限抛
     EncodeError。
     """
     if not isinstance(query, bytes):
@@ -1637,45 +1775,22 @@ def edns(query: bytes, model: dict, rcode: int = 0,
         opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
                     + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
                     + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
-    truncated = False
-    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
+    # OPT 占 ar 一席且固定保留为附加段末项：先预留其空间，普通 RR 的
+    # 有效上限相应扣除，model 的 ar 计数预算减一。
     max_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
-    if len(ar) > max_ar:
-        del ar[max_ar:]
-        truncated = True
-    for section in (ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode & 0xF)
-    body_limit = limit - len(opt_wire)  # 为 OPT 预留，OPT 不参与尾删
-    na, nn, nr = len(an), len(ns), len(ar)
-    total_end = ar_ends[-1] if ar_ends else (
-        ns_ends[-1] if ns_ends else (an_ends[-1] if an_ends else body_base))
-    if total_end > body_limit:
-        # 超长：先尾删 ar，ar 清空仍超长再尾删 ns，最后尾删 an。
-        truncated = True
-        nr = bisect_right(ar_ends, body_limit)
-        if nr == 0:
-            nn = bisect_right(ns_ends, body_limit)
-            if nn == 0:
-                na = bisect_right(an_ends, body_limit)
-                if na == 0 and body_base > body_limit:
-                    raise EncodeError("header and question exceed limit")
-    if nr:
-        end = ar_ends[nr - 1]
-    elif nn:
-        end = ns_ends[nn - 1]
-    elif na:
-        end = an_ends[na - 1]
-    else:
-        end = body_base
+    body_limit = limit - len(opt_wire)
+    # 截断以 RRset 为原子单位（识别与淘汰规则同 _encode_response）：
+    # OPT 不参与分组、不删不截；头部、问题段与预留 OPT 超限抛 EncodeError。
+    an, ns, ar, truncated, out, end, flags = _rrset_select(
+        msg, an, ns, ar, rcode & 0xF,
+        lambda total_end: total_end <= body_limit,
+        "header and question exceed limit",
+        max_ar=max_ar)
     result = bytearray(out[:end])
     result += opt_wire
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = (nr + (1 if opt_wire else 0)).to_bytes(2, "big")
+    result[6:8] = len(an).to_bytes(2, "big")
+    result[8:10] = len(ns).to_bytes(2, "big")
+    result[10:12] = (len(ar) + (1 if opt_wire else 0)).to_bytes(2, "big")
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
@@ -1702,8 +1817,8 @@ def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
     ipaddress 的 packed。未带服务端值或服务端值匹配时按 model、rcode
     应答；不匹配时先完成 model 校验，再以空 an/ns/ar 与扩展 RCODE 23
     应答。应答 OPT 回显 CLASS、DO、版本 0，RDATA 仅含码 10，data 为
-    8 字节客户端值加新算的 16 字节服务端值；OPT 固定不删，超限与普通
-    RR 尾删规则沿用 edns。相同参数逐字节一致。
+    8 字节客户端值加新算的 16 字节服务端值；OPT 固定不删，超限普通
+    RR 的 RRset 整组淘汰规则沿用 edns。相同参数逐字节一致。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1771,12 +1886,14 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
     校验后返回既有 BADVERS 应答（同 edns 的版本协商契约：model 三段
     须空、rcode 须为 0），不填充。版本 0 查询中 Padding 选项至多一
     项且 data 全零，否则抛 EDNSError；其余选项一律忽略、不回显。
-    应答 OPT 仅含一个 Padding TLV：按 ar、ns、an 尾删顺序枚举候选
-    （优先保留最多普通 RR），B 为候选含零长 TLV 时的报文长度，
+    应答 OPT 仅含一个 Padding TLV：按附加段、授权段、回答段的
+    RRset 整组淘汰顺序枚举候选（RRset 按规范化 owner/type/class
+    识别，优先保留最多普通 RR），B 为候选含零长 TLV 时的报文长度，
     n=(-B)%block，取首个 B+n≤min(model.limit, OPT CLASS) 的候选并
-    写 n 个零（n=0 仍保留 TLV）；无候选抛 EncodeError。OPT 不删不
-    截，仅删过普通 RR 才置 TC；标志、扩展 RCODE、名称压缩与其余异
-    常沿用 edns。相同参数逐字节一致，时空 O(报文长+RR 数)。
+    在最终候选上写 n 个零（n=0 仍保留 TLV）；无候选抛 EncodeError。
+    OPT 不删不截，仅删过普通 RRset 才置 TC；标志、扩展 RCODE、名称
+    压缩与其余异常沿用 edns。相同参数逐字节一致，时空
+    O((报文长+RR 数)·log RR 组数)。
     """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
@@ -1815,58 +1932,35 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
         if any(data):
             raise EDNSError("PADDING data must be all zeros")
         seen_padding = True
-    truncated = False
-    # 区段计数为 16 位：OPT 占 ar 一席且不删，model 的 ar 预算相应减一。
-    max_ar = _MAX_SECTION_RECORDS - 1
-    if len(ar) > max_ar:
-        del ar[max_ar:]
-        truncated = True
-    for section in (ns, an):
-        if len(section) > _MAX_SECTION_RECORDS:
-            del section[_MAX_SECTION_RECORDS:]
-            truncated = True
     opt_class, _opt_version, do, _query_opts = opt
     limit = min(limit, opt_class)
-    ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
-    out, body_base, (an_ends, ns_ends, ar_ends), flags = _build_message(
-        msg, an, ns, ar, rcode & 0xF)
+    ttl = ((rcode >> 4) << 24 | (_FLAG_DO if do else 0))
     # OPT 固定部分（根 owner、TYPE41、CLASS、TTL）与零长 TLV 的字节数。
     opt_fixed = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
                  + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big"))
     zero_tlv_len = len(opt_fixed) + 2 + 4  # RDLENGTH 字段 + 零长 TLV
-    # 候选按 ar、ns、an 尾删顺序枚举，优先保留最多普通 RR。
-    candidates = (
-        [(len(an), len(ns), nr) for nr in range(len(ar), -1, -1)]
-        + [(len(an), nn, 0) for nn in range(len(ns) - 1, -1, -1)]
-        + [(na, 0, 0) for na in range(len(an) - 1, -1, -1)])
-    chosen = None
-    for na, nn, nr in candidates:
-        if nr:
-            end = ar_ends[nr - 1]
-        elif nn:
-            end = ns_ends[nn - 1]
-        elif na:
-            end = an_ends[na - 1]
-        else:
-            end = body_base
-        msg_len = end + zero_tlv_len  # B：候选含零长 TLV 时的报文长度
-        pad = (-msg_len) % block
-        if msg_len + pad <= limit:
-            chosen = (na, nn, nr, end, pad)
-            break
-    if chosen is None:
-        raise EncodeError("no padding candidate fits the limit")
-    na, nn, nr, end, pad = chosen
-    if (na, nn, nr) != (len(an), len(ns), len(ar)):
-        truncated = True
+    max_ar = _MAX_SECTION_RECORDS - 1  # OPT 固定占 ar 末席
+
+    def padded_fits(total_end):
+        msg_len = total_end + zero_tlv_len  # B：候选含零长 TLV 时的长度
+        return msg_len + (-msg_len) % block <= limit
+
+    # 候选按附加段、授权段、回答段的 RRset 整组淘汰顺序枚举（优先保留
+    # 最多普通 RR）；OPT 不删不截，仅删过普通 RRset 才置 TC。填充在
+    # 选定的最终候选上计算块对齐。
+    an, ns, ar, truncated, out, end, flags = _rrset_select(
+        msg, an, ns, ar, rcode & 0xF, padded_fits,
+        "no padding candidate fits the limit", max_ar=max_ar)
+    msg_len = end + zero_tlv_len
+    pad = (-msg_len) % block
     tlv = (_OPT_CODE_PADDING.to_bytes(2, "big") + pad.to_bytes(2, "big")
            + b"\x00" * pad)
     opt_wire = opt_fixed + (4 + pad).to_bytes(2, "big") + tlv
     result = bytearray(out[:end])
     result += opt_wire
-    result[6:8] = na.to_bytes(2, "big")
-    result[8:10] = nn.to_bytes(2, "big")
-    result[10:12] = (nr + 1).to_bytes(2, "big")
+    result[6:8] = len(an).to_bytes(2, "big")
+    result[8:10] = len(ns).to_bytes(2, "big")
+    result[10:12] = (len(ar) + 1).to_bytes(2, "big")
     if truncated:
         result[2:4] = (flags | _FLAG_TC).to_bytes(2, "big")
     return bytes(result)
@@ -1884,7 +1978,7 @@ def edns_ede(query: bytes, model: dict, info_code: int, text: str = "",
     0，扩展 RCODE 取 rcode>>4、头部低 4 位取 rcode&15，RDATA 仅含一
     个 EDE TLV：code=15、length=2+text 的 UTF-8 字节数、data 为网络
     序 uint16 info_code 后接 text 的 UTF-8 字节（可为空）。上限
-    min(model.limit, OPT CLASS)；超限普通 RR 按 ar、ns、an 尾删并置
+    min(model.limit, OPT CLASS)；超限普通 RR 按 RRset 整组淘汰并置
     TC，OPT 不删不截，删空仍超限抛 EncodeError。其余错误沿用 edns。
     相同参数逐字节一致，时空 O(报文长+RR 数)。
     """
@@ -3910,7 +4004,7 @@ class PositiveCache:
     ECS 时仅回写码 8 选项（family、source 不变，scope=source，
     address 同查询，其他选项不回显；ECS 使报文超 min(limit,OPT
     CLASS) 抛 EncodeError），无 ECS 时扩展码、版本及 RDLENGTH 为 0，
-    普通 RR 超限按既有顺序整条尾删并置 TC、OPT
+    普通 RR 超限按 RRset 整组淘汰并置 TC、OPT
     不删，头部、问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计
     或最后时刻，成功原子提交；无 ECS 输出与既有逐字节相同。
 
