@@ -49,7 +49,13 @@
   恰含一个版本 0 的 OPT（缺失或版本非 0 抛 EDEError），查询选项不
   回显，应答 OPT 仅含一个 EDE TLV（网络序 uint16 info_code 后接
   text 的 UTF-8 字节，可为空）。
-- answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询。
+- answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询；
+  权威计划按 ANSWER 后 AUTHORITY 中首次出现的顺序观察 NS、MX、SRV 的嵌入
+  目标（NS 整段 rdata；MX 跳过两字节 preference；SRV 跳过六字节
+  priority/weight/port），为 origin 内目标把区域中 owner 精确相等的
+  A/AAAA（区域原序、不通配合成、不追随 CNAME、重复不归并）确定性放入
+  ADDITIONAL，EDNS 时置于唯一 OPT 之前；截断时附加 RRset 先于授权段与
+  回答段淘汰并置 TC，域外、根与无精确地址的目标不生成附加记录。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
@@ -82,7 +88,9 @@
   应答末项回显 OPT（OPT 版本非 0 时直接返回 BADVERS，先于时钟回退
   判断且不触缓存）；版本 0 查询至多携带一个 ECS（选项码 8），ECS
   合法时缓存按 (family,source,address) 分区、应答 OPT 回写码 8
-  （scope=source），非法 ECS 在访问缓存前抛 EDNSError；
+  （scope=source），非法 ECS 在访问缓存前抛 EDNSError；正条目把权威
+  计划生成的地址附加记录纳入同一计划，命中时 ANSWER 与 ADDITIONAL 的
+  TTL 等量衰减，以两段所有记录的最小原始 TTL 判断整条到期；
   stats(reset=False) 返回键序 h,m,x,k 的
   紧凑 ASCII JSON（末尾换行），reset=True 先返回快照再清零 h,m,x。
 - UpstreamError: 上游转发未获得可用应答（RuntimeError 子类）。
@@ -2195,17 +2203,95 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype):
         current = target
 
 
+def _address_index(records):
+    """按区域记录原序构造精确 owner -> A/AAAA 记录列表索引。
+
+    仅索引 A/AAAA，同一 owner 的地址记录保持其在区域记录中的相对顺序
+    （A 与 AAAA 交错时不重排）；键为精确 owner，故通配记录只可能被
+    字面值与其 owner 精确相等的目标命中，绝不展开合成；CNAME 由区域
+    约束（CNAME owner 只能持有一条 CNAME）自然排除。
+    """
+    addresses = {}
+    for rr in records:
+        rrtype = rr[1]
+        if rrtype == _TYPE_A or rrtype == _TYPE_AAAA:
+            addresses.setdefault(tuple(rr[0]), []).append(rr)
+    return addresses
+
+
+def _additional_target(rr):
+    """提取 NS/MX/SRV rdata 中（须完整未压缩绝对名的）嵌入目标标签。
+
+    NS 取整个 rdata；MX 跳过两字节 preference；SRV 跳过六字节
+    priority/weight/port。嵌入名不是完整未压缩绝对名（含压缩指针、
+    截断、尾随等区域层历史宽松形态）时返回 None：原记录照常输出，
+    但不为其生成附加记录，也不新增异常。
+    """
+    rrtype = rr[1]
+    rdata = rr[4]
+    try:
+        if rrtype == _TYPE_NS:
+            return _decode_cname_target(rdata)
+        if rrtype == _TYPE_MX:
+            if len(rdata) < 3:
+                return None
+            return _decode_cname_target(rdata[2:])
+        if rrtype == _TYPE_SRV:
+            if len(rdata) < 7:
+                return None
+            return _decode_cname_target(rdata[6:])
+    except RecordError:
+        return None
+    return None
+
+
+def _address_additional(an, ns, origin, addresses):
+    """为权威计划确定性地生成地址附加段（NS/MX/SRV glue）。
+
+    目标按其在 ANSWER 后 AUTHORITY 中首次出现的顺序观察（NS、MX、
+    SRV），每个规范化目标只触发一次；目标须位于 origin 之内（根目标
+    与域外目标跳过），且仅取区域中 owner 与目标精确相等的 A/AAAA，
+    不用通配记录展开合成、不追随目标处的 CNAME；同一目标的地址记录
+    沿用区域记录原序（A/AAAA 交错不重排），重复记录不归并。候选数
+    与临时内存以区域记录数为线性上界。
+    """
+    seen = set()
+    targets = []
+    for section in (an, ns):
+        for rr in section:
+            if rr[1] not in (_TYPE_NS, _TYPE_MX, _TYPE_SRV):
+                continue
+            target = _additional_target(rr)
+            if target is None:
+                continue
+            key = tuple(target)
+            if not key or key in seen:
+                continue
+            if (len(key) < len(origin)
+                    or key[len(key) - len(origin):] != tuple(origin)):
+                continue
+            seen.add(key)
+            targets.append(key)
+    ar = []
+    for key in targets:
+        ar.extend(addresses.get(key, ()))
+    return ar
+
+
 def _answer_plan(msg, origin, records, zone_class):
-    """answer 的完整（未截断）应答计划，返回 (rcode, an, ns)。
+    """answer 的完整（未截断）应答计划，返回 (rcode, an, ns, ar)。
 
     msg 为已解码且通过可应答性检查的单问题查询；zone 已校验，
-    RR 均为规范化元组。
+    RR 均为规范化元组。ar 为按 an、ns 中 NS/MX/SRV 目标确定性生成
+    的精确地址附加记录（见 _address_additional）；REFUSED 与域外
+    NXDOMAIN 等计划不含可观察目标时 ar 为空。
     """
     question = msg["questions"][0]
     qlabels = _normalize_name(question["name"])
     qtype = question["type"]
     an = []
     ns = []
+    ar = []
     if question["class"] != zone_class:
         rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
     elif (len(qlabels) < len(origin)
@@ -2220,25 +2306,32 @@ def _answer_plan(msg, origin, records, zone_class):
             for i in range(len(labels) - len(origin)):
                 nodes.add(tuple(labels[i:]))
         rcode, an, ns = _resolve_chain(records, nodes, origin, qlabels, qtype)
-    return rcode, an, ns
+        addresses = _address_index(records)
+        ar = _address_additional(an, ns, origin, addresses)
+    return rcode, an, ns, ar
 
 
-def _encode_plan(query, rcode, an, ns, limit, ecs=None):
+def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None):
     """把完整应答计划编码为权威应答报文。
 
-    ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。
+    ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。ar 为权威计划
+    生成的地址附加记录；None（递归转发等非权威路径的默认值）等价于空
+    附加段，输出与既有逐字节相同。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
-        "ar": [],
+        "ar": [_rr_to_model(rr) for rr in (ar if ar is not None else ())],
         "limit": limit,
     }
     return _encode_response(query, model, rcode)
 
 
-def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None):
+def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None):
     """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
+
+    ar 为权威计划生成的地址附加记录，置于唯一应答 OPT 之前；None
+    （递归转发等非权威路径的默认值）等价于空附加段。
 
     ecs 非 None 时应答 OPT 仅回写该 ECS（码 8）选项：family、source
     不变，scope=source，address 同查询；查询携带的其他选项不回显。
@@ -2246,7 +2339,7 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None):
     model = {
         "an": [_rr_to_model(rr) for rr in an],
         "ns": [_rr_to_model(rr) for rr in ns],
-        "ar": [],
+        "ar": [_rr_to_model(rr) for rr in (ar if ar is not None else ())],
         "limit": limit,
     }
     options = None
@@ -2287,7 +2380,17 @@ def _encode_policy_refusal(query, limit):
 
 
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
-    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
+    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配、CNAME 链
+    与确定性地址附加段）。
+
+    ADDITIONAL 由完整计划按规则生成：在 ANSWER 后 AUTHORITY 中按原序
+    观察 NS、MX、SRV，取其嵌入目标（NS 整个 rdata；MX 跳过两字节
+    preference；SRV 跳过六字节 priority/weight/port），每个规范化目标
+    仅处理一次，目标须在 origin 内（根/域外跳过），仅追加区域中 owner
+    与目标精确相等的 A/AAAA（区域原序、不通配合成、不追随 CNAME、重复
+    不归并）；RCODE、AA、ANSWER、AUTHORITY 不因无附加记录而改变。长度
+    与区段计数沿用 RRset 原子截断：附加 RRset 最先淘汰并置 TC。
+    """
     msg = decode_query(query)  # MessageError/TypeError 原样传播
     _check_int(limit, "limit")
     questions = msg["questions"]
@@ -2295,8 +2398,8 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
         raise EncodeError("query or limit not answerable")
     origin, records, zone_class = _validate_zone(zone)
-    rcode, an, ns = _answer_plan(msg, origin, records, zone_class)
-    return _encode_plan(query, rcode, an, ns, limit)
+    rcode, an, ns, ar = _answer_plan(msg, origin, records, zone_class)
+    return _encode_plan(query, rcode, an, ns, limit, ar=ar)
 
 
 def _config_pairs(pairs):
@@ -4033,8 +4136,11 @@ class PositiveCache:
     """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
     正缓存键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
-    仅缓存 RCODE=0、ns 空、an 非空且各原始 TTL 均为正的完整有序应答；
-    条目保存插入时刻与原始 RR，输出 TTL 随经过时间递减，到期即删除。
+    仅缓存 RCODE=0、ns 空、an 非空且 ANSWER 与 ADDITIONAL 两段所有记录
+    原始 TTL 均为正的完整有序应答；条目保存插入时刻、原始 an 与权威计划
+    生成的地址附加 ar（NS/MX/SRV 目标在 origin 内的精确 A/AAAA，规则同
+    answer），输出时两段 TTL 随经过时间等量递减，以两段所有记录的最小
+    原始 TTL 判断整条到期并按既有流程刷新。
 
     负缓存仅收完整计划所得且 an 为空的 NXDOMAIN（RCODE=3，键为小写绝对
     (qname, qclass)，匹配任意 qtype）与 NODATA（RCODE=0，键为
@@ -4092,7 +4198,8 @@ class PositiveCache:
         # 校验异常与 answer 完全一致。
         zone = copy.deepcopy(zone)
         self._origin, self._records, self._zone_class = _validate_zone(zone)
-        self._entries = {}  # 正缓存键 -> (插入时刻, 规范化 an)
+        # 正缓存键 -> (插入时刻, 规范化 an, 规范化地址附加 ar)
+        self._entries = {}
         self._neg_entries = {}  # 负缓存键 -> (插入时刻, rcode, 规范化 SOA, 负 TTL)
         self._order = deque()  # (类别, 键) 插入次序；与两个字典的键集合始终一致
         self._last_now = None  # 上次成功 resolve 的时钟值
@@ -4212,8 +4319,9 @@ class PositiveCache:
         """resolve/resolve_edns 共用的缓存查找、计划应答与原子提交。
 
         msg 为已解码且通过可应答性检查的单问题报文；encode_plan 为
-        (query, rcode, an, ns, limit, ecs=None) -> 应答报文 的编码器，
-        其异常即本次失败，不改变条目、统计与时钟。ecs 非 None 时缓存
+        (query, rcode, an, ns, limit, ecs=None, ar=None) -> 应答报文 的
+        编码器（ar 为权威计划的地址附加记录），其异常即本次失败，不改
+        变条目、统计与时钟。ecs 非 None 时缓存
         键追加 (family,source,address) 分区，普通 resolve 路径恒为
         None（无 ECS 单独分区）。
         """
@@ -4224,15 +4332,21 @@ class PositiveCache:
         expired = None  # 到期条目在 _order 中的标记键，待编码成功后清理
         entry = self._entries.get(key)
         if entry is not None:
-            inserted, an = entry
+            inserted, an, ar = entry
             elapsed = now - inserted
-            min_ttl = min(rr[3] for rr in an)
+            # 整条正缓存以 ANSWER 与 ADDITIONAL 两段所有记录的最小原始
+            # TTL 判定到期；命中时两段 TTL 按显式 now 等量衰减。
+            min_ttl = min([rr[3] for rr in an]
+                          + [rr[3] for rr in ar])
             if elapsed < min_ttl:
                 aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
                         for labels, rrtype, rrclass, ttl, rdata in an]
+                aged_ar = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
+                           for labels, rrtype, rrclass, ttl, rdata in ar]
                 # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
                 # 命中也不改变插入次序。
-                response = encode_plan(query, 0, aged, [], limit, ecs)
+                response = encode_plan(query, 0, aged, [], limit, ecs,
+                                       aged_ar)
                 # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                 self._stats_h[0] += 1
                 self._last_now = now
@@ -4263,18 +4377,22 @@ class PositiveCache:
                     return response, True
                 expired = ("neg", neg_key)
         # 未命中（含到期）：先按 answer 语义生成未截断的完整有序应答。
-        rcode, an, ns = _answer_plan(
+        rcode, an, ns, ar = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
         # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
-        response = encode_plan(query, rcode, an, ns, limit, ecs)
+        response = encode_plan(query, rcode, an, ns, limit, ecs, ar)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
             tag, ekey = expired
             del (self._entries if tag == "pos" else self._neg_entries)[ekey]
             self._order.remove(expired)  # 到期删除后按未命中刷新
-        if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
-            self._entries[key] = (now, an)
+        # 正条目要求 RCODE=0、ns 空、an 非空且 ANSWER 与 ADDITIONAL
+        # 两段所有记录的原始 TTL 均为正；附加记录随同一计划一并缓存。
+        if (rcode == 0 and not ns and an
+                and all(rr[3] > 0 for rr in an)
+                and all(rr[3] > 0 for rr in ar)):
+            self._entries[key] = (now, an, ar)
             self._order.append(("pos", key))
             m_index = 0  # 新写正缓存
         else:
@@ -4951,15 +5069,19 @@ def _state_stats_text(h, m, x, u, c, l_buckets):
 def _min_remaining_ttl(entries, now, negative):
     """该类全部条目的最小剩余 TTL（下限 0），无条目为 -1。
 
-    正条目值为 (插入时刻, 规范化 an)，负条目值为
-    (插入时刻, rcode, SOA, 负 TTL)；正条目剩余值为
-    max(0, 插入时刻 + RR 最小 TTL - now)，负条目以负 TTL 同算。
-    读取不清除到期项，故到期条目贡献 0。
+    正条目值为 (插入时刻, 规范化 an, 规范化地址附加 ar)，负条目值为
+    (插入时刻, rcode, SOA, 负 TTL)；正条目剩余值取 an 与 ar 两段所有
+    记录的最小原始 TTL，即 max(0, 插入时刻 + 两段最小 TTL - now)，
+    负条目以负 TTL 同算。读取不清除到期项，故到期条目贡献 0。
     """
     remaining = -1
     for value in entries.values():
         inserted = value[0]
-        ttl = value[3] if negative else min(rr[3] for rr in value[1])
+        if negative:
+            ttl = value[3]
+        else:
+            ttl = min([rr[3] for rr in value[1]]
+                      + [rr[3] for rr in value[2]])
         current = max(0, inserted + ttl - now)
         if remaining < 0 or current < remaining:
             remaining = current
@@ -6400,7 +6522,11 @@ class Resolver:
                partition)
         entry = cache._entries.get(key)
         if entry is not None:
-            return now - entry[0] >= min(rr[3] for rr in entry[1])
+            # 到期口径与 PositiveCache 一致：an 与地址附加 ar 两段所有
+            # 记录的最小原始 TTL。
+            inserted, an, ar = entry
+            min_ttl = min([rr[3] for rr in an] + [rr[3] for rr in ar])
+            return now - inserted >= min_ttl
         neg_key = ("nodata",) + key
         neg = cache._neg_entries.get(neg_key)
         if neg is None:
