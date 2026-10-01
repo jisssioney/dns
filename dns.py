@@ -97,6 +97,22 @@
   单换行；输入限 1048576 码点；规范 v1 再次迁移逐字节不变）。
 - Resolver(zone, plan, timeout=5): 权威缓存与上游转发组合的解析器，
   resolve(query, now, limit=512) 返回 (应答报文, 来源, 结束时刻, 是否命中缓存)；
+  resolve_edns(query, now, limit=65535) 让 EDNS 查询沿同一路径完成校验、
+  权威缓存或模拟转发，返回同形四元组：仅接受 QR 未置位、恰一个问题且
+  附加段恰一个合法末项 OPT 的查询，报文、OPT、ECS、now 与 limit 的范围
+  及异常类型同 PositiveCache.resolve_edns，有效长度上限取
+  min(limit, OPT CLASS)；版本 1..255 在访问区域、缓存、时钟、统计与
+  上游前直接返回 (BADVERS, "edns", now, False)，版本 0 区内查询使用现有
+  权威正负缓存与 ECS 分区（来源 "authority"，无 ECS 与现有权威 EDNS
+  输出逐字节一致，有 ECS 仅回写规范 ECS，TTL 衰减、NXDOMAIN、NODATA、
+  截断与命中沿用当前契约），区外查询按当前上游顺序、attempts 与 timeout
+  转发（来源为成功上游名、结束时刻累加事件延迟、命中恒 False），候选
+  应答还须问题一致、恰含一个合法末项 OPT 且总长度不超有效上限，否则按
+  不可用应答继续尝试，全部超时抛 UpstreamTimeout、存在非超时失败但无
+  可用应答抛 UpstreamError；成功的区内解析按现有 authority 口径更新统计，
+  成功或耗尽的区外转发按普通 resolve 口径原子更新逐上游结果、失败分类
+  与耗时分桶，BADVERS、参数或报文错误、时钟回退、编码失败均不改变缓存、
+  FIFO、时钟或统计；
   resolve_authorized(query, client, rules, now, limit=512, default="deny")
   先按授权规则判定再解析，放行行为同 resolve，拒绝返回
   (拒绝应答, "policy", now, False)（flags=0x8400|(flags&0x7910)|5，
@@ -136,8 +152,8 @@
   键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
   i,n,a,s,to,e,bad,ms 的对象（重名不合并，i 为从 0 起的序号，n 为
   原上游名，其余为非负整数），t 省略 i、n 并为逐项和；仅经 resolve
-  的直转在成功或耗尽（UpstreamTimeout/UpstreamError）时原子提交，
-  权威、缓存与 resolve_recursive 的 levels 不计；reset=True 先返回
+  与 resolve_edns 的直转在成功或耗尽（UpstreamTimeout/UpstreamError）时
+  原子提交，权威、缓存与 resolve_recursive 的 levels 不计；reset=True 先返回
   旧快照再清零上述计数；
   recursive_upstream_stats(reset=False) 返回 resolve_recursive 逐层
   转发的按深度统计，为顶层键序仅 l,t 的紧凑 ASCII JSON（末尾单换行）：
@@ -4622,6 +4638,76 @@ def _upstream_forward_counts(plan, query, timeout):
     return counts
 
 
+def _matching_edns_reply(query, reply, effective_limit):
+    """EDNS 直转的合格上游应答判定：普通匹配外还须恰含一个合法末项 OPT
+    且总长度不超有效上限 min(limit, 查询 OPT CLASS)。任何不符为 False。"""
+    if len(reply) > effective_limit:
+        return False
+    try:
+        _decode_edns_response(query, reply)
+    except EncodeError:
+        return False
+    return True
+
+
+def _forward_edns(query, plan, now, effective_limit, timeout=5):
+    """按 forward 同序模拟向上游转发 EDNS 查询。
+
+    与 forward 的差异仅在应答合格判定：候选应答除问题一致外还须恰含一个
+    合法末项 OPT（_decode_edns_response 契约）且总长度不超
+    effective_limit（调用方取 min(limit, 查询 OPT CLASS)），否则按不可用
+    应答继续尝试。顺序、每上游前 2 事件、时钟推进、停止点与耗尽异常
+    （全超时 UpstreamTimeout，其余 UpstreamError）均同 forward。query 须
+    已通过 _decode_edns_query 校验（单问题、恰一个合法末项 OPT）。
+    """
+    _check_non_negative_int(now, "now")
+    _check_int(timeout, "timeout")
+    if not _MIN_TIMEOUT <= timeout <= _MAX_TIMEOUT:
+        raise ValueError("timeout out of range")
+    items = _validate_plan(plan)
+    clock = now
+    saw_timeout = False
+    saw_other = False
+    for name, events in items:
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            if delay > timeout:
+                saw_timeout = True
+                clock += timeout
+                continue
+            clock += delay
+            if reply is not None and _matching_edns_reply(
+                    query, reply, effective_limit):
+                return reply, name, clock
+            saw_other = True
+    if saw_timeout and not saw_other:
+        raise UpstreamTimeout("all upstream attempts timed out")
+    raise UpstreamError("no usable upstream reply")
+
+
+def _upstream_forward_edns_counts(plan, query, timeout, effective_limit):
+    """_forward_edns 的逐上游事件计数，口径与 _upstream_forward_counts
+    完全一致，仅应答匹配改用 _matching_edns_reply（含合法末项 OPT 与有效
+    长度上限判定）。本身不产生异常。"""
+    counts = [[0, 0, 0, 0, 0, 0] for _ in plan]
+    for index, (_name, events) in enumerate(plan):
+        entry = counts[index]
+        for delay, reply in events[:_PLAN_EVENTS_USED]:
+            entry[0] += 1  # a：尝试
+            if delay > timeout:
+                entry[2] += 1  # to：超时
+                entry[5] += timeout
+                continue
+            entry[5] += delay
+            if reply is None:
+                entry[3] += 1  # e：无应答
+            elif not _matching_edns_reply(query, reply, effective_limit):
+                entry[4] += 1  # bad：应答未通过匹配
+            else:
+                entry[1] += 1  # s：成功并停止
+                return counts
+    return counts
+
+
 def _duration_bucket(elapsed, timeout):
     """模拟时长分桶下标：0、1..timeout、timeout+1..2*timeout、>2*timeout。"""
     if elapsed <= 0:
@@ -5304,6 +5390,23 @@ class Resolver:
     调用 forward，返回 (应答报文, 上游名, 结束时刻, False)，转发结果
     不缓存。
 
+    resolve_edns(query, now, limit=65535)：EDNS 查询沿 resolve 同一路径
+    完成校验、权威缓存或模拟转发，返回同形四元组。仅接受 QR 未置位、恰
+    一个问题且附加段恰一个合法末项 OPT 的查询，报文、OPT、ECS、now 与
+    limit 的范围及异常类型同 PositiveCache.resolve_edns，有效长度上限
+    取 min(limit, OPT CLASS)。版本 1..255 在访问区域、缓存、时钟、统计
+    与上游前直接返回 (BADVERS, "edns", now, False)。版本 0 区内查询沿用
+    权威正负缓存与 ECS 分区，来源 "authority"，无 ECS 时与现有权威 EDNS
+    输出逐字节一致、有 ECS 时仅回写规范 ECS，TTL 衰减、NXDOMAIN、NODATA、
+    截断与命中标记沿用当前契约；成功按现有 authority 口径更新命中、未中、
+    到期、水位与最后时刻。区外查询按当前上游顺序、attempts 与 timeout
+    转发，候选应答还须问题一致、恰含一个合法末项 OPT 且总长度不超有效
+    上限，否则按不可用应答继续尝试；全部超时抛 UpstreamTimeout，存在非
+    超时失败但无可用应答抛 UpstreamError；成功来源为上游名、结束时刻累加
+    事件延迟、命中恒为 False，成功或耗尽按普通 resolve 口径原子更新逐
+    上游结果、失败分类与耗时分桶。BADVERS、参数或报文错误、时钟回退、
+    编码失败均不改变缓存、FIFO、时钟或统计。
+
     resolve_authorized(query, client, rules, now, limit=512,
     default="deny")：授权匹配、TypeError 与 PolicyError 沿用 authorize，
     其余校验及异常沿用 resolve，全部校验通过后方可改变状态。放行时
@@ -5798,6 +5901,109 @@ class Resolver:
         self._last_end = end
         return reply, name, end, False
 
+    def resolve_edns(self, query: bytes, now: int,
+                     limit: int = 65535) -> tuple[bytes, str, int, bool]:
+        """EDNS 查询沿 resolve 同一路径完成校验、权威缓存或模拟转发。
+
+        返回 (应答报文, 来源, 结束时刻, 是否命中缓存)，与 resolve 同形。
+        入口只接受 QR 未置位、恰有一个问题且附加段恰有一个合法末项 OPT
+        的查询；报文、OPT、ECS、now 与 limit 的范围及异常类型与
+        PositiveCache.resolve_edns 完全一致（时钟单调性以解析器上次成功
+        结束时刻 _last_end 为准），有效长度上限取 min(limit, OPT CLASS)。
+
+        OPT 版本 1..255 在访问区域、缓存、时钟、统计与上游前直接返回
+        (BADVERS 应答, "edns", now, False)，不改变任何状态；版本 0 的
+        区内查询沿用现有权威正负缓存与 ECS 分区（无 ECS 时与现有权威
+        EDNS 输出逐字节一致，有 ECS 时仅回写规范 ECS），TTL 衰减、
+        NXDOMAIN、NODATA、截断与命中标记沿用 PositiveCache 契约，来源为
+        "authority"，成功按现有 authority 口径更新命中、未中、到期、水位
+        与最后时刻。区外查询按当前上游顺序、attempts 与 timeout 转发，
+        候选应答还须问题一致、恰含一个合法末项 OPT 且总长度不超有效上限，
+        否则按不可用应答继续尝试；全部超时抛 UpstreamTimeout，存在非超时
+        失败但无可用应答抛 UpstreamError。成功来源为成功上游名、结束时刻
+        累加事件延迟、命中恒为 False；成功或耗尽按普通 resolve 的口径原子
+        更新逐上游结果、失败分类与耗时分桶。BADVERS、参数或报文错误、
+        时钟回退、编码失败均不改变缓存、FIFO、时钟或统计。
+        """
+        # 校验次序与 PositiveCache.resolve_edns 逐项一致，仅时钟单调性
+        # 以解析器上次成功结束时刻为准。
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0:
+            raise CacheError("now must be non-negative and monotonic")
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        _check_int(limit, "limit")
+        if (int.from_bytes(query[2:4], "big") & 0x8000
+                or int.from_bytes(query[4:6], "big") != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
+        if opt[1] != 0:
+            # 版本协商先于时钟回退判断与区域、缓存、统计、上游访问：
+            # 直接返回 BADVERS，不改变任何状态，结束时刻为 now、命中为
+            # False，来源固定为 "edns"。
+            return _encode_badvers(msg, opt, limit), "edns", now, False
+        # 版本 0：ECS 校验先于时钟回退判断与一切状态访问。
+        ecs = _parse_query_ecs(opt[3])
+        if self._last_end is not None and now < self._last_end:
+            raise CacheError("now must be non-negative and monotonic")
+        question = msg["questions"][0]
+        origin = self._cache._origin
+        if _name_in_origin(question, origin, self._cache._zone_class):
+            partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
+            expired = self._authority_miss_expired(question, now, partition)
+            # 权威正负缓存与 ECS 分区由 PositiveCache.resolve_edns 处理：
+            # 无 ECS 时输出与既有权威 EDNS 逐字节一致，有 ECS 时仅回写
+            # 规范 ECS；TTL 衰减、NXDOMAIN、NODATA、截断与命中沿用其契约。
+            response, hit = self._cache.resolve_edns(query, now, limit)
+            self._fold_authority_cleanup()
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
+            self._sync_stats_c0()
+            self._last_end = now
+            return response, "authority", now, hit
+        # 区外：有效长度上限取 limit 与查询 OPT CLASS 的较小值；候选应答
+        # 除问题一致外还须恰含一个合法末项 OPT 且总长度不超该上限。顺序、
+        # attempts、前 2 事件、时钟与耗尽异常均同普通 resolve 的直转。
+        plan = self._forward_plan()
+        effective_limit = min(limit, opt[0])
+        upstream_counts = _upstream_forward_edns_counts(
+            plan, query, self._timeout, effective_limit)
+        try:
+            reply, name, end = _forward_edns(
+                query, plan, now, effective_limit, self._timeout)
+        except UpstreamTimeout:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[1] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        except UpstreamError:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[2] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        self._commit_upstream_counts(upstream_counts)
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._sync_stats_c0()
+        self._last_end = end
+        return reply, name, end, False
+
     def resolve_authorized(self, query: bytes, client: str, rules: list,
                            now: int, limit: int = 512,
                            default: str = "deny"
@@ -6000,11 +6206,16 @@ class Resolver:
         cache._clean_expired = 0
         cache._clean_evicted = 0
 
-    def _authority_miss_expired(self, question, now):
-        """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。"""
+    def _authority_miss_expired(self, question, now, partition=None):
+        """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。
+
+        partition 为 ECS 分区（None 或 (family,source,address)）：resolve
+        与 resolve_recursive 不经 EDNS/ECS，恒为 None；resolve_edns 按
+        查询 ECS 传入与 PositiveCache.resolve_edns 相同的分区。
+        """
         cache = self._cache
-        # resolve 不经 EDNS/ECS，恒为无 ECS 分区（partition=None）。
-        key = (question["name"], question["type"], question["class"], None)
+        key = (question["name"], question["type"], question["class"],
+               partition)
         entry = cache._entries.get(key)
         if entry is not None:
             return now - entry[0] >= min(rr[3] for rr in entry[1])
@@ -6848,7 +7059,7 @@ class Resolver:
         即 a 加 1，delay>timeout 时 to 加 1、ms 加 timeout，否则 ms 加
         delay 后按 reply 为 None/未通过匹配/通过分别计 e/bad/s（通过即
         停），无事件的上游不计。t 省略 i、n，余键同序并为逐项和。
-        仅经 resolve 进入该 plan 的直转计数（权威、缓存与
+        仅经 resolve 与 resolve_edns 进入该 plan 的直转计数（权威、缓存与
         resolve_recursive 的 levels 不计），直转成功或耗尽抛
         UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
         reset 非 bool 抛 TypeError 且无变化；False 只读，重复调用逐
