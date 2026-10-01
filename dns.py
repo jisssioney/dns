@@ -386,7 +386,16 @@
   操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，
   结果上限 16777216 字节。
 
-命令行：python dns.py decode HEX
+命令行：
+- python dns.py decode HEX
+- python dns.py answer ZONE_PATH QUERY_HEX [LIMIT]：离线权威应答。
+  读取 ZONE_PATH（最多 1048576 字节，须为 ASCII）指向的 v0/v1/v2
+  区域 JSON，按 answer 语义应答单问题查询 QUERY_HEX（非空偶长十六
+  进制）；LIMIT 省略为 512，显式值为 12..65535 的 ASCII 十进制整数。
+  成功时以 0 退出，stdout 仅含应答原始字节且无追加换行。参数非法以
+  2 退出且不打开区域文件；区域文件读取/ASCII/配置非法以 4 退出；
+  报文结构非法以 3 退出；编码失败或 CNAME 链非法以 5 退出；任何
+  失败 stdout 为空，stderr 仅写异常类型名加换行。
 """
 
 from bisect import bisect_right
@@ -758,6 +767,8 @@ _MAX_RDATA_LEN = 65535
 _MAX_TTL = 4294967295
 _MIN_LIMIT = 12
 _MAX_LIMIT = 65535
+# answer 子命令读取区域文件的字节上限（最多读 1048576 字节）。
+_MAX_ZONE_FILE_BYTES = 1048576
 _MAX_POINTER_TARGET = 0x3FFF
 _MAX_SECTION_RECORDS = 65535
 _FLAGS_RESPONSE = 0x8400  # QR | AA
@@ -10286,7 +10297,86 @@ def replay_cache(zone: dict, ops: list, expected=None) -> str:
     return result
 
 
+class _CliArgumentError(ValueError):
+    """answer 子命令的命令行参数错误（内部类型，不属于公开接口）。"""
+
+
+def _cli_answer(argv):
+    """answer ZONE_PATH QUERY_HEX [LIMIT] 的实现，返回退出码。
+
+    参数检查先于任何文件访问；stdout 仅在成功时写入原始应答字节且无
+    追加换行，失败时只向 stderr 写一个异常类型名加换行。
+    """
+    if len(argv) not in (4, 5):
+        raise _CliArgumentError
+    path, hextext = argv[2], argv[3]
+    if not path or "\x00" in path:
+        raise _CliArgumentError
+    if (not hextext or len(hextext) % 2
+            or any(c not in _HEXDIGITS for c in hextext)):
+        raise _CliArgumentError
+    limit = 512
+    if len(argv) == 5:
+        limittext = argv[4]
+        # ASCII 十进制整数 12..65535；允许前导零，拒符号、空白与非 ASCII
+        # 数字。先去前导零并按位数收口，避免超长数字串触发整数转换限制。
+        if not limittext or not limittext.isascii() or not limittext.isdigit():
+            raise _CliArgumentError
+        digits = limittext.lstrip("0")
+        if (not digits or len(digits) > 5
+                or not _MIN_LIMIT <= int(digits) <= _MAX_LIMIT):
+            raise _CliArgumentError
+        limit = int(digits)
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_MAX_ZONE_FILE_BYTES + 1)
+    except OSError:
+        sys.stderr.write("ConfigError\n")
+        return 4
+    if len(raw) > _MAX_ZONE_FILE_BYTES:
+        sys.stderr.write("ConfigError\n")
+        return 4
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        sys.stderr.write("ConfigError\n")
+        return 4
+    # import_zone 完整校验配置结构（ConfigError）与区域/记录语义
+    # （ZoneError/RecordError），均以 4 退出；open 失败已单独归为 ConfigError。
+    try:
+        zone = import_zone(text)
+    except ConfigError:
+        sys.stderr.write("ConfigError\n")
+        return 4
+    except ZoneError:
+        sys.stderr.write("ZoneError\n")
+        return 4
+    except RecordError:
+        sys.stderr.write("RecordError\n")
+        return 4
+    query = bytes.fromhex(hextext)
+    try:
+        result = answer(query, zone, limit)
+    except MessageError:
+        sys.stderr.write("MessageError\n")
+        return 3
+    except EncodeError:
+        sys.stderr.write("EncodeError\n")
+        return 5
+    except CNAMEError:
+        sys.stderr.write("CNAMEError\n")
+        return 5
+    sys.stdout.buffer.write(result)
+    return 0
+
+
 def main(argv):
+    if len(argv) >= 2 and argv[1] == "answer":
+        try:
+            return _cli_answer(argv)
+        except _CliArgumentError:
+            sys.stderr.write("ArgumentError\n")
+            return 2
     if len(argv) != 3 or argv[1] != "decode":
         sys.stderr.write("ArgumentError\n")
         return 2
