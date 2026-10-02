@@ -159,8 +159,22 @@
   查询限流或拒绝报文编码异常不计；reset 非 bool 抛 TypeError 且
   状态不变，True 先返回旧快照再清零十项计数，其余状态与 stats
   不变；
-  resolve_recursive(query, levels, now, limit=512) 按 1–16 层转介计划
-  递归解析域外查询，返回 (应答报文, 来源, 结束时刻, 是否命中递归缓存)；
+  resolve_recursive(query, levels, now, limit=512, stale_window=0)
+  按 1–16 层转介计划递归解析域外查询，返回 (应答报文, 来源, 结束
+  时刻, 是否命中递归缓存)；stale_window 为非 bool 整数、0..86400
+  （默认 0；bool/非 int 抛 TypeError，越界抛 ValueError），域内权威
+  查询不校验且行为不变，域外查询在校验 query/now/limit 之后、查递归
+  缓存之前完整校验 levels 与 stale_window；命中已过期正答案、
+  NXDOMAIN 或 NODATA 时仍照常完成递归与上游尝试，仅当本应抛
+  UpstreamTimeout/UpstreamError 且耗尽时刻距到期不超过窗口时返回
+  (陈旧应答, "stale", 耗尽时刻, True)：陈旧正答案 ANSWER TTL 全为 0，
+  陈旧负答案保留 RCODE、问题段与 SOA 数据、仅授权段 SOA 的 RR TTL
+  置 0，编码沿用名字压缩、记录顺序、长度上限与 RRset 原子截断；
+  陈旧返回不刷新/删除/重写过期条目、不改 FIFO（cache_stats 剩余
+  TTL 仍为 0，dump_rec 与状态导出仍跳过），按未中、到期、原耗尽
+  类别与耗时计数并提交 recursive_upstream_stats、推进最后成功时刻，
+  不增加新鲜命中；陈旧应答编码失败抛 EncodeError 且缓存、FIFO、
+  最后时刻与全部统计不变；默认与显式 0 与历史行为逐字节一致；
   stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
   upstream_stats(reset=False) 返回构造 plan 直转的逐上游统计，为顶层
   键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
@@ -176,9 +190,10 @@
   数、delay>timeout 数、reply=None 数、末层 kind=0 数、模拟耗时累计；
   超时仅给 ms 加 timeout，其余事件加 delay；每上游仅取前 2 事件，转介
   或终态后的事件不计），t 为同顺序七整数数组且逐项等于 l 之和；仅域外
-  递归缓存未命中且 levels 全量校验通过后暂存，成功返回或耗尽抛
-  UpstreamTimeout/UpstreamError 时原子提交已访问事件，查询、levels、
-  编码、缓存写入或其他异常以及权威、缓存命中均不提交；reset 非 bool
+  递归缓存未命中且 levels 全量校验通过后暂存，成功返回、陈旧返回或
+  耗尽抛 UpstreamTimeout/UpstreamError 时原子提交已访问事件，查询、
+  levels、stale_window、编码（含陈旧应答编码失败）、缓存写入或其他
+  异常以及权威、缓存命中均不提交；reset 非 bool
   抛 TypeError 且无变化，False 只读，True 先返回旧快照再清零本统计，
   缓存、时钟、区域、plan 及其他统计不变；
   dump_forward() 导出当前上游转发配置，返回键序 version,config 的
@@ -879,6 +894,9 @@ _MAX_REPLY_LEN = 65535
 _FLAG_QR = 0x8000
 _MAX_RECURSION_LEVELS = 16
 _RECURSIVE_RCODES = {0: 0, 1: 0, 2: _RCODE_NXDOMAIN, 3: 0}
+# resolve_recursive 的 stale_window：非 bool 整数，范围 0..86400；
+# 0 表示关闭陈旧应答（默认，行为与历史完全一致）。
+_MAX_STALE_WINDOW = 86400
 # 递归缓存命中类别 -> stats 的 h 下标（正/NXDOMAIN/NODATA）
 _RECURSIVE_HIT_KINDS = {"pos": 1, "nxdomain": 2, "nodata": 3}
 # dump_rec/load_rec 递归缓存配置：顶层键序仅 v,clock,items（v 恒为 1，
@@ -4854,6 +4872,16 @@ def _check_resolve_inputs(query, now, limit, last_end):
     return msg
 
 
+def _check_stale_window(stale_window):
+    """resolve_recursive 的 stale_window：非 bool 整数，范围 0..86400。
+
+    bool 或非 int 抛 TypeError，越界抛 ValueError；0 为默认且关闭陈旧应答。
+    """
+    _check_int(stale_window, "stale_window")
+    if not 0 <= stale_window <= _MAX_STALE_WINDOW:
+        raise ValueError("stale_window out of range")
+
+
 def _name_in_origin(question, origin, zone_class):
     """qclass 等于 zone 类且规范化 qname 在 origin 内（含 origin 自身）。"""
     qlabels = _normalize_name(question["name"])
@@ -5780,16 +5808,32 @@ class Resolver:
     调用逐字节相同；True 先返回旧快照再清零十项计数，其余状态与
     stats() 不变。
 
-    resolve_recursive(query, levels, now, limit=512)：域内查询沿用
-    resolve；域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、FIFO
-    同 PositiveCache），命中返回 (应答报文, "cache", now, True)，未命中
-    再按 1–16 层转介计划逐层模拟 forward（顺序、前 2 事件、时钟、
+    resolve_recursive(query, levels, now, limit=512, stale_window=0)：
+    域内查询沿用 resolve（stale_window 不参与校验、行为不变）；域外线
+    路在 query/now/limit 之后、查递归缓存之前完整校验 levels 与
+    stale_window（非 bool 整数 0..86400，类型错抛 TypeError、越界抛
+    ValueError）。域外查询先查独立的递归缓存（键、正/负 TTL、容量 256、
+    FIFO 同 PositiveCache），新鲜命中返回 (应答报文, "cache", now,
+    True)；命中已过期正答案、NXDOMAIN 或 NODATA 不立即返回或删除，未
+    命中再按 1–16 层转介计划逐层模拟 forward（顺序、前 2 事件、时钟、
     timeout、耗尽异常均同 forward，末层转介抛 UpstreamError）。终态
     按原序与本次 query、limit 编码后写入递归缓存，返回
-    (应答报文, 终态上游名, 结束时刻, False)。
+    (应答报文, 终态上游名, 结束时刻, False)。仅当最终结果本应为
+    UpstreamTimeout 或 UpstreamError、stale_window>0 且耗尽时刻减去
+    该条目到期时刻不超过窗口时，返回 (陈旧应答, "stale", 耗尽时刻,
+    True)：陈旧正答案 ANSWER TTL 全为 0，陈旧负答案保留原 RCODE、问题
+    段与 SOA 数据、仅授权段 SOA 的 RR TTL 置 0；编码沿用现有名字压缩、
+    记录顺序、长度上限与 RRset 原子截断规则。陈旧返回不刷新插入时刻与
+    TTL、不改 FIFO、不删除或重写过期项（cache_stats 仍显示其剩余 TTL
+    为 0，dump_rec 与状态导出仍跳过它）；本次 recursive_upstream_stats
+    提交，stats 按原耗尽类别增加未命中、到期、上游失败与耗时分桶，不
+    增加新鲜命中，并把最后成功时刻推进到耗尽时刻。陈旧应答因 limit
+    无法编码时抛 EncodeError，缓存、FIFO、最后时刻与全部统计均不改变。
+    默认调用与显式 stale_window=0 的报文、异常、统计及状态变化与历史
+    行为逐字节一致。
 
-    任何失败都原样传播且不改变缓存与上次成功结束时刻；成功后时钟单调性
-    以该结束时刻为准。
+    除陈旧返回外，任何失败都原样传播且不改变缓存与上次成功结束时刻；
+    成功后时钟单调性以该结束时刻为准。
 
     stats()：只读统计，返回键序 h,m,x,u,c,l,r 的紧凑 ASCII JSON（末尾
     换行）；仅成功返回或上游耗尽时原子更新（c[0] 随提交与权威缓存
@@ -5817,9 +5861,10 @@ class Resolver:
     kind=0 数、ms 模拟耗时累计；超时仅给 ms 加 timeout，其余事件加
     delay；每个上游仅取前 2 个事件，转介或终态后的事件不计。t 为同
     顺序七整数数组，逐项等于 l 各行之和。仅域外递归缓存未命中且
-    levels 全量校验通过后暂存本次已访问事件，成功返回或耗尽抛
-    UpstreamTimeout/UpstreamError 时原子提交；查询、levels、编码、
-    缓存写入或其他异常以及权威、缓存命中均不提交。reset 非 bool 抛
+    levels 全量校验通过后暂存本次已访问事件，成功返回、陈旧返回或
+    耗尽抛 UpstreamTimeout/UpstreamError 时原子提交；查询、levels、
+    stale_window、编码（含陈旧应答编码失败）、缓存写入或其他异常以及
+    权威、缓存命中均不提交。reset 非 bool 抛
     TypeError 且无变化；False 只读、重复调用逐字节相同；True 先返回
     旧快照再清零本统计，缓存、时钟、区域、plan 及其他统计不变。
 
@@ -6536,22 +6581,27 @@ class Resolver:
         return now - neg[0] >= neg[3]
 
     def _recursive_cache_lookup(self, query, question, now, limit):
-        """域外递归结果查找，返回 (应答报文或 None, 到期标记或 None, 命中类别或 None)。
+        """域外递归结果查找，返回 (应答报文或 None, 到期描述或 None, 命中类别或 None)。
 
-        键、正/负 TTL、查找顺序同 PositiveCache；到期条目标记为
-        ("pos"/"neg", 键) 但不立即删除，由调用方在新终态编码成功后清理，
-        保证失败不改状态。命中类别为 "pos"、"nxdomain"、"nodata"，供统计细分。
+        键、正/负 TTL、查找顺序同 PositiveCache；到期条目不立即删除，由
+        调用方在新终态编码成功后清理，保证失败不改状态。命中类别为
+        "pos"、"nxdomain"、"nodata"，供统计细分。到期描述为
+        ("pos", 键, 到期时刻, 原始 an) 或 ("neg", 负键, 到期时刻,
+        (rcode, 规范化 SOA, 类别))：到期时刻正条目为插入时刻+ANSWER
+        最小 TTL、负条目为插入时刻+负 TTL，供 stale_window 判定；条目
+        内容仅供只读重编码，调用方不得改写。
         """
         key = (question["name"], question["type"], question["class"])
         entry = self._rec_pos.get(key)
         if entry is not None:
             inserted, an = entry
             elapsed = now - inserted
-            if elapsed < min(rr[3] for rr in an):
+            min_ttl = min(rr[3] for rr in an)
+            if elapsed < min_ttl:
                 aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
                         for labels, rrtype, rrclass, ttl, rdata in an]
                 return _encode_plan(query, 0, aged, [], limit), None, "pos"
-            return None, ("pos", key), None
+            return None, ("pos", key, inserted + min_ttl, an), None
         neg_key = ("nodata",) + key
         neg = self._rec_neg.get(neg_key)
         kind = "nodata"
@@ -6564,7 +6614,8 @@ class Resolver:
         inserted, rcode, soa, neg_ttl = neg
         elapsed = now - inserted
         if elapsed >= neg_ttl:
-            return None, ("neg", neg_key), None
+            return None, ("neg", neg_key, inserted + neg_ttl,
+                          (rcode, soa, kind)), None
         aged_soa = (soa[0], soa[1], soa[2], neg_ttl - elapsed, soa[4])
         return _encode_plan(query, rcode, [], [aged_soa], limit), None, kind
 
@@ -6575,9 +6626,10 @@ class Resolver:
         到期删除与 FIFO 淘汰各累计入递归清理事件计数。
         """
         if expired is not None:
-            tag, ekey = expired
+            tag = expired[0]
+            ekey = expired[1]
             del (self._rec_pos if tag == "pos" else self._rec_neg)[ekey]
-            self._rec_order.remove(expired)
+            self._rec_order.remove((tag, ekey))
             self._clean_expired[1] += 1  # 成功解析实际删除的到期条目
         key = (question["name"], question["type"], question["class"])
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
@@ -6595,25 +6647,68 @@ class Resolver:
             del (self._rec_pos if tag == "pos" else self._rec_neg)[oldest]
             self._clean_evicted[1] += 1  # 容量 FIFO 淘汰
 
+    def _encode_stale_recursive(self, query, expired, limit):
+        """把过期递归条目按本次 query、limit 重编码为陈旧应答（只读条目）。
+
+        正陈旧：保留原 ANSWER 记录顺序，所有 RR TTL 置 0，授权段为空；
+        负陈旧：保留原 RCODE、问题段与唯一 SOA（owner/type/class/rdata
+        不变），仅把授权段 SOA 的 RR TTL 置 0。编码继续遵守现有名字压缩、
+        记录顺序、长度上限与 RRset 原子截断规则；编码失败原样抛
+        EncodeError，调用方不得据此提交任何状态。
+        """
+        tag = expired[0]
+        if tag == "pos":
+            an = expired[3]
+            stale_an = [(labels, rrtype, rrclass, 0, rdata)
+                        for labels, rrtype, rrclass, _ttl, rdata in an]
+            return _encode_plan(query, 0, stale_an, [], limit)
+        rcode, soa, _kind = expired[3]
+        stale_soa = (soa[0], soa[1], soa[2], 0, soa[4])
+        return _encode_plan(query, rcode, [], [stale_soa], limit)
+
     def resolve_recursive(self, query: bytes, levels, now: int,
-                          limit: int = 512) -> tuple[bytes, str, int, bool]:
+                          limit: int = 512, stale_window: int = 0
+                          ) -> tuple[bytes, str, int, bool]:
         """按 1–16 层转介计划递归解析域外查询。
 
         query/now/limit 的异常沿用 resolve；levels 为逐层 forward 式
         plan（1–16 层，每层 1–16 个上游，仅前 2 事件），reply 为 None
         或 (kind, an, ns)：0 转介、1 答案、2 NXDOMAIN、3 NODATA。
+        stale_window 为非 bool 整数、范围 0..86400（bool/非 int 抛
+        TypeError，越界抛 ValueError），默认 0；默认与显式 0 的报文、
+        异常、统计与状态变化与历史行为逐字节一致。域内权威查询不受
+        stale_window 影响（校验与应答完全沿用 resolve）；域外查询在
+        query、now、limit 之后、查递归缓存之前完整校验 levels 与
+        stale_window，任一非法均不查缓存、不改变任何状态。
         时钟、timeout 与耗尽异常（全超时 UpstreamTimeout，其余
         UpstreamError）沿用 forward；末层仍为转介（kind 0）抛 UpstreamError。
         终态（kind 1/2/3）按原序与本次 query、limit 编码并按
         PositiveCache 键与正/负 TTL 规则缓存（256 项 FIFO，source 取
-        上游名、hit=False）；递归缓存命中返回 (应答, "cache", now, True)。
-        任何失败都不改变缓存与上次成功结束时刻。
+        上游名、hit=False）；递归缓存新鲜命中返回 (应答, "cache", now,
+        True)。命中已过期正答案、NXDOMAIN 或 NODATA 时不立即返回或
+        删除，而是照常完成必要的递归层与上游尝试；仅当最终结果本应为
+        UpstreamTimeout 或 UpstreamError、stale_window>0 且耗尽时刻
+        减去该条目到期时刻不超过窗口时，返回 (陈旧应答, "stale", 耗尽
+        时刻, True)，否则抛原耗尽异常。陈旧正答案 ANSWER 记录顺序不变、
+        RR TTL 全为 0、授权段为空；陈旧负答案保留原 RCODE、问题段与
+        SOA（owner/type/class/rdata 不变），仅把授权段 SOA 的 RR TTL
+        置 0；编码继续遵守现有名字压缩、记录顺序、长度上限与 RRset
+        原子截断规则。陈旧返回不刷新插入时刻与 TTL、不改 FIFO 次序、
+        不删除或重写过期条目（cache_stats 的剩余 TTL 仍为 0，
+        dump_rec 与状态导出仍跳过它，清理计数不变）；m 计未中、x 计
+        到期、u 按原耗尽类别、l 按耗尽耗时、recursive_upstream_stats
+        提交本次全部已访问事件、c[0] 同步、最后成功时刻推进到耗尽时刻，
+        不增加 h 新鲜命中计数。陈旧应答在任何统计、时钟与缓存提交前
+        先编码：若因 limit 无法编码则抛 EncodeError，缓存、FIFO、最后
+        时刻与全部统计均不改变（含 recursive_upstream_stats）。
+        任何其他失败都不改变缓存与上次成功结束时刻。
         """
         msg = _check_resolve_inputs(query, now, limit, self._last_end)
         question = msg["questions"][0]
         origin = self._cache._origin
         if _name_in_origin(question, origin, self._cache._zone_class):
             # 域内沿用 resolve：经权威正/负缓存应答，source 为 "authority"。
+            # 权威路径不校验 levels/stale_window，行为与历史完全一致。
             expired = self._authority_miss_expired(question, now)
             response, hit = self._cache.resolve(query, now, limit)
             self._fold_authority_cleanup()
@@ -6626,9 +6721,10 @@ class Resolver:
             self._sync_stats_c0()
             self._last_end = now
             return response, "authority", now, hit
-        # levels 整体校验（含全部 reply）在任何缓存查找之前完成：
+        # levels 整体校验（含全部 reply）先于 stale_window 与任何缓存查找：
         # 入参非法不得呈现为命中，也不得改变任何状态。
         plans = _validate_levels(levels)
+        _check_stale_window(stale_window)
         cached, expired, kind = self._recursive_cache_lookup(
             query, question, now, limit)
         if cached is not None:
@@ -6639,10 +6735,11 @@ class Resolver:
         # 未命中：m 与（到期时）x 暂记，待成功或耗尽时与 u、l 一并原子提交。
         m_inc = 1
         x_inc = 1 if expired is not None else 0
-        # levels 已全量校验且递归缓存确认未命中：本次各层已访问事件先暂存于
-        # 本地 staged（固定 16 行，行索引即递归深度 0..15），仅成功返回或
-        # 耗尽抛 UpstreamTimeout/UpstreamError 时才原子并入 _recursive_up；
-        # 查询、levels、编码、缓存写入或其他异常，以及权威路径与缓存命中，
+        # levels/stale_window 已全量校验且递归缓存确认未命中：本次各层已
+        # 访问事件先暂存于本地 staged（固定 16 行，行索引即递归深度
+        # 0..15），仅成功返回、陈旧返回或耗尽抛 UpstreamTimeout/
+        # UpstreamError 时才原子并入 _recursive_up；查询、levels、
+        # stale_window、编码、缓存写入或其他异常，以及权威路径与缓存命中，
         # 均不提交（staged 随栈丢弃）。
         staged = [[0, 0, 0, 0, 0, 0, 0]
                   for _ in range(_MAX_RECURSION_LEVELS)]
@@ -6653,21 +6750,38 @@ class Resolver:
             result, clock, saw_timeout, saw_other = self._attempt_recursive_level(
                 plan, clock, depth == len(plans) - 1, staged[depth])
             if result is None:
-                # 该层所有上游均未给出可用应答：耗尽异常沿用 forward；
-                # 统计随耗尽提交，缓存与最后时刻不变。
+                # 该层所有上游均未给出可用应答：耗尽时刻为 clock。
+                end = clock
+                stale_response = None
+                if (stale_window > 0 and expired is not None
+                        and end - expired[2] <= stale_window):
+                    # 命中过期条目且耗尽时刻距到期不超过窗口：在任何统计、
+                    # 时钟与缓存提交前先按本次 query、limit 编码陈旧应答；
+                    # 编码失败抛 EncodeError，全部状态保持不变。
+                    stale_response = self._encode_stale_recursive(
+                        query, expired, limit)
+                # 编码成功（或不返回陈旧应答）后按原耗尽类别原子提交：
+                # 未中、到期、逐深度事件、耗时分桶与 c[0] 同步，陈旧返回
+                # 同样提交 recursive_upstream_stats 但不增加 h。
                 self._stats_m += m_inc
                 self._stats_x += x_inc
                 self._commit_recursive_up(staged)
                 self._sync_stats_c0()
+                self._stats_l[_duration_bucket(
+                    end - now, self._timeout)] += 1
                 if saw_timeout and not saw_other:
                     self._stats_u[1] += 1
-                    self._stats_l[_duration_bucket(
-                        clock - now, self._timeout)] += 1
-                    raise UpstreamTimeout("all upstream attempts timed out")
-                self._stats_u[2] += 1
-                self._stats_l[_duration_bucket(
-                    clock - now, self._timeout)] += 1
-                raise UpstreamError("no usable upstream reply")
+                    if stale_response is None:
+                        raise UpstreamTimeout(
+                            "all upstream attempts timed out")
+                else:
+                    self._stats_u[2] += 1
+                    if stale_response is None:
+                        raise UpstreamError("no usable upstream reply")
+                # 陈旧应答：过期条目保持原样（不删除、不重写、FIFO 与
+                # 清理计数不变），最后成功时刻推进到耗尽时刻，hit 为 True。
+                self._last_end = end
+                return stale_response, "stale", end, True
             if result[0] == "referral":
                 continue  # 转介：clock 已推进，进入下一层
             _tag, rcode, an, ns, name, end = result
@@ -7407,8 +7521,9 @@ class Resolver:
         终态后的事件不计。t 为同顺序七整数数组，逐项等于 l 各行之和。
 
         仅域外递归缓存未命中且 levels 全量校验通过后暂存本次访问事件，
-        成功返回或耗尽抛 UpstreamTimeout/UpstreamError 时原子提交；查询、
-        levels、编码、缓存写入或其他异常以及权威、缓存命中均不提交。
+        成功返回、陈旧返回或耗尽抛 UpstreamTimeout/UpstreamError 时
+        原子提交；查询、levels、stale_window、编码（含陈旧应答编码
+        失败）、缓存写入或其他异常以及权威、缓存命中均不提交。
         reset 非 bool 抛 TypeError 且无变化；False 只读、重复调用逐字节
         相同；True 先返回旧快照再清零本统计，缓存、时钟、区域、plan 及
         其他统计不变。同初态同调用序列逐字节一致。
