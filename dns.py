@@ -59,6 +59,18 @@
   EDNS 应答置于唯一 OPT 之前（OPT 仍为末项）；附加 RRset 在 RRset 原子
   截断中先于授权段、回答段淘汰并置 TC，OPT 不淘汰；域外/根/无精确地址
   目标及不完整嵌入名不出附加项，RCODE、AA、ANSWER、AUTHORITY 不变。
+  区域中 owner 非通配且不等于 origin 的 NS RRset 定义委派切点，同一查询
+  路径存在多级切点时取标签最长者；查询名恰在切点或位于其下方时（切点处
+  的 DS 查询除外）返回 NOERROR 非权威转介：QR 置一、AA 清零、ANSWER 为空，
+  AUTHORITY 按区域原序含该切点完整 NS RRset，附加段仅收集这些 NS 目标在
+  父区数据中的精确 A/AAAA（目标须位于当前 origin 内，每个规范目标只处理
+  一次，不用通配合成、不追随 CNAME，保留区域原序与重复记录；目标名无法
+  完整解码的 NS 仍形成切点与授权 RRset，只是不生成其胶水）。切点处 DS
+  存在时返回权威 DS 答案，不存在时返回权威 NODATA 与起点 SOA。通配记录
+  不跨越切点；CNAME 链进入切点或其下方时保留已展开 CNAME 并以最近切点的
+  NS 结束为非权威转介，不再查找目标类型。转介（含带 CNAME 的转介）不写入
+  正/负缓存，成功调用只按未写条目计数并提交显式时钟；起点 NS、无切点区域、
+  域外查询与 class 不匹配保持既有行为。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
@@ -1726,10 +1738,12 @@ class _RRsetPlan:
     一次，单次处理时间与额外内存受区段记录数及编码总量的线性上界约束。
     """
 
-    def __init__(self, msg, sections, rcode_low, caps):
+    def __init__(self, msg, sections, rcode_low, caps, authoritative=True):
         self.msg = msg
         self.rcode_low = rcode_low
-        self.flags = (_FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+        # 权威应答置 QR|AA；非权威转介仅置 QR（AA 清零），其余保留位相同。
+        base_flags = _FLAGS_RESPONSE if authoritative else _FLAG_QR
+        self.flags = (base_flags | (msg["flags"] & _FLAGS_KEPT)
                       | rcode_low)
         self.sections = [list(section) for section in sections]
         self.caps = caps
@@ -1943,8 +1957,12 @@ class _RRsetPlan:
         return bytes(out)
 
 
-def _encode_response(query, model, rcode):
-    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。"""
+def _encode_response(query, model, rcode, authoritative=True):
+    """把查询报文与应答模型编码为确定性权威应答报文（rcode 由内部指定）。
+
+    authoritative 为假时输出非权威转介（QR 置一、AA 清零），仅供内部
+    权威计划的委派路径使用；公开 encode_response 入口恒为权威应答。
+    """
     if not isinstance(query, bytes):
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
@@ -1961,7 +1979,8 @@ def _encode_response(query, model, rcode):
     # 不含 TTL/rdata），其余记录保持相对顺序；删过普通 RR 集即置 TC。
     # 三段清空后仍超限时仅头部与问题段，抛 EncodeError。
     caps = (_MAX_SECTION_RECORDS,) * 3
-    plan = _RRsetPlan(msg, (an, ns, ar), rcode, caps)
+    plan = _RRsetPlan(msg, (an, ns, ar), rcode, caps,
+                      authoritative=authoritative)
     plan.fit(limit)
     return plan.finalize()
 
@@ -2002,8 +2021,8 @@ def _encode_badvers(msg, opt, limit):
     return bytes(out)
 
 
-def edns(query: bytes, model: dict, rcode: int = 0,
-         options: list | None = None) -> bytes:
+def _edns_core(query: bytes, model: dict, rcode: int = 0,
+               options: list | None = None, authoritative: bool = True):
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
     query/model 的解码与编码契约同 decode_query/encode_response；查询
@@ -2076,10 +2095,17 @@ def edns(query: bytes, model: dict, rcode: int = 0,
     cap_ar = _MAX_SECTION_RECORDS - (1 if opt_wire else 0)
     caps = (_MAX_SECTION_RECORDS, _MAX_SECTION_RECORDS, cap_ar)
     body_limit = limit - len(opt_wire)
-    plan = _RRsetPlan(msg, (an, ns, ar), rcode & 0xF, caps)
+    plan = _RRsetPlan(msg, (an, ns, ar), rcode & 0xF, caps,
+                      authoritative=authoritative)
     plan.fit(body_limit)
     # OPT 固定为附加段末项，不参与 RRset 重组，定稿时追加。
     return plan.finalize(opt_wire, 1 if opt_wire else 0)
+
+
+def edns(query: bytes, model: dict, rcode: int = 0,
+         options: list | None = None) -> bytes:
+    """编码可含 OPT 的 EDNS 权威应答（公开入口恒为权威应答）。"""
+    return _edns_core(query, model, rcode, options, authoritative=True)
 
 
 def _server_cookie(secret, family, packed, client_cookie):
@@ -2382,27 +2408,87 @@ def _hop(records, nodes, origin, current, qtype):
     return "nxdomain", None
 
 
-def _resolve_chain(records, nodes, origin, qlabels, qtype):
-    """在 origin 内解析（qtype≠5 时跟随 CNAME 链），返回 (rcode, an, ns)。"""
+def _zone_cut_points(records, origin):
+    """收集区域切点：owner 非通配且不等于 origin 的 NS RRset。
+
+    返回 {切点 owner 元组: 该切点按区域原序的完整 NS RR 列表}。NS rdata
+    能否完整解码不影响切点成立（宽松兼容形态仍形成切点与授权 RRset，
+    只是胶水收集阶段跳过该目标）。
+    """
+    cuts = {}
+    origin_key = tuple(origin)
+    for rr in records:
+        labels = rr[0]
+        if (rr[1] == _TYPE_NS and labels
+                and labels[0] != _WILDCARD_LABEL
+                and tuple(labels) != origin_key):
+            cuts.setdefault(tuple(labels), []).append(rr)
+    return cuts
+
+
+def _nearest_cut(cuts, name, origin):
+    """name 恰在切点或位于其下方时，返回标签最长（最深）的切点 owner 元组。
+
+    多级切点同处一条查询路径时取标签最长者；沿 name 的后缀（仍在 origin
+    内）依次查切点索引，首个命中即最深切点。name 不在任何切点下方时
+    返回 None。查询时间以查询标签数为线性上界。
+    """
+    depth = len(name) - len(origin)
+    for i in range(depth + 1):
+        suffix = tuple(name[i:])
+        if suffix in cuts:
+            return suffix
+    return None
+
+
+def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
+    """在 origin 内解析（qtype≠5 时跟随 CNAME 链），返回
+    (rcode, an, ns, authoritative)。
+
+    authoritative 为假表示非权威委派转介：QR 置一、AA 清零、an 为空
+    （或仅含已展开的 CNAME）、ns 为最近切点完整 NS RRset。切点处 DS
+    查询例外：DS 存在时给权威答案，不存在时给权威 NODATA（ns 为起点
+    SOA）。通配记录不得跨越切点——名称处于切点或其下方时直接转介，
+    不进入通配合成。CNAME 链进入切点或其下方时保留已展开 CNAME 并以
+    最近切点 NS 结束，不再查找目标类型。
+    """
     soa = [rr for rr in records if rr[0] == origin and rr[1] == _TYPE_SOA]
     if qtype == _TYPE_CNAME:
+        cut = _nearest_cut(cuts, qlabels, origin)
+        if cut is not None:
+            # 切点或其下方的 CNAME 查询同样转介（仅切点 DS 查询例外）。
+            return 0, [], cuts[cut], False
         kind, rrs = _hop(records, nodes, origin, qlabels, qtype)
         if kind == "answer":
-            return 0, rrs, []
+            return 0, rrs, [], True
         if kind == "nodata":
-            return 0, [], soa
-        return _RCODE_NXDOMAIN, [], soa
+            return 0, [], soa, True
+        return _RCODE_NXDOMAIN, [], soa, True
     an = []
     seen = {tuple(qlabels)}
     current = list(qlabels)
     while True:
+        cut = _nearest_cut(cuts, current, origin)
+        if cut is not None:
+            if (not an and tuple(current) == cut and qtype == _TYPE_DS):
+                # 切点处 DS：权威答案；不存在时权威 NODATA（切点节点必有
+                # NS，故不会是 NXDOMAIN）。
+                kind, rrs = _hop(records, nodes, origin, current,
+                                 _TYPE_DS)
+                if kind == "answer":
+                    return 0, rrs, [], True
+                return 0, [], soa, True
+            # 查询名（或 CNAME 链目标）进入切点或其下方：非权威转介。
+            # 已展开的 CNAME 全部保留在 an，授权段为最近切点完整 NS，
+            # 不再追随 CNAME 或查找目标类型。
+            return 0, an, cuts[cut], False
         kind, rrs = _hop(records, nodes, origin, current, qtype)
         if kind == "answer":
-            return 0, an + rrs, []
+            return 0, an + rrs, [], True
         if kind == "nodata":
-            return 0, an, soa
+            return 0, an, soa, True
         if kind == "nxdomain":
-            return _RCODE_NXDOMAIN, an, soa
+            return _RCODE_NXDOMAIN, an, soa, True
         # 命中 CNAME：先入链，再查目标；第 17 条或名称重复即失败。
         if len(an) >= _MAX_CNAME_CHAIN:
             raise CNAMEError("cname chain too long")
@@ -2413,7 +2499,7 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype):
         seen.add(tuple(target))
         if (len(target) < len(origin)
                 or target[len(target) - len(origin):] != origin):
-            return 0, an, []  # 目标在 origin 外：返回积累链，ns 为空
+            return 0, an, [], True  # 目标在 origin 外：返回积累链，ns 为空
         current = target
 
 
@@ -2497,17 +2583,21 @@ def _glue_addresses(an, ns, origin, records):
 
 
 def _answer_plan(msg, origin, records, zone_class):
-    """answer 的完整（未截断）应答计划，返回 (rcode, an, ns, ar)。
+    """answer 的完整（未截断）应答计划，返回 (rcode, an, ns, ar, authoritative)。
 
     msg 为已解码且通过可应答性检查的单问题查询；zone 已校验，
     RR 均为规范化元组。ar 为按 NS/MX/SRV 嵌入目标从区域确定性收集的
     精确 owner A/AAAA 地址附加记录（不通配合成、不追随 CNAME）。
+    authoritative 为假时计划是非权威委派转介：an 为空或仅含已展开的
+    CNAME，ns 为最近切点完整 NS RRset，其 NS 目标的区内精确 A/AAAA
+    作为胶水进入 ar（同一收集、去重与保序规则）。
     """
     question = msg["questions"][0]
     qlabels = _normalize_name(question["name"])
     qtype = question["type"]
     an = []
     ns = []
+    authoritative = True
     if question["class"] != zone_class:
         rcode = _RCODE_REFUSED  # 问题 class 与 zone 不同：三段为空
     elif (len(qlabels) < len(origin)
@@ -2521,20 +2611,29 @@ def _answer_plan(msg, origin, records, zone_class):
         for labels, _rrtype, _cls, _ttl, _rdata in records:
             for i in range(len(labels) - len(origin)):
                 nodes.add(tuple(labels[i:]))
-        rcode, an, ns = _resolve_chain(records, nodes, origin, qlabels, qtype)
+        # 委派切点：owner 非通配且非 origin 的 NS RRset；同一查询路径
+        # 存在多级切点时由 _resolve_chain 取标签最长者。
+        cuts = _zone_cut_points(records, origin)
+        rcode, an, ns, authoritative = _resolve_chain(
+            records, nodes, origin, qlabels, qtype, cuts)
     # 对最终计划的 ANSWER、AUTHORITY 统一观察 NS/MX/SRV 收集地址附加项；
     # REFUSED 的空段与域外/NXDOMAIN/NODATA 的 SOA-only 授权段均不含
     # NS/MX/SRV 目标，自然不产生附加项，RCODE、AA、ANSWER、AUTHORITY 不变。
+    # 委派转介时 an 仅可能含 CNAME（不产生目标），ns 为切点 NS RRset，
+    # 故此处只收集切点 NS 目标的区内精确 A/AAAA 胶水。
     ar = _glue_addresses(an, ns, origin, records)
-    return rcode, an, ns, ar
+    return rcode, an, ns, ar, authoritative
 
 
-def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None):
+def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None,
+                 authoritative=True):
     """把完整应答计划编码为权威应答报文。
 
     ecs 仅 EDNS 变体使用，普通解析路径恒为 None 并忽略。ar 为权威计划
     确定性生成的地址附加记录；None 按空附加段处理（递归终态等非权威
     生成路径沿用空 ar，显式 ar 仅经 encode_response 模型入口提供）。
+    authoritative 为假时编码非权威转介（QR 置一、AA 清零），仅供内部
+    委派路径使用。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -2542,16 +2641,19 @@ def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None):
         "ar": [_rr_to_model(rr) for rr in (ar if ar is not None else ())],
         "limit": limit,
     }
-    return _encode_response(query, model, rcode)
+    return _encode_response(query, model, rcode,
+                            authoritative=authoritative)
 
 
-def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None):
+def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
+                      authoritative=True):
     """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
 
     ar 为权威计划确定性生成的地址附加记录，置于应答 OPT 之前，OPT 仍
     为附加段唯一末项；None 按空附加段处理。ecs 非 None 时应答 OPT 仅
     回写该 ECS（码 8）选项：family、source 不变，scope=source，
-    address 同查询；查询携带的其他选项不回显。
+    address 同查询；查询携带的其他选项不回显。authoritative 为假时
+    编码非权威转介（QR 置一、AA 清零）。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -2565,7 +2667,8 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None):
         options = [{"code": _OPT_CODE_ECS,
                     "data": _encode_ecs_option(family, source, source,
                                                address)}]
-    return edns(query, model, rcode, options)
+    return _edns_core(query, model, rcode, options,
+                      authoritative=authoritative)
 
 
 def _encode_policy_refusal(query, limit):
@@ -2605,8 +2708,10 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
         raise EncodeError("query or limit not answerable")
     origin, records, zone_class = _validate_zone(zone)
-    rcode, an, ns, ar = _answer_plan(msg, origin, records, zone_class)
-    return _encode_plan(query, rcode, an, ns, limit, ar=ar)
+    rcode, an, ns, ar, authoritative = _answer_plan(
+        msg, origin, records, zone_class)
+    return _encode_plan(query, rcode, an, ns, limit, ar=ar,
+                        authoritative=authoritative)
 
 
 def _config_pairs(pairs):
@@ -4357,6 +4462,10 @@ class PositiveCache:
     负命中时 RCODE 不变，an/ar 为空，ns 仅该 SOA 且 ttl 随经过时间递减。
 
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
+    委派转介（AA 清零、授权段为切点完整 NS RRset，含携带已展开 CNAME 的
+    转介）既不写正缓存也不写负缓存：每次都重新计算计划，成功调用只按未写
+    条目（m.o）计数并提交时钟，不改 FIFO 与水位。切点处 DS 的权威答案与
+    权威 NODATA 仍分别按正、负缓存规则处理。
     任何失败（含编码失败）都不改变条目与时钟状态。
 
     resolve_edns(query, now, limit=65535) 处理恰含一个合法 OPT 的单问题
@@ -4584,17 +4693,22 @@ class PositiveCache:
                 expired = ("neg", neg_key)
         # 未命中（含到期）：先按 answer 语义生成未截断的完整有序应答
         # （含确定性地址附加段）。
-        rcode, an, ns, ar_glue = _answer_plan(
+        rcode, an, ns, ar_glue, authoritative = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
         # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
-        response = encode_plan(query, rcode, an, ns, limit, ecs, ar=ar_glue)
+        response = encode_plan(query, rcode, an, ns, limit, ecs, ar=ar_glue,
+                               authoritative=authoritative)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
             tag, ekey = expired
             del (self._entries if tag == "pos" else self._neg_entries)[ekey]
             self._order.remove(expired)  # 到期删除后按未命中刷新
-        if (rcode == 0 and not ns and an
+        if not authoritative:
+            # 委派转介（含携带已展开 CNAME 的转介）不写入正缓存或负缓存，
+            # 仅按未写条目计数；每次都重新计算计划。
+            m_index = 3  # 未写条目
+        elif (rcode == 0 and not ns and an
                 and all(rr[3] > 0 for rr in an)
                 and all(rr[3] > 0 for rr in ar_glue)):
             # 正条目把 ANSWER 与地址 ADDITIONAL 纳入同一计划：命中时两段
