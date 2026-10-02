@@ -28,6 +28,16 @@
 - ReplayError: 回放操作序列非法或回放记录与期望不符（ValueError 子类）。
 - PolicyError: 授权规则数量、键序或字段值非法（ValueError 子类）。
 - decode_query(data: bytes) -> dict: 解码 DNS 查询报文。
+- decode_message(data: bytes) -> dict: 离线解析完整 DNS 请求或响应报文
+  （12..65535 字节、问题数 0..64），按头部计数完整消费问题、回答、
+  授权、附加四段；返回键序固定为 id、flags、questions、answers、
+  authorities、additionals，资源记录键序 name、type、class、ttl、rdata，
+  rdata 为 RDLENGTH 覆盖的原始 bytes，各段保线序与重复记录、不合并
+  RRset、不改写 TTL。问题名、owner 与 NS、CNAME、PTR、MX、SOA 的嵌入
+  名允许压缩且指针只能向后指向已确认标签边界（至多 128 次跳转）；
+  SRV、NAPTR、NSEC、RRSIG 的嵌入名不得压缩；计数不足、截断、尾随、
+  非法名字抛 MessageError，data 非 bytes 抛 TypeError；未知类型 RDATA
+  不解释，无缓存、区域、统计或文件副作用。
 - encode_response(query: bytes, model: dict) -> bytes: 编码权威应答报文；
   超限或区段计数超 16 位时按 RRset 原子截断（规范化 owner、数值 type、
   class 同一集合整组删除，键不含 TTL/rdata；ar、ns、an 优先级，置 TC）。
@@ -504,6 +514,10 @@ _MAX_MESSAGE_LEN = 512
 _MAX_QUESTIONS = 64
 _MAX_NAME_WIRE_LEN = 255
 _MAX_POINTER_JUMPS = 16
+# decode_message 的压缩指针跳转上限：完整报文（问题、owner 与可压缩嵌入
+# 名）允许至多 128 次跳转，第 129 次抛 MessageError；decode_query 与
+# EDNS 查询路径仍沿用 16。
+_MAX_MESSAGE_POINTER_JUMPS = 128
 # 名称安全字符：小写字母、数字、下划线、连字符；大写 ASCII 仅出现在
 # 输入文本中，规范时折为小写。标签内部表示统一为 bytes（任意八位组），
 # 仅最左标签可为解码后恰为单字节 0x2A（"*"）的通配标签。
@@ -806,6 +820,7 @@ _TYPE_A = 1
 _TYPE_NS = 2
 _TYPE_CNAME = 5
 _TYPE_SOA = 6
+_TYPE_PTR = 12
 _TYPE_MX = 15
 _TYPE_TXT = 16
 _TYPE_AAAA = 28
@@ -927,11 +942,12 @@ _RECURSIVE_UP_ROWS = _MAX_RECURSION_LEVELS
 _RECURSIVE_UP_COLS = 7
 
 
-def _read_name(data, offset, boundaries):
+def _read_name(data, offset, boundaries, max_jumps=_MAX_POINTER_JUMPS):
     """解码 offset 处的域名，返回 (name, 主流程下一个偏移)。
 
     boundaries 为已知标签边界偏移集合，随解析就地补充；
-    压缩指针目标必须是其中向后的边界。
+    压缩指针目标必须是其中向后的边界。max_jumps 为压缩指针跳转上限
+    （查询路径 16，decode_message 完整报文 128）。
     """
     labels = []
     pos = offset
@@ -959,7 +975,7 @@ def _read_name(data, offset, boundaries):
             if target not in boundaries:
                 raise MessageError("pointer target not a label boundary")
             jumps += 1
-            if jumps > _MAX_POINTER_JUMPS:
+            if jumps > max_jumps:
                 raise MessageError("too many pointer jumps")
             if end is None:
                 end = pos + 2
@@ -1020,6 +1036,184 @@ def decode_query(data: bytes) -> dict:
     if pos != len(data):
         raise MessageError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}
+
+
+# NAPTR RDATA 中 replacement 前的长度前缀字符串数量（order/preference
+# 两个 uint16 之后）。
+_NAPTR_STRING_COUNT = 3
+
+
+class _BoundaryMarks:
+    """以每偏移一字节的 bytearray 记录已确认标签边界。
+
+    接口与 set 的 add/in 对齐，供 _read_name 使用；decode_message 处理
+    最大报文时该结构恰占 len(data) 字节，额外内存不超过输入长度。
+    """
+
+    def __init__(self, size):
+        self._marks = bytearray(size)
+
+    def add(self, offset):
+        self._marks[offset] = 1
+
+    def __contains__(self, offset):
+        return bool(self._marks[offset])
+
+
+def _message_uncompressed_name(data, pos, end, boundaries):
+    """校验 decode_message 中按协议不得压缩的嵌入名。
+
+    解析 data[pos:end] 内一个未压缩、0 结尾的绝对名，返回名后偏移。
+    标签边界随主流程登记；出现任何压缩指针形态（长度字节高两位置位）
+    即抛 MessageError。与主名相同的标签长度、截断、展开长度限制在此
+    统一执行。
+    """
+    wire_len = 1  # 根终止符占 1 字节
+    while True:
+        if pos >= end:
+            raise MessageError("embedded name truncated")
+        boundaries.add(pos)
+        length = data[pos]
+        kind = length & 0xC0
+        if kind != 0x00:
+            raise MessageError("embedded name must not be compressed")
+        pos += 1
+        if length == 0:
+            return pos
+        if pos + length > end:
+            raise MessageError("embedded name label truncated")
+        pos += length
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE_LEN:
+            raise MessageError("embedded name too long")
+
+
+def _message_check_rdata(rrtype, rdata, data, rdata_start, boundaries):
+    """校验 decode_message 一条 RR 的 RDATA 内嵌入名。
+
+    rdata 为 RDLENGTH 覆盖的原始字节切片；rdata_start 为其在报文中的
+    绝对偏移，嵌入名解析时据此登记标签边界与压缩指针目标。
+    NS/CNAME/PTR/MX/SOA 的嵌入名允许压缩，与问题名、owner 同一套指针
+    规则（只能向后指向已确认边界），且每个嵌入名在本段内联部分的结束
+    偏移不得越过 RDLENGTH（经指针到达的标签位于本段之外，按整份报文与
+    边界集校验）；SRV/NAPTR/NSEC/RRSIG 的嵌入名按协议不得压缩，出现
+    指针即抛 MessageError。未知类型不解释。
+    """
+    end = rdata_start + len(rdata)
+    if rrtype in (_TYPE_NS, _TYPE_CNAME, _TYPE_PTR):
+        _, name_end = _read_name(data, rdata_start, boundaries,
+                                 max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+        if name_end > end:
+            raise MessageError("embedded name overruns rdata")
+    elif rrtype == _TYPE_MX:
+        if len(rdata) < 2:
+            raise MessageError("mx rdata truncated")
+        _, name_end = _read_name(data, rdata_start + 2, boundaries,
+                                 max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+        if name_end > end:
+            raise MessageError("embedded name overruns rdata")
+    elif rrtype == _TYPE_SOA:
+        _, pos1 = _read_name(data, rdata_start, boundaries,
+                             max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+        if pos1 > end:
+            raise MessageError("embedded name overruns rdata")
+        _, pos2 = _read_name(data, pos1, boundaries,
+                             max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+        if pos2 > end:
+            raise MessageError("embedded name overruns rdata")
+    elif rrtype == _TYPE_SRV:
+        if len(rdata) < 7:
+            raise MessageError("srv rdata truncated")
+        _message_uncompressed_name(data, rdata_start + 6, end, boundaries)
+    elif rrtype == _TYPE_NAPTR:
+        pos = rdata_start + 4
+        for _ in range(_NAPTR_STRING_COUNT):
+            if pos >= end:
+                raise MessageError("naptr rdata truncated")
+            count = data[pos]
+            pos += 1
+            if pos + count > end:
+                raise MessageError("naptr rdata truncated")
+            pos += count
+        _message_uncompressed_name(data, pos, end, boundaries)
+    elif rrtype == _TYPE_NSEC:
+        _message_uncompressed_name(data, rdata_start, end, boundaries)
+    elif rrtype == _TYPE_RRSIG:
+        if len(rdata) < 18:
+            raise MessageError("rrsig rdata truncated")
+        _message_uncompressed_name(data, rdata_start + 18, end, boundaries)
+
+
+def decode_message(data: bytes) -> dict:
+    """离线解析完整 DNS 报文（请求或响应），不联网、无副作用。
+
+    长度限 12..65535 字节；问题数限 0..64；按头部计数完整消费问题、
+    回答、授权、附加四段，计数不足、记录头或 RDATA 截断、末尾多余字节
+    一律抛 MessageError，data 非 bytes 抛 TypeError。返回对象固定按
+    id、flags、questions、answers、authorities、additionals 排列；问题项
+    键序 name、type、class，资源记录键序 name、type、class、ttl、rdata，
+    rdata 是 RDLENGTH 覆盖的原始 bytes。各段保持线序、重复记录与数值
+    字段，不合并 RRset，不做区域判断或 TTL 改写。
+
+    问题名、owner 名与 NS、CNAME、PTR、MX、SOA 的可压缩嵌入名共用同
+    一套压缩规则：指针只能向后指向已经确认的标签边界，越界、前向、
+    循环、保留标签类型（高两位为 01/10）、超过 128 次跳转、标签超过
+    63 字节或展开名超过 255 字节均抛 MessageError。SRV、NAPTR、NSEC、
+    RRSIG 中按协议不得压缩的嵌入名若出现指针同样抛 MessageError；未知
+    类型的 RDATA 保持不解释。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not _MIN_MESSAGE_LEN <= len(data) <= 0xFFFF:
+        raise MessageError("bad message length")
+    msg_id = int.from_bytes(data[0:2], "big")
+    flags = int.from_bytes(data[2:4], "big")
+    qdcount = int.from_bytes(data[4:6], "big")
+    ancount = int.from_bytes(data[6:8], "big")
+    nscount = int.from_bytes(data[8:10], "big")
+    arcount = int.from_bytes(data[10:12], "big")
+    if not 0 <= qdcount <= _MAX_QUESTIONS:
+        raise MessageError("bad question count")
+    # 每偏移一字节记录已确认标签边界：压缩指针只能指向其中向后的偏移。
+    boundaries = _BoundaryMarks(len(data))
+    questions = []
+    pos = _MIN_MESSAGE_LEN
+    for _ in range(qdcount):
+        name, pos = _read_name(data, pos, boundaries,
+                               max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+        if pos + 4 > len(data):
+            raise MessageError("question truncated")
+        qtype = int.from_bytes(data[pos:pos + 2], "big")
+        qclass = int.from_bytes(data[pos + 2:pos + 4], "big")
+        pos += 4
+        questions.append({"name": name, "type": qtype, "class": qclass})
+    sections = [[], [], []]
+    for index, count in enumerate((ancount, nscount, arcount)):
+        section = sections[index]
+        for _ in range(count):
+            name, pos = _read_name(data, pos, boundaries,
+                                   max_jumps=_MAX_MESSAGE_POINTER_JUMPS)
+            if pos + 10 > len(data):
+                raise MessageError("record truncated")
+            rrtype = int.from_bytes(data[pos:pos + 2], "big")
+            rrclass = int.from_bytes(data[pos + 2:pos + 4], "big")
+            ttl = int.from_bytes(data[pos + 4:pos + 8], "big")
+            rdlength = int.from_bytes(data[pos + 8:pos + 10], "big")
+            pos += 10
+            rdata_start = pos
+            if pos + rdlength > len(data):
+                raise MessageError("rdata truncated")
+            rdata = bytes(data[pos:pos + rdlength])
+            pos += rdlength
+            _message_check_rdata(rrtype, rdata, data, rdata_start,
+                                 boundaries)
+            section.append({"name": name, "type": rrtype, "class": rrclass,
+                            "ttl": ttl, "rdata": rdata})
+    if pos != len(data):
+        raise MessageError("trailing bytes")
+    return {"id": msg_id, "flags": flags, "questions": questions,
+            "answers": sections[0], "authorities": sections[1],
+            "additionals": sections[2]}
 
 
 def _decode_edns_query(data):
