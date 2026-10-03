@@ -50,6 +50,14 @@
   回显，应答 OPT 仅含一个 EDE TLV（网络序 uint16 info_code 后接
   text 的 UTF-8 字节，可为空）。
 - answer(query: bytes, zone: dict, limit: int = 512) -> bytes: 按 zone 应答查询；
+  QTYPE=255（ANY）使用确定性权威语义：精确 owner 存在时 ANSWER 按区域
+  原始顺序含其全部记录，保留重复项且不按类型重排，仅有 CNAME 时也不
+  展开目标；精确节点即使是空非终端也阻止通配，返回权威 NODATA 与起点
+  SOA。名称不存在且允许通配时，按现有最近包围节点（"*."+最长既存
+  后缀）规则选择通配 owner 并把 owner 合成为查询名后返回其全部记录，
+  同样不展开 CNAME；无精确节点也无通配时 NXDOMAIN。查询名位于委派
+  切点或其下方时继续返回非权威转介：ANY 不享受 DS 的切点例外，通配
+  也不跨越切点。除 255 外的未知 QTYPE 行为不变。
   普通与 EDNS 权威应答均为计划中的 ANSWER、AUTHORITY 按现有顺序观察 NS、
   MX、SRV，取 NS 整个 rdata、MX 跳过两字节 preference、SRV 跳过六字节
   priority/weight/port 后的嵌入名为目标，目标须位于 origin 内且为非根全名，
@@ -830,6 +838,7 @@ _TYPE_DNSKEY = 48
 _TYPE_CDS = 59
 _TYPE_CDNSKEY = 60
 _TYPE_CAA = 257
+_TYPE_ANY = 255
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
 _FLAG_DO = 0x8000
@@ -2441,9 +2450,54 @@ def _nearest_cut(cuts, name, origin):
     return None
 
 
-def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
-    """在 origin 内解析（qtype≠5 时跟随 CNAME 链），返回
+def _resolve_any(records, nodes, origin, qlabels, cuts):
+    """QTYPE=255（ANY）的确定性权威解析，返回
     (rcode, an, ns, authoritative)。
+
+    ANY 不追随 CNAME，精确 owner 存在时（含仅有 CNAME 的 owner）ANSWER
+    按区域原始顺序含该节点全部记录，保留重复项且不按类型重排；精确
+    节点即使是空非终端也阻止通配，此时无记录即权威 NODATA（ns 为起点
+    SOA）。无精确节点时按现有最近包围节点规则选 "*."+最长既存后缀的
+    通配 owner：存在即把查询 owner 合成为 qlabels 后返回其全部记录
+    （含仅有 CNAME 的通配，同样不展开目标）；通配 owner 必由其记录
+    定义，故无该通配记录时即既无精确节点也无可用通配，返回 NXDOMAIN。
+    查询名位于委派切点或其下方时一律非权威转介：ANY 不享受 DS 的切点
+    例外，通配也不得跨越切点。
+    """
+    soa = [rr for rr in records if rr[0] == origin and rr[1] == _TYPE_SOA]
+    cut = _nearest_cut(cuts, qlabels, origin)
+    if cut is not None:
+        # 切点或其下方的 ANY 查询直接转介：无 DS 例外，不做通配合成。
+        return 0, [], cuts[cut], False
+    current = tuple(qlabels)
+    if current in nodes:
+        # 同名节点存在（含空非终端）：不回退通配；全部记录按区域原序。
+        matched = [rr for rr in records if tuple(rr[0]) == current]
+        if matched:
+            return 0, matched, [], True
+        return 0, [], soa, True
+    # 节点不存在：取最长既存后缀，只检查 "*."+该后缀。
+    encloser = None
+    for i in range(1, len(qlabels) - len(origin) + 1):
+        if tuple(qlabels[i:]) in nodes:
+            encloser = qlabels[i:]
+            break
+    wildcard = tuple([_WILDCARD_LABEL] + encloser)
+    matched = [rr for rr in records if tuple(rr[0]) == wildcard]
+    if matched:
+        # ANY 收集该 owner 全部类型，matched 非空即通配 owner 存在：
+        # 合成为查询 owner 后按区域原序返回全部记录，不展开 CNAME。
+        return 0, [(list(qlabels), rr[1], rr[2], rr[3], rr[4])
+                   for rr in matched], [], True
+    return _RCODE_NXDOMAIN, [], soa, True
+
+
+def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
+    """在 origin 内解析（qtype≠5、≠255 时跟随 CNAME 链），返回
+    (rcode, an, ns, authoritative)。
+
+    QTYPE=255（ANY）分流到 _resolve_any：全类型、按区域原序、不追随
+    CNAME、切点无 DS 例外的确定性权威语义。
 
     authoritative 为假表示非权威委派转介：QR 置一、AA 清零、an 为空
     （或仅含已展开的 CNAME）、ns 为最近切点完整 NS RRset。切点处 DS
@@ -2452,6 +2506,9 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
     不进入通配合成。CNAME 链进入切点或其下方时保留已展开 CNAME 并以
     最近切点 NS 结束，不再查找目标类型。
     """
+    if qtype == _TYPE_ANY:
+        # ANY：确定的全类型权威语义（不追随 CNAME、无切点 DS 例外）。
+        return _resolve_any(records, nodes, origin, qlabels, cuts)
     soa = [rr for rr in records if rr[0] == origin and rr[1] == _TYPE_SOA]
     if qtype == _TYPE_CNAME:
         cut = _nearest_cut(cuts, qlabels, origin)
@@ -2700,7 +2757,12 @@ def _encode_policy_refusal(query, limit):
 
 
 def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
-    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。"""
+    """按 zone 对查询报文给出确定性权威应答（支持最左 "*" 通配与 CNAME 链）。
+
+    QTYPE=255（ANY）为确定性权威全类型应答，语义见 _resolve_any：精确
+    owner 全部记录按区域原序、不展开 CNAME、空非终端阻止通配、通配
+    合成为查询 owner、切点一律转介；其余 QTYPE 行为不变。
+    """
     msg = decode_query(query)  # MessageError/TypeError 原样传播
     _check_int(limit, "limit")
     questions = msg["questions"]
@@ -4448,6 +4510,12 @@ class PositiveCache:
     """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
     正缓存键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
+    QTYPE=255（ANY）与各具体 QTYPE 各自独立成键，互不复用：ANY 正条目
+    保存完整全类型 ANSWER 及其地址附加段，ANY 的 NODATA（如精确空非
+    终端）仅以 ("nodata",qname,255,qclass,...) 为键，不覆盖也不命中
+    其他 QTYPE 的负条目；NXDOMAIN 仍按 (qname,qclass) 对所有 QTYPE
+    （含 ANY）共享。ANY 不追随 CNAME、切点一律转介（不缓存），其余
+    存储、衰减、到期与截断口径与普通正条目一致。
     仅缓存 RCODE=0、ns 空、an 非空且 ANSWER 与地址 ADDITIONAL 各记录
     原始 TTL 均为正的完整有序应答；条目保存插入时刻、原始 ANSWER RR 与
     权威计划为该计划生成的原始地址 ADDITIONAL RR（可能为空），输出 TTL
