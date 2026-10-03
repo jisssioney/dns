@@ -59,10 +59,18 @@
   EDNS 应答置于唯一 OPT 之前（OPT 仍为末项）；附加 RRset 在 RRset 原子
   截断中先于授权段、回答段淘汰并置 TC，OPT 不淘汰；域外/根/无精确地址
   目标及不完整嵌入名不出附加项，RCODE、AA、ANSWER、AUTHORITY 不变。
+  QTYPE=255（ANY）为确定性权威语义、不追随 CNAME：精确 owner 存在时
+  ANSWER 按区域原序含其全部记录（保留重复项、不按类型重排；owner 仅持
+  CNAME 时也只回该 CNAME、不展开目标），精确节点为空非终端时阻断通配、
+  回权威 NODATA 与起点 SOA；无精确节点且允许通配时按最近包围节点选择
+  通配 owner，把其全部记录的 owner 合成为查询 owner（原序、保留重复、
+  不展开 CNAME），无精确节点也无通配时 NXDOMAIN。255 以外的未知 QTYPE
+  行为不变。
   区域中 owner 非通配且不等于 origin 的 NS RRset 定义委派切点，同一查询
   路径存在多级切点时取标签最长者；查询名恰在切点或位于其下方时（切点处
-  的 DS 查询除外）返回 NOERROR 非权威转介：QR 置一、AA 清零、ANSWER 为空，
-  AUTHORITY 按区域原序含该切点完整 NS RRset，附加段仅收集这些 NS 目标在
+  的 DS 查询例外；ANY 不享受该 DS 例外）返回 NOERROR 非权威转介：QR
+  置一、AA 清零、ANSWER 为空，AUTHORITY 按区域原序含该切点完整 NS
+  RRset，附加段仅收集这些 NS 目标在
   父区数据中的精确 A/AAAA（目标须位于当前 origin 内，每个规范目标只处理
   一次，不用通配合成、不追随 CNAME，保留区域原序与重复记录；目标名无法
   完整解码的 NS 仍形成切点与授权 RRset，只是不生成其胶水）。切点处 DS
@@ -830,6 +838,7 @@ _TYPE_DNSKEY = 48
 _TYPE_CDS = 59
 _TYPE_CDNSKEY = 60
 _TYPE_CAA = 257
+_TYPE_ANY = 255
 _TYPE_OPT = 41
 _MIN_OPT_CLASS = 512
 _FLAG_DO = 0x8000
@@ -2408,6 +2417,36 @@ def _hop(records, nodes, origin, current, qtype):
     return "nxdomain", None
 
 
+def _any_owner(records, nodes, origin, qlabels):
+    """ANY（QTYPE=255）的确定性 owner 选择，不追随 CNAME。
+
+    返回 (kind, owner 标签列表)：
+    - "exact"：精确节点存在（含空非终端），owner 即查询名，不回退通配；
+    - "wildcard"：无精确节点，最近包围节点（剥离标签后首个既存后缀）处
+      存在通配 owner "*."+suffix，owner 为该通配标签列表（记录的 owner
+      仍是通配名，由调用方在输出时合成为查询 owner）；
+    - "nxdomain"：无精确节点且最近包围节点处无通配 owner。
+
+    与 _hop 的通配规则一致：从查询名自左向右剥离标签，首个既存后缀为
+    最近包围节点；只检查该后缀正上方的单层通配，不逐级继续上溯。通配
+    owner 至少有一条记录，故 ANY 命中通配时必有记录可返回，不存在通配
+    层 NODATA。查询时间以查询标签数为线性上界。
+    """
+    if tuple(qlabels) in nodes:
+        return "exact", list(qlabels)
+    encloser = None
+    for i in range(1, len(qlabels) - len(origin) + 1):
+        if tuple(qlabels[i:]) in nodes:
+            encloser = qlabels[i:]
+            break
+    if encloser is None:
+        return "nxdomain", None
+    wildcard = [_WILDCARD_LABEL] + encloser
+    if any(rr[0] == wildcard for rr in records):
+        return "wildcard", wildcard
+    return "nxdomain", None
+
+
 def _zone_cut_points(records, origin):
     """收集区域切点：owner 非通配且不等于 origin 的 NS RRset。
 
@@ -2441,16 +2480,53 @@ def _nearest_cut(cuts, name, origin):
     return None
 
 
-def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
-    """在 origin 内解析（qtype≠5 时跟随 CNAME 链），返回
-    (rcode, an, ns, authoritative)。
+def _resolve_any(records, nodes, origin, qlabels, cuts, soa):
+    """ANY（QTYPE=255）的确定性权威应答计划，无 CNAME 链。
 
-    authoritative 为假表示非权威委派转介：QR 置一、AA 清零、an 为空
-    （或仅含已展开的 CNAME）、ns 为最近切点完整 NS RRset。切点处 DS
-    查询例外：DS 存在时给权威答案，不存在时给权威 NODATA（ns 为起点
-    SOA）。通配记录不得跨越切点——名称处于切点或其下方时直接转介，
+    返回与 _resolve_chain 同形的 (rcode, an, ns, authoritative)：
+    - 查询名位于委派切点或其下方时返回非权威转介（an 为空、ns 为最近
+      切点完整 NS RRset、AA 清零）；ANY 不享受切点 DS 例外，通配也不
+      跨越切点（切点判定先于 owner 选择）。
+    - 精确节点存在时 ANSWER 按区域原序含其全部记录，保留重复项、不按
+      类型重排；节点仅有 CNAME 时返回该 CNAME 而不展开目标。精确节点
+      为空非终端时阻断通配，返回权威 NODATA 与起点 SOA。
+    - 无精确节点时按 _any_owner 的最近包围节点规则选择通配 owner，把
+      其全部记录的 owner 合成为查询 owner，同样原序、保留重复且不展开
+      CNAME；无通配 owner 时返回 NXDOMAIN 与起点 SOA。
+    """
+    cut = _nearest_cut(cuts, qlabels, origin)
+    if cut is not None:
+        return 0, [], cuts[cut], False
+    kind, owner = _any_owner(records, nodes, origin, qlabels)
+    if kind == "exact":
+        matched = [rr for rr in records if rr[0] == qlabels]
+        if matched:
+            return 0, matched, [], True
+        # 精确空非终端：阻断通配，权威 NODATA + 起点 SOA。
+        return 0, [], soa, True
+    if kind == "wildcard":
+        synthesized = [(list(qlabels), rr[1], rr[2], rr[3], rr[4])
+                       for rr in records if rr[0] == owner]
+        return 0, synthesized, [], True
+    return _RCODE_NXDOMAIN, [], soa, True
+
+
+def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
+    """在 origin 内解析，返回 (rcode, an, ns, authoritative)。
+
+    qtype=5（CNAME）与其余具体类型：跟随 CNAME 链（CNAME 查询本身不
+    跟随）。authoritative 为假表示非权威委派转介：QR 置一、AA 清零、
+    an 为空（或仅含已展开的 CNAME）、ns 为最近切点完整 NS RRset。切点
+    处 DS 查询例外：DS 存在时给权威答案，不存在时给权威 NODATA（ns 为
+    起点 SOA）。通配记录不得跨越切点——名称处于切点或其下方时直接转介，
     不进入通配合成。CNAME 链进入切点或其下方时保留已展开 CNAME 并以
     最近切点 NS 结束，不再查找目标类型。
+
+    qtype=255（ANY）走 _resolve_any 的确定性权威计划：不追随 CNAME、
+    不享受切点 DS 例外；精确节点（含空非终端）阻断通配，ANSWER 按区域
+    原序含该 owner 全部记录（仅 CNAME 时也不展开），空非终端给权威
+    NODATA；无精确节点时按最近包围节点规则合成为查询 owner 的通配全部
+    记录，无通配时 NXDOMAIN；切点或其下方一律非权威转介。
     """
     soa = [rr for rr in records if rr[0] == origin and rr[1] == _TYPE_SOA]
     if qtype == _TYPE_CNAME:
@@ -2464,6 +2540,9 @@ def _resolve_chain(records, nodes, origin, qlabels, qtype, cuts):
         if kind == "nodata":
             return 0, [], soa, True
         return _RCODE_NXDOMAIN, [], soa, True
+    if qtype == _TYPE_ANY:
+        # ANY 不追随 CNAME、不享受切点 DS 例外：独立的确定性权威计划。
+        return _resolve_any(records, nodes, origin, qlabels, cuts, soa)
     an = []
     seen = {tuple(qlabels)}
     current = list(qlabels)
@@ -4453,6 +4532,12 @@ class PositiveCache:
     权威计划为该计划生成的原始地址 ADDITIONAL RR（可能为空），输出 TTL
     随经过时间递减，两段等量衰减；整条正条目以 ANSWER 与 ADDITIONAL
     全部记录的最小原始 TTL 判断到期，到期即删除。
+
+    QTYPE=255（ANY）与具体类型各自独立成键（规范化 qname、255、qclass
+    及既有 ECS 分区），不与任何具体类型查询互用：条目的 ANSWER 为该
+    owner 区域原序全部记录（含地址 ADDITIONAL），TTL 衰减与最小 TTL
+    到期口径同上；ANY 的空非终端权威 NODATA 只以 255 的负键缓存，不
+    覆盖也不影响其他 QTYPE 的正负条目。
 
     负缓存仅收完整计划所得且 an 为空的 NXDOMAIN（RCODE=3，键为小写绝对
     (qname, qclass)，匹配任意 qtype）与 NODATA（RCODE=0，键为
