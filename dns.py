@@ -79,6 +79,16 @@
   NS 结束为非权威转介，不再查找目标类型。转介（含带 CNAME 的转介）不写入
   正/负缓存，成功调用只按未写条目计数并提交显式时钟；起点 NS、无切点区域、
   域外查询与 class 不匹配保持既有行为。
+  PositiveCache.resolve_edns 与 Resolver.resolve_edns 的版本 0 区内权威
+  路径在查询 OPT DO=1 时，基于未截断应答计划为 ANSWER 与 AUTHORITY 中每个
+  非 RRSIG RRset 在其末条记录后按区域原序紧接随附全部同 owner、class 且
+  type covered 相等的区域 RRSIG；CNAME 链每一跳、最终答案、转介 NS、切点
+  DS 与负应答 SOA 同规则；ADDITIONAL 地址胶水不自动带签名；显式查询
+  RRSIG 或 ANY 保留现有选择与区域顺序、不重复插入；无匹配签名时结果不变。
+  DO 与 ECS 分区共同构成权威缓存键；命中时数据、签名、胶水按显式 now 各自
+  衰减，正缓存以三者最小 TTL 到期，负缓存以现有负 TTL 与随附签名 TTL 的较
+  小值到期；截断时被覆盖 RRset 与其随附 RRSIG 为同一淘汰单元。区域中的
+  RRSIG 在区域校验阶段按严格 RRSIG 契约校验，非法抛 RecordError。
 - import_zone(text: str) -> dict: 导入 v0/v1/v2 配置文本为规范化 zone。
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
@@ -1637,7 +1647,19 @@ def _validate_zone(zone):
     for rr in records:
         labels, rrtype, rrclass, ttl, rdata = _validate_rr(
             rr, allow_wildcard=True)
-        if rrtype in _NAME_BEARING_TYPES:
+        if rrtype == _TYPE_RRSIG:
+            # RRSIG 现为 DO 权威签名随附的记录来源：区域校验阶段按主文件
+            # 同一严格契约解码（18 字节固定头、type covered 为当前已支持
+            # 类型且不得为 RRSIG、未压缩绝对 signer、非空签名），非法即
+            # 抛 RecordError；通过后按嵌入名规范化重编码（与既有宽松形态
+            # 不同，非法 rdata 不再原样透传）。
+            (covered, algorithm, label_count, original_ttl, expiration,
+             inception, keytag, signer, signature) = (
+                _master_decode_rrsig_rdata(rdata))
+            rdata = _master_rrsig_rdata(
+                covered, algorithm, label_count, original_ttl, expiration,
+                inception, keytag, signer, signature)
+        elif rrtype in _NAME_BEARING_TYPES:
             # 嵌入名规范：大写折小写、任意八位组保留，rdata 据此重编码。
             rdata = _canonical_rdata(rrtype, rdata)
         rrs.append((labels, rrtype, rrclass, ttl, rdata))
@@ -1662,7 +1684,11 @@ def _validate_zone(zone):
     for labels, rrtype, _cls, _ttl, _rdata in rrs:
         owner_types.setdefault(tuple(labels), []).append(rrtype)
     for types in owner_types.values():
-        if _TYPE_CNAME in types and len(types) != 1:
+        if _TYPE_CNAME in types and (
+                types.count(_TYPE_CNAME) != 1 or any(
+                    t != _TYPE_CNAME and t != _TYPE_RRSIG for t in types)):
+            # CNAME owner 恰持有一条 CNAME；DO 随附所需的 RRSIG(CNAME)
+            # 之外不得出现其他类型记录。
             raise ZoneError("cname owner must hold exactly one cname record")
     return origin, rrs, rrclass
 
@@ -1719,14 +1745,21 @@ def _name_wire_len(labels, offsets):
     return sum(len(label) + 1 for label in labels) + 1
 
 
-def _rrset_unit(rr, position):
+def _rrset_unit(rr, position, sig_units=None):
     """RR 在所属区段内的 RRset 单元键：规范化 owner、数值 type、数值 class。
 
     键不含 TTL 与 rdata；OPT（TYPE41）不属于 RRset，每条各自为独立
-    单元（以位置区分），不与任何其他记录成组。
+    单元（以位置区分），不与任何其他记录成组。sig_units 非 None 时为
+    DO 权威随附 RRSIG 所在位置集合：集合中的 RRSIG 与其紧前被覆盖
+    RRset 合并为同一淘汰单元（键取该被覆盖 RRset 单元），保证截断时
+    二者整组同删，不留孤立签名；键不存在时以自身位置自成一组。
     """
     if rr[1] == _TYPE_OPT:
         return ("opt", position)
+    if sig_units is not None and position in sig_units:
+        covered = sig_units[position]
+        if covered is not None:
+            return covered
     return (tuple(rr[0]), rr[1], rr[2])
 
 
@@ -1747,7 +1780,8 @@ class _RRsetPlan:
     一次，单次处理时间与额外内存受区段记录数及编码总量的线性上界约束。
     """
 
-    def __init__(self, msg, sections, rcode_low, caps, authoritative=True):
+    def __init__(self, msg, sections, rcode_low, caps, authoritative=True,
+                 sig_units=None):
         self.msg = msg
         self.rcode_low = rcode_low
         # 权威应答置 QR|AA；非权威转介仅置 QR（AA 清零），其余保留位相同。
@@ -1756,6 +1790,11 @@ class _RRsetPlan:
                       | rcode_low)
         self.sections = [list(section) for section in sections]
         self.caps = caps
+        # sig_units 为 None 或每区段一个 {位置: 被覆盖 RRset 单元键}：
+        # DO 权威随附的 RRSIG 与其紧前被覆盖 RRset 合并为同一淘汰单元。
+        if sig_units is None:
+            sig_units = (None, None, None)
+        self.sig_units = sig_units
         self.nexts = []
         self.prevs = []
         self.heads = []
@@ -1775,8 +1814,9 @@ class _RRsetPlan:
             self.counts.append(size)
             keys = [None] * size
             membership = {}
+            section_sig = sig_units[len(self.key_at)]
             for position, rr in enumerate(section):
-                key = _rrset_unit(rr, position)
+                key = _rrset_unit(rr, position, section_sig)
                 keys[position] = key
                 membership.setdefault(key, []).append(position)
             self.key_at.append(keys)
@@ -2031,7 +2071,8 @@ def _encode_badvers(msg, opt, limit):
 
 
 def _edns_core(query: bytes, model: dict, rcode: int = 0,
-               options: list | None = None, authoritative: bool = True):
+               options: list | None = None, authoritative: bool = True,
+               signed_sections=None):
     """把（可含 OPT 的）查询报文与应答模型编码为 EDNS 应答报文。
 
     query/model 的解码与编码契约同 decode_query/encode_response；查询
@@ -2063,6 +2104,11 @@ def _edns_core(query: bytes, model: dict, rcode: int = 0,
         raise TypeError("query must be bytes")
     _check_int(rcode, "rcode")
     an, ns, ar, limit = _validate_model(model)
+    sig_units = None
+    if signed_sections is not None:
+        # DO 权威随附路径：三段与随附单元表由权威计划直接提供（model
+        # 仅提供 limit），RRSIG 与紧前被覆盖 RRset 在截断时同组淘汰。
+        an, ns, ar, sig_units = signed_sections
     msg, opt = _decode_edns_query(query)
     for section in (an, ns, ar):
         if any(rr[1] == _TYPE_OPT for rr in section):
@@ -2105,7 +2151,7 @@ def _edns_core(query: bytes, model: dict, rcode: int = 0,
     caps = (_MAX_SECTION_RECORDS, _MAX_SECTION_RECORDS, cap_ar)
     body_limit = limit - len(opt_wire)
     plan = _RRsetPlan(msg, (an, ns, ar), rcode & 0xF, caps,
-                      authoritative=authoritative)
+                      authoritative=authoritative, sig_units=sig_units)
     plan.fit(body_limit)
     # OPT 固定为附加段末项，不参与 RRset 重组，定稿时追加。
     return plan.finalize(opt_wire, 1 if opt_wire else 0)
@@ -2682,6 +2728,78 @@ def _answer_plan(msg, origin, records, zone_class):
     return rcode, an, ns, ar, authoritative
 
 
+def _rrsig_covered_type(rdata):
+    """取 RRSIG rdata 的两字节 type covered；不足两字节返回 None。
+
+    区域校验保证 RRSIG rdata 至少含 18 字节固定头，此处对宽松形态
+    防御性返回 None（该签名不随附任何 RRset）。
+    """
+    if len(rdata) < 2:
+        return None
+    return int.from_bytes(rdata[0:2], "big")
+
+
+def _attach_authority_signatures(section, records, rrset_keys=None):
+    """DO=1 时为单个权威区段（ANSWER 或 AUTHORITY）随附 RRSIG。
+
+    基于未截断应答计划：对区段中每个非 RRSIG RRset（以规范化 owner、
+    type、class 成组，不含 TTL/rdata），在该 RRset 末条成员之后，紧接
+    按区域原始顺序加入全部同 owner、同 class 且 RDATA 的 type covered
+    等于该 RRset 类型的区域 RRSIG；多条匹配签名全部保留。区段已显式
+    含 RRSIG（显式查询 RRSIG 或 ANY 时的现有选择）时整段保持现有选择
+    与区域原序，不插入、不重排、不重复。
+    返回 (新区段, {随附 RRSIG 在新区段的位置: 被覆盖 RRset 单元键})。
+    候选匹配总扫描数以区域记录数为线性上界。
+    """
+    if not section:
+        return list(section), {}
+    if any(rr[1] == _TYPE_RRSIG for rr in section):
+        # 显式 RRSIG/ANY 选择：保留现有选择与区域顺序，不自动随附。
+        return list(section), {}
+    if rrset_keys is None:
+        rrset_keys = {}
+        for rr in section:
+            rrset_keys.setdefault(
+                (tuple(rr[0]), rr[1], rr[2]), []).append(rr)
+    # 区域 RRSIG 索引：(owner, class) -> 按区域原序的 RR 列表。
+    sig_index = {}
+    for zone_rr in records:
+        if zone_rr[1] == _TYPE_RRSIG:
+            sig_index.setdefault(
+                (tuple(zone_rr[0]), zone_rr[2]), []).append(zone_rr)
+    result = []
+    sig_units = {}
+    for rr in section:
+        result.append(rr)
+        owner = tuple(rr[0])
+        rrtype = rr[1]
+        unit = (owner, rrtype, rr[2])
+        members = rrset_keys.get(unit)
+        if members is None or rr is not members[-1]:
+            # 仅在每个 RRset 的末条成员后随附一次。
+            continue
+        for sig in sig_index.get((owner, rr[2]), ()):  # 区域原序
+            if _rrsig_covered_type(sig[4]) == rrtype:
+                sig_units[len(result)] = unit
+                result.append(sig)
+    return result, sig_units
+
+
+def _signed_authority_plan(rcode, an, ns, ar, records, authoritative):
+    """DO=1 版本 0 权威路径的完整（未截断）签名随附计划。
+
+    ANSWER 与 AUTHORITY 的每个非 RRSIG RRset 后紧接随附 RRSIG；
+    ADDITIONAL 地址胶水不自动带签名，保持原序。返回
+    (an, ns, ar, (an_sig_units, ns_sig_units, {})) 供 _encode_plan_edns
+    直接编码；非权威转介同样适用（已展开 CNAME 与切点 NS、切点 DS
+    均按同一规则随附）。
+    """
+    signed_an, an_units = _attach_authority_signatures(an, records)
+    signed_ns, ns_units = _attach_authority_signatures(ns, records)
+    return (signed_an, signed_ns, list(ar),
+            (an_units, ns_units, {}))
+
+
 def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None,
                  authoritative=True):
     """把完整应答计划编码为权威应答报文。
@@ -2703,7 +2821,7 @@ def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None,
 
 
 def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
-                      authoritative=True):
+                      authoritative=True, do=False, signed=None):
     """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
 
     ar 为权威计划确定性生成的地址附加记录，置于应答 OPT 之前，OPT 仍
@@ -2711,6 +2829,12 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
     回写该 ECS（码 8）选项：family、source 不变，scope=source，
     address 同查询；查询携带的其他选项不回显。authoritative 为假时
     编码非权威转介（QR 置一、AA 清零）。
+    do 真且 signed 非 None 时用于 DO=1 的版本 0 权威路径：signed 为
+    (an, ns, ar, sig_units)，前三项已按未截断计划在 ANSWER、AUTHORITY
+    的每个非 RRSIG RRset 后紧接随附同 owner、class、type covered 的
+    区域 RRSIG（地址胶水段不随附），sig_units 为每区段 {随附 RRSIG
+    位置: 被覆盖 RRset 单元键}，截断时被覆盖 RRset 与其随附签名整体
+    淘汰；该路径不经模型逐 RR 校验，limit 仍取自入参。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -2724,8 +2848,15 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
         options = [{"code": _OPT_CODE_ECS,
                     "data": _encode_ecs_option(family, source, source,
                                                address)}]
+    signed_sections = None
+    if do and signed is not None:
+        model["an"] = []
+        model["ns"] = []
+        model["ar"] = []
+        signed_sections = signed
     return _edns_core(query, model, rcode, options,
-                      authoritative=authoritative)
+                      authoritative=authoritative,
+                      signed_sections=signed_sections)
 
 
 def _encode_policy_refusal(query, limit):
@@ -4509,25 +4640,34 @@ def compare_serial(left: int, right: int) -> str:
 class PositiveCache:
     """容量 256 的正/负答案缓存（FIFO 淘汰，命中不重排）。
 
-    正缓存键为 (小写绝对 qname, qtype, qclass)，与 ID、flags、limit 无关。
-    QTYPE=255（ANY）与各具体 QTYPE 各自独立成键，互不复用：ANY 正条目
+    正缓存键为 (小写绝对 qname, qtype, qclass, ECS 分区, DO)，与 ID、
+    flags、limit 无关。DO 仅对版本 0 且查询 OPT DO=1 的 resolve_edns
+    为真，与 ECS 分区共同成键：DO=1 与 DO=0/普通解析各自独立，有签名
+    与无签名应答不互相命中。QTYPE=255（ANY）与各具体 QTYPE 各自独立
+    成键，互不复用：ANY 正条目
     保存完整全类型 ANSWER 及其地址附加段，ANY 的 NODATA（如精确空非
     终端）仅以 ("nodata",qname,255,qclass,...) 为键，不覆盖也不命中
     其他 QTYPE 的负条目；NXDOMAIN 仍按 (qname,qclass) 对所有 QTYPE
     （含 ANY）共享。ANY 不追随 CNAME、切点一律转介（不缓存），其余
     存储、衰减、到期与截断口径与普通正条目一致。
     仅缓存 RCODE=0、ns 空、an 非空且 ANSWER 与地址 ADDITIONAL 各记录
-    原始 TTL 均为正的完整有序应答；条目保存插入时刻、原始 ANSWER RR 与
-    权威计划为该计划生成的原始地址 ADDITIONAL RR（可能为空），输出 TTL
-    随经过时间递减，两段等量衰减；整条正条目以 ANSWER 与 ADDITIONAL
+    原始 TTL 均为正的完整有序应答；DO 正条目另存与 ANSWER 逐 RR 对齐
+    的随附签名，其原始 TTL 也须全部为正；条目保存插入时刻、原始
+    ANSWER RR、权威计划为该计划生成的原始地址 ADDITIONAL RR（可能为空）
+    与随附签名（仅 DO），输出 TTL 随经过时间递减，数据、签名与胶水按
+    同一显式 now 各自衰减；整条正条目以 ANSWER、随附签名与 ADDITIONAL
     全部记录的最小原始 TTL 判断到期，到期即删除。
 
     负缓存仅收完整计划所得且 an 为空的 NXDOMAIN（RCODE=3，键为小写绝对
     (qname, qclass)，匹配任意 qtype）与 NODATA（RCODE=0，键为
-    (qname, qtype, qclass)），且 ns 恰为 origin 唯一 SOA；SOA rdata 须
+    (qname, qtype, qclass)），两类键均带 ECS 分区与 DO 标志，且 ns
+    恰为 origin 唯一 SOA；SOA rdata 须
     完整为两个未压缩绝对域名及五个网络序 uint32，负 TTL 为
     min(SOA ttl, 第五个 uint32)，格式错或负 TTL 为 0 则不缓存。
-    负命中时 RCODE 不变，an/ar 为空，ns 仅该 SOA 且 ttl 随经过时间递减。
+    DO=1 时另按区域原序随附与 SOA 同 owner、class、type covered=SOA
+    的 RRSIG：任一随附签名 TTL 非正不缓存，负 TTL 取原负 TTL 与各随附
+    签名 TTL 的较小值；负命中时 RCODE 不变，an/ar 为空，ns 为 SOA
+    紧接随附签名，SOA 按负 TTL、签名按各自原始 TTL 随显式 now 衰减。
 
     查找顺序为正缓存、NODATA、NXDOMAIN；正负条目共用容量与同一 FIFO。
     委派转介（AA 清零、授权段为切点完整 NS RRset，含携带已展开 CNAME 的
@@ -4553,16 +4693,24 @@ class PositiveCache:
     NODATA、NXDOMAIN 均纳入，无 ECS 查询使用与 resolve 相同的无分区
     键；版本 0 时缓存分区、正负缓存、TTL 衰减、FIFO、
     命中与统计和 resolve 完全共享（分区内键忽略 OPT、ID、flags 与
-    limit）；应答按同一权威计划以 edns 语义编码：上限为 min(limit,
+    limit）。版本 0 且 DO=1 时缓存键另含 DO 标志，与 ECS 分区共同把
+    有签名与无签名应答隔离：基于未截断应答计划，为 ANSWER 与
+    AUTHORITY 中每个非 RRSIG RRset 在其末条成员后按区域原序紧接加入
+    全部同 owner、class 且 type covered 等于该 RRset 类型的区域
+    RRSIG；CNAME 链每一跳、最终答案、转介 NS、切点 DS 与负应答 SOA
+    同一规则，ADDITIONAL 地址胶水不自动带签名；显式查询 RRSIG 或
+    ANY 时保留现有选择与区域顺序、不重复插入；找不到签名时仍返回原
+    未签名结果。应答按同一权威计划以 edns 语义编码：上限为 min(limit,
     OPT CLASS)，RCODE 取计划值，末项 OPT 回显 CLASS 与 DO，查询含
     ECS 时仅回写码 8 选项（family、source 不变，scope=source，
     address 同查询，其他选项不回显；ECS 使报文超 min(limit,OPT
     CLASS) 抛 EncodeError），无 ECS 时扩展码、版本及 RDLENGTH 为 0，
     普通 RR 超限或区段计数超 16 位时按 RRset 原子截断整组删除并置
     TC（规范化 owner、type、class 同组，不含 TTL/rdata；ar、ns、an
-    优先级）、OPT
+    优先级；DO 随附 RRSIG 与其紧前被覆盖 RRset 视为同一淘汰单元，
+    不留孤立签名）、OPT
     不删，头部、问题和 OPT 超限抛 EncodeError。异常不改变缓存、统计
-    或最后时刻，成功原子提交；未触发截断时输出与既有逐字节相同。
+    或最后时刻，成功原子提交；DO=0 时输出与既有逐字节相同。
 
     stats(reset=False) 输出键序 h,m,x,k 的紧凑 ASCII JSON（末尾单换行）：
     h 键序 p,nx,nd，按 resolve 命中正缓存、NXDOMAIN、NODATA 递增；
@@ -4600,15 +4748,19 @@ class PositiveCache:
         self._clean_expired = 0
         self._clean_evicted = 0
 
-    def _negative_entry(self, key, rcode, an, ns, now):
+    def _negative_entry(self, key, rcode, an, ns, now, do=False):
         """完整计划可负缓存时返回 (负缓存键, 条目)，否则返回 None。
 
-        key 已含 ECS 分区（无 ECS 时末项为 None），负键在原 NXDOMAIN/
-        NODATA 键基础上保留该分区，故不同 ECS 分区各自独立。
+        key 已含 ECS 分区与 DO（末两项），负键在原 NXDOMAIN/NODATA 键
+        基础上保留它们，故不同 ECS 分区与 DO=0/1 各自独立。DO=1 时
+        额外收集与负应答 SOA 同 owner、class、type covered=SOA 的区域
+        RRSIG（区域原序），随附签名 TTL 全部为正才缓存，条目第五项
+        保存该签名列表；负 TTL 取 min(SOA ttl, SOA minimum, 各签名
+        TTL)。
         """
         if an or rcode not in (0, _RCODE_NXDOMAIN):
             return None
-        if (len(ns) != 1 or ns[0][0] != self._origin
+        if (len(ns) != 1 or tuple(ns[0][0]) != tuple(self._origin)
                 or ns[0][1] != _TYPE_SOA):
             return None
         soa = ns[0]
@@ -4618,12 +4770,28 @@ class PositiveCache:
         neg_ttl = min(soa[3], minimum)
         if neg_ttl == 0:
             return None
-        partition = key[-1]
+        sig_ns = ()
+        if do:
+            owner = tuple(soa[0])
+            sig_ns = tuple(rr for rr in self._records
+                           if rr[1] == _TYPE_RRSIG
+                           and tuple(rr[0]) == owner
+                           and rr[2] == soa[2]
+                           and _rrsig_covered_type(rr[4]) == _TYPE_SOA)
+            if any(rr[3] <= 0 for rr in sig_ns):
+                return None
+            if sig_ns:
+                neg_ttl = min(neg_ttl, *(rr[3] for rr in sig_ns))
+        partition = key[-2]
+        do_flag = key[-1]
         if rcode == _RCODE_NXDOMAIN:
-            neg_key = ("nxdomain", key[0], key[2], partition)  # 匹配任意 qtype
+            neg_key = ("nxdomain", key[0], key[2], partition, do_flag)
         else:
             neg_key = ("nodata",) + key
-        return neg_key, (now, rcode, soa, neg_ttl)
+        entry = (now, rcode, soa, neg_ttl)
+        if do:
+            entry = (now, rcode, soa, neg_ttl, list(sig_ns))
+        return neg_key, entry
 
     def resolve(self, query: bytes, now: int,
                 limit: int = 512) -> tuple[bytes, bool]:
@@ -4695,41 +4863,83 @@ class PositiveCache:
         if self._last_now is not None and now < self._last_now:
             raise CacheError("now must be non-negative and monotonic")
         return self._resolve_cached(msg, query, now, limit,
-                                    _encode_plan_edns, ecs)
+                                    _encode_plan_edns, ecs, do=opt[2])
+
+    @staticmethod
+    def _cache_key(question, partition, do):
+        """权威缓存键：(小写绝对 qname, qtype, qclass, ECS 分区, DO)。
+
+        无 ECS 时分区为 None；DO=1 的版本 0 EDNS 应答与 DO=0/普通解析
+        各自独立成键，有签名与无签名应答不互相命中。
+        """
+        return (question["name"], question["type"], question["class"],
+                partition, bool(do))
+
+    @staticmethod
+    def _positive_min_ttl(entry):
+        """正条目（含 DO 随附签名）全部数据、签名与胶水的最小原始 TTL。"""
+        ttls = [rr[3] for rr in entry[1]] + [rr[3] for rr in entry[2]]
+        if len(entry) == 4:
+            # DO 正条目：第四项为与 ANSWER 对齐的随附签名列表。
+            for attached in entry[3]:
+                ttls.extend(rr[3] for rr in attached)
+        return min(ttls)
 
     def _resolve_cached(self, msg, query, now, limit, encode_plan,
-                        ecs=None):
+                        ecs=None, do=False):
         """resolve/resolve_edns 共用的缓存查找、计划应答与原子提交。
 
         msg 为已解码且通过可应答性检查的单问题报文；encode_plan 为
         (query, rcode, an, ns, limit, ecs=None) -> 应答报文 的编码器，
         其异常即本次失败，不改变条目、统计与时钟。ecs 非 None 时缓存
         键追加 (family,source,address) 分区，普通 resolve 路径恒为
-        None（无 ECS 单独分区）。
+        None（无 ECS 单独分区）。do 仅版本 0 且查询 OPT DO=1 的 EDNS
+        权威路径为真：未截断计划在 ANSWER、AUTHORITY 的每个非 RRSIG
+        RRset 后紧接随附区域 RRSIG（ADDITIONAL 胶水不随附），并与
+        ECS 分区共同独立成键；普通 resolve 与 DO=0 的 EDNS 路径恒为
+        False，键形态以外的行为与既有逐字节一致。
         """
         question = msg["questions"][0]
         partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
-        key = (question["name"], question["type"], question["class"],
-               partition)
+        key = self._cache_key(question, partition, do)
         expired = None  # 到期条目在 _order 中的标记键，待编码成功后清理
+
+        def age_rr(rr):
+            return (list(rr[0]), rr[1], rr[2], rr[3] - elapsed, rr[4])
+
         entry = self._entries.get(key)
         if entry is not None:
-            inserted, an, ar_glue = entry
+            inserted = entry[0]
             elapsed = now - inserted
-            # 整条正缓存的到期以 ANSWER 与 ADDITIONAL 全部记录的最小原始
-            # TTL 判断；命中时两段 TTL 按同一显式 now 等量衰减。
-            min_ttl = min([rr[3] for rr in an]
-                          + [rr[3] for rr in ar_glue])
+            # 整条正缓存的到期以 ANSWER、随附签名与 ADDITIONAL 全部记录
+            # 的最小原始 TTL 判断；命中时各段 TTL 按同一显式 now 衰减。
+            min_ttl = self._positive_min_ttl(entry)
             if elapsed < min_ttl:
-                aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
-                        for labels, rrtype, rrclass, ttl, rdata in an]
-                aged_ar = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
-                           for labels, rrtype, rrclass, ttl, rdata
-                           in ar_glue]
-                # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
-                # 命中也不改变插入次序。
-                response = encode_plan(query, 0, aged, [], limit, ecs,
-                                       ar=aged_ar)
+                if len(entry) == 4:
+                    # DO 正命中：ANSWER 逐 RR 后紧接其随附签名（与插入时
+                    # 同序），胶水不随附；被覆盖 RRset 与签名同属一个
+                    # 截断单元。
+                    _inserted, an, ar_glue, sig_an = entry
+                    signed_an = []
+                    an_units = {}
+                    for index, rr in enumerate(an):
+                        unit = (tuple(rr[0]), rr[1], rr[2])
+                        signed_an.append(age_rr(rr))
+                        for sig in sig_an[index]:
+                            an_units[len(signed_an)] = unit
+                            signed_an.append(age_rr(sig))
+                    aged_ar = [age_rr(rr) for rr in ar_glue]
+                    signed = (signed_an, [], aged_ar, (an_units, {}, {}))
+                    response = encode_plan(query, 0, [], [], limit, ecs,
+                                           do=True, signed=signed)
+                else:
+                    _inserted, an, ar_glue = entry
+                    aged = [age_rr(rr) for rr in an]
+                    aged_ar = [age_rr(rr) for rr in ar_glue]
+                    # 用本次 ID、flags、问题段、limit 重编码；截断不改条目，
+                    # 命中也不改变插入次序。
+                    response = encode_plan(query, 0, aged, [], limit, ecs,
+                                           ar=aged_ar)
                 # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                 self._stats_h[0] += 1
                 self._last_now = now
@@ -4741,18 +4951,32 @@ class PositiveCache:
             neg_key = ("nodata",) + key
             neg = self._neg_entries.get(neg_key)
             if neg is None:
-                neg_key = ("nxdomain", key[0], key[2], partition)
+                neg_key = ("nxdomain", key[0], key[2], partition, do)
                 neg = self._neg_entries.get(neg_key)
             if neg is not None:
-                inserted, rcode, soa, neg_ttl = neg
+                inserted, rcode, soa, neg_ttl = neg[0], neg[1], neg[2], neg[3]
                 elapsed = now - inserted
                 if elapsed < neg_ttl:
-                    aged_soa = (soa[0], soa[1], soa[2],
-                                neg_ttl - elapsed, soa[4])
-                    # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
-                    # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
-                    response = encode_plan(query, rcode, [], [aged_soa],
-                                           limit, ecs)
+                    if len(neg) == 5:
+                        # DO 负命中：SOA 后紧接随附签名；SOA 沿用负 TTL
+                        # 剩余，签名按各自原始 TTL 随显式 now 衰减。
+                        signed_ns = [(soa[0], soa[1], soa[2],
+                                      neg_ttl - elapsed, soa[4])]
+                        ns_units = {}
+                        unit = (tuple(soa[0]), soa[1], soa[2])
+                        for sig in neg[4]:
+                            ns_units[len(signed_ns)] = unit
+                            signed_ns.append(age_rr(sig))
+                        signed = ([], signed_ns, [], ({}, ns_units, {}))
+                        response = encode_plan(query, rcode, [], [], limit,
+                                               ecs, do=True, signed=signed)
+                    else:
+                        aged_soa = (soa[0], soa[1], soa[2],
+                                    neg_ttl - elapsed, soa[4])
+                        # 用本次 ID、flags、问题段、limit 重编码；RCODE 不变，
+                        # an/ar 为空，ns 仅 SOA；截断不改条目与插入次序。
+                        response = encode_plan(query, rcode, [], [aged_soa],
+                                               limit, ecs)
                     # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                     # neg_key 首项区分 NXDOMAIN（h[1]）与 NODATA（h[2]）。
                     self._stats_h[1 if neg_key[0] == "nxdomain" else 2] += 1
@@ -4763,9 +4987,20 @@ class PositiveCache:
         # （含确定性地址附加段）。
         rcode, an, ns, ar_glue, authoritative = _answer_plan(
             msg, self._origin, self._records, self._zone_class)
-        # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
-        response = encode_plan(query, rcode, an, ns, limit, ecs, ar=ar_glue,
-                               authoritative=authoritative)
+        # DO=1：基于该未截断计划随附签名（ANSWER、AUTHORITY 各非 RRSIG
+        # RRset 之后；胶水不随附）。先编码成功再落条目，编码失败不改变
+        # 任何状态（含统计与时钟）。
+        signed = None
+        if do:
+            signed = _signed_authority_plan(
+                rcode, an, ns, ar_glue, self._records, authoritative)
+            response = encode_plan(query, rcode, an, ns, limit, ecs,
+                                   ar=ar_glue, authoritative=authoritative,
+                                   do=True, signed=signed)
+        else:
+            response = encode_plan(query, rcode, an, ns, limit, ecs,
+                                   ar=ar_glue,
+                                   authoritative=authoritative)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
@@ -4779,13 +5014,24 @@ class PositiveCache:
         elif (rcode == 0 and not ns and an
                 and all(rr[3] > 0 for rr in an)
                 and all(rr[3] > 0 for rr in ar_glue)):
-            # 正条目把 ANSWER 与地址 ADDITIONAL 纳入同一计划：命中时两段
-            # TTL 等量衰减，并以两段最小原始 TTL 判断整条是否到期。
-            self._entries[key] = (now, an, ar_glue)
-            self._order.append(("pos", key))
-            m_index = 0  # 新写正缓存
+            if do:
+                # DO 正条目额外保存与 ANSWER 对齐的随附签名；任一签名
+                # TTL 非正则整条不缓存（应答仍正常返回，按未写条目计数）。
+                sig_an = self._signed_attached(signed[0], an, signed[3][0])
+                if any(any(rr[3] <= 0 for rr in sigs) for sigs in sig_an):
+                    m_index = 3
+                else:
+                    self._entries[key] = (now, an, ar_glue, sig_an)
+                    self._order.append(("pos", key))
+                    m_index = 0  # 新写正缓存
+            else:
+                # 正条目把 ANSWER 与地址 ADDITIONAL 纳入同一计划：命中时两段
+                # TTL 等量衰减，并以两段最小原始 TTL 判断整条是否到期。
+                self._entries[key] = (now, an, ar_glue)
+                self._order.append(("pos", key))
+                m_index = 0  # 新写正缓存
         else:
-            negative = self._negative_entry(key, rcode, an, ns, now)
+            negative = self._negative_entry(key, rcode, an, ns, now, do)
             if negative is not None:
                 neg_key, neg_entry = negative
                 self._neg_entries[neg_key] = neg_entry
@@ -4804,6 +5050,25 @@ class PositiveCache:
         self._stats_m[m_index] += 1
         self._last_now = now
         return response, False
+
+    @staticmethod
+    def _signed_attached(signed_an, an, an_units):
+        """把随附签名按原始 an 逐 RR 对齐为签名列表（非末条成员为空）。
+
+        signed_an 为 an 各 RR 后紧接其随附签名的定序列表；an_units 为
+        {随附 RRSIG 在 signed_an 中的位置: 被覆盖 RRset 单元键}，显式
+        RRSIG/ANY 区段未随附时为空。
+        """
+        attached = []
+        position = 0
+        for rr in an:
+            position += 1  # rr 自身
+            sigs = []
+            while position < len(signed_an) and position in an_units:
+                sigs.append(signed_an[position])
+                position += 1
+            attached.append(sigs)
+        return attached
 
     def stats(self, reset: bool = False) -> str:
         """返回固定键序紧凑 ASCII JSON（末尾单换行），可选重置 h、m、x。
@@ -5469,10 +5734,12 @@ def _min_remaining_ttl(entries, now, negative, glue=False):
     """该类全部条目的最小剩余 TTL（下限 0），无条目为 -1。
 
     正条目值为 (插入时刻, 规范化 an) 或权威正缓存的
-    (插入时刻, 规范化 an, 规范化 ar)；glue 为真时后者额外把地址附加
-    段纳入最小原始 TTL。负条目值为 (插入时刻, rcode, SOA, 负 TTL)；
-    正条目剩余值为 max(0, 插入时刻 + RR 最小 TTL - now)，负条目以负
-    TTL 同算。读取不清除到期项，故到期条目贡献 0。
+    (插入时刻, 规范化 an, 规范化 ar[, 与 an 对齐的随附签名])；glue
+    为真时后者额外把地址附加段（DO 条目另含随附签名）纳入最小原始
+    TTL。负条目值为 (插入时刻, rcode, SOA, 负 TTL[, 随附 SOA 签名])，
+    其负 TTL 已取 SOA 与随附签名 TTL 的较小值；正条目剩余值为
+    max(0, 插入时刻 + RR 最小 TTL - now)，负条目以负 TTL 同算。读取
+    不清除到期项，故到期条目贡献 0。
     """
     remaining = -1
     for value in entries.values():
@@ -5480,7 +5747,11 @@ def _min_remaining_ttl(entries, now, negative, glue=False):
         if negative:
             ttl = value[3]
         elif glue:
-            ttl = min([rr[3] for rr in value[1]] + [rr[3] for rr in value[2]])
+            ttls = [rr[3] for rr in value[1]] + [rr[3] for rr in value[2]]
+            if len(value) == 4:
+                for attached in value[3]:
+                    ttls.extend(rr[3] for rr in attached)
+            ttl = min(ttls)
         else:
             ttl = min(rr[3] for rr in value[1])
         current = max(0, inserted + ttl - now)
@@ -6122,9 +6393,13 @@ class Resolver:
     取 min(limit, OPT CLASS)。OPT 版本 1..255 在访问区域、缓存、时钟、
     统计与上游前直接返回 (BADVERS 应答, "edns", now, False)，不校验
     ECS 也不做时钟回退判断。版本 0 区内查询使用现有权威正/负缓存与
-    ECS 分区，来源为 "authority"：无 ECS 时与现有权威 EDNS 输出逐字节
-    一致，有 ECS 时应答 OPT 仅回写规范 ECS，TTL 衰减、NXDOMAIN、
-    NODATA、截断与命中标记沿用当前契约；区外查询按当前上游顺序、
+    ECS 分区，来源为 "authority"：DO=0 与现有权威 EDNS 输出逐字节
+    一致；DO=1 时基于未截断计划随附权威 RRSIG（ANSWER、AUTHORITY 各
+    非 RRSIG RRset 之后按区域原序，胶水不随附，RRSIG/ANY 查询保持
+    现有选择与顺序），DO 与 ECS 共同分区，TTL 衰减、NXDOMAIN、
+    NODATA、随附签名、被覆盖 RRset 与签名一体的截断单元及命中标记
+    沿用 PositiveCache.resolve_edns 契约，有 ECS 时应答 OPT 仅回写
+    规范 ECS；区外查询按当前上游顺序、
     attempts 与 timeout 转发，来源为成功上游名，结束时刻累加事件延迟，
     命中恒为 False。候选应答还须问题一致、恰含一个合法末项 OPT 且总
     长度不超有效上限，否则按不可用应答继续尝试；全部超时抛
@@ -6659,9 +6934,13 @@ class Resolver:
         OPT CLASS)。OPT 版本 1..255 时在访问区域、缓存、时钟、统计与
         上游前直接返回 (BADVERS 应答, "edns", now, False)。版本 0 的
         区内查询使用现有权威正/负缓存与 ECS 分区，来源为 "authority"：
-        无 ECS 时与现有权威 EDNS 输出逐字节一致，有 ECS 时仅回写规范
-        ECS，TTL 衰减、NXDOMAIN、NODATA、截断与命中标记沿用当前契约，
-        并按现有 authority 口径更新命中、未中、到期、水位与最后时刻。
+        DO=0 时与现有权威 EDNS 输出逐字节一致，有 ECS 时仅回写规范
+        ECS；DO=1 时基于未截断计划随附权威 RRSIG（ANSWER、AUTHORITY
+        各非 RRSIG RRset 之后按区域原序，胶水不随附，显式 RRSIG/ANY
+        查询保持现有选择与顺序），DO 与 ECS 共同分区，TTL 衰减、
+        NXDOMAIN、NODATA、随附签名、被覆盖 RRset 与签名一体的截断
+        单元及命中标记沿用 PositiveCache.resolve_edns 契约，并按现有
+        authority 口径更新命中、未中、到期、水位与最后时刻。
         区外查询按当前上游顺序、attempts 与 timeout 转发，候选应答还
         须问题一致、恰含一个合法末项 OPT 且总长度不超有效上限，否则按
         不可用应答继续尝试；全部超时抛 UpstreamTimeout，存在非超时失败
@@ -6680,8 +6959,10 @@ class Resolver:
         effective_limit = min(limit, opt[0])
         if _name_in_origin(question, origin, self._cache._zone_class):
             # 区内：权威正/负缓存与 ECS 分区完全沿用 PositiveCache
-            # 的 resolve_edns；解析器侧统计提交口径与 resolve 相同。
-            expired = self._authority_miss_expired(question, now, ecs)
+            # 的 resolve_edns；DO=1 时签名随附与 DO 分区同样在缓存内
+            # 完成。解析器侧统计提交口径与 resolve 相同。
+            expired = self._authority_miss_expired(
+                question, now, ecs, do=opt[2])
             response, hit = self._cache.resolve_edns(query, now, limit)
             self._fold_authority_cleanup()
             if hit:
@@ -6929,29 +7210,26 @@ class Resolver:
         cache._clean_expired = 0
         cache._clean_evicted = 0
 
-    def _authority_miss_expired(self, question, now, ecs=None):
+    def _authority_miss_expired(self, question, now, ecs=None, do=False):
         """本次权威缓存查找若未中，是否源于到期条目（查找顺序同 PositiveCache）。
 
         ecs 非 None 时键追加 (family,source,address) 分区，与
-        PositiveCache.resolve_edns 的分区一致；普通 resolve/
-        resolve_recursive 恒为 None（无 ECS 分区）。
+        PositiveCache.resolve_edns 的分区一致；do 为版本 0 DO=1 的 EDNS
+        权威路径标记，与分区共同成键。普通 resolve/resolve_recursive 恒
+        为 None/False（无 ECS 分区、无签名）。
         """
         cache = self._cache
         partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
-        key = (question["name"], question["type"], question["class"],
-               partition)
+        key = PositiveCache._cache_key(question, partition, do)
         entry = cache._entries.get(key)
         if entry is not None:
-            inserted, an, ar_glue = entry
-            # 与 PositiveCache 的正条目到期口径一致：取 ANSWER 与
-            # ADDITIONAL 全部记录的最小原始 TTL。
-            min_ttl = min([rr[3] for rr in an]
-                          + [rr[3] for rr in ar_glue])
-            return now - inserted >= min_ttl
+            # 与 PositiveCache 的正条目到期口径一致：取 ANSWER、随附签名
+            # 与 ADDITIONAL 全部记录的最小原始 TTL。
+            return now - entry[0] >= PositiveCache._positive_min_ttl(entry)
         neg_key = ("nodata",) + key
         neg = cache._neg_entries.get(neg_key)
         if neg is None:
-            neg_key = ("nxdomain", key[0], key[2], partition)
+            neg_key = ("nxdomain", key[0], key[2], partition, do)
             neg = cache._neg_entries.get(neg_key)
         if neg is None:
             return False
