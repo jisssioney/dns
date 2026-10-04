@@ -172,6 +172,23 @@
   事件延迟、命中恒为 False；区内按 authority 口径、区外成功或耗尽
   按 resolve 口径原子更新统计，BADVERS 与任何错误均不改变缓存、
   FIFO、时钟或统计；
+  resolve_cookie(query, client, secret, now, limit=65535) 处理版本 0、
+  恰含一个 COOKIE（码 10）的单问题 EDNS 查询，返回与 resolve 同形的
+  四元组；COOKIE data 须恰为 8 字节客户端值或再接 16 字节服务端值，
+  secret 长度须 16..64、client 须为合法 IPv4/IPv6（否则 CookieError，
+  类型错误抛 TypeError），服务端值算法同 edns_cookie。仅客户端值或
+  服务端值匹配时解析路径、来源、结束时刻、命中标记、有效长度上限
+  min(limit,OPT CLASS)、ECS 与 DO 分区沿用 resolve_edns（COOKIE 不
+  进入缓存键与缓存内容，TTL 按 now 衰减后再以本次 client、secret
+  生成 COOKIE）；区外转发时 24 字节 COOKIE 截为 8 字节客户端值（不
+  转发客户端侧服务端值，仅客户端值时原字节保留）、其余选项原序
+  保留，候选应答按现有 EDNS 规则校验，最终 OPT 按固定顺序只含规范
+  ECS（若有）与末项 COOKIE，其他选项不回显；服务端值不匹配时立即
+  返回扩展 RCODE 23 的 BADCOOKIE（回答、授权段空，附加段仅回写正确
+  COOKIE 的 OPT，来源 "cookie"、结束时刻 now、命中 False），不访问
+  区域、缓存或上游；BADCOOKIE 与异常均不改变缓存、FIFO、最后时刻
+  或统计，正常成功与上游耗尽按 resolve_edns 口径原子提交，OPT 为
+  不可淘汰项、截断沿用 RRset 原子规则，同状态同输入逐字节一致；
   resolve_authorized(query, client, rules, now, limit=512, default="deny")
   先按授权规则判定再解析，放行行为同 resolve，拒绝返回
   (拒绝应答, "policy", now, False)（flags=0x8400|(flags&0x7910)|5，
@@ -224,9 +241,11 @@
   upstream_stats(reset=False) 返回构造 plan 直转的逐上游统计，为顶层
   键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
   i,n,a,s,to,e,bad,ms 的对象（重名不合并，i 为从 0 起的序号，n 为
-  原上游名，其余为非负整数），t 省略 i、n 并为逐项和；仅经 resolve
-  或 resolve_edns 的直转在成功或耗尽（UpstreamTimeout/UpstreamError）
-  时原子提交，权威、缓存与 resolve_recursive 的 levels 不计；
+  原上游名，其余为非负整数），t 省略 i、n 并为逐项和；仅经 resolve、
+  resolve_edns 或 resolve_cookie 的直转在成功或耗尽
+  （UpstreamTimeout/UpstreamError）时原子提交，权威、缓存与
+  resolve_recursive 的 levels 不计（resolve_cookie 以删除全部
+  COOKIE 的查询转发，候选校验同 resolve_edns）；
   reset=True 先返回旧快照再清零上述计数；
   recursive_upstream_stats(reset=False) 返回 resolve_recursive 逐层
   转发的按深度统计，为顶层键序仅 l,t 的紧凑 ASCII JSON（末尾单换行）：
@@ -5557,6 +5576,304 @@ def _check_resolve_edns_inputs(query, now, limit, last_end):
     return msg, opt, ecs, None
 
 
+def _check_resolve_cookie_inputs(query, client, secret, now, limit,
+                                 last_end):
+    """resolve_cookie 的入参/报文/OPT/COOKIE/ECS 校验。
+
+    校验顺序与异常口径：query/secret/client/now/limit 类型错误抛
+    TypeError；secret 长度非 16..64、client 非合法 IPv4/IPv6、报文长度
+    或可应答性外的其余 COOKIE 语义错误抛 CookieError；报文长度、问题数
+    等沿用 MessageError，QR/QDCOUNT/limit 可应答性沿用 EncodeError，
+    非法 AR/OPT 与尾随字节沿用 EDNSError（CookieError 为其子类，凡
+    COOKIE 专属违规统一为 CookieError）。OPT 版本须为 0，缺失 COOKIE、
+    重复 COOKIE 或 data 长度非 8/24 抛 CookieError；ECS 校验沿用
+    resolve_edns（非法抛 EDNSError）。
+
+    返回 (msg, opt, ecs, client_cookie, server_cookie, address,
+    effective_limit)：opt 为版本 0 的查询 OPT 元组，address 为
+    ipaddress 对象，server_cookie 为 bytes（无服务端值时为空）。全部
+    校验先于任何区域、缓存、时钟、统计与上游访问；时钟单调性以
+    last_end 为准，仅在版本 0、COOKIE 与 ECS 均合法后判断。
+    """
+    if not isinstance(query, bytes):
+        raise TypeError("query must be bytes")
+    if not isinstance(secret, bytes):
+        raise TypeError("secret must be bytes")
+    if not isinstance(client, str):
+        raise TypeError("client must be str")
+    if not isinstance(now, int) or isinstance(now, bool):
+        raise TypeError("now must be int")
+    if now < 0:
+        raise CacheError("now must be non-negative and monotonic")
+    if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+        raise MessageError("bad message length")
+    _check_int(limit, "limit")
+    if (int.from_bytes(query[2:4], "big") & 0x8000
+            or int.from_bytes(query[4:6], "big") != 1
+            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+        raise EncodeError("query or limit not answerable")
+    msg, opt = _decode_edns_query(query)
+    if opt is None:
+        raise CookieError("query must contain exactly one OPT with COOKIE")
+    if opt[1] != 0:
+        raise CookieError("OPT version must be 0")
+    client_cookie = None
+    server_cookie = b""
+    for code, data in opt[3]:
+        if code != _OPT_CODE_COOKIE:
+            continue
+        if client_cookie is not None:
+            raise CookieError("duplicate COOKIE option")
+        if len(data) not in (_COOKIE_CLIENT_LEN,
+                             _COOKIE_CLIENT_LEN + _COOKIE_SERVER_LEN):
+            raise CookieError("COOKIE data must be 8 or 24 bytes")
+        client_cookie = data[:_COOKIE_CLIENT_LEN]
+        server_cookie = data[_COOKIE_CLIENT_LEN:]
+    if client_cookie is None:
+        raise CookieError("query must contain exactly one COOKIE option")
+    if not _MIN_COOKIE_SECRET_LEN <= len(secret) <= _MAX_COOKIE_SECRET_LEN:
+        raise CookieError("secret length must be 16..64 bytes")
+    try:
+        address = ipaddress.ip_address(client)
+    except ValueError:
+        raise CookieError(
+            "client must be a valid IPv4/IPv6 address") from None
+    # ECS 分区沿用 resolve_edns：版本 0 查询至多一个合法 ECS，其他选项
+    # （含 COOKIE 之外的选项码）原样忽略、不回显。
+    ecs = _parse_query_ecs(opt[3])
+    if last_end is not None and now < last_end:
+        raise CacheError("now must be non-negative and monotonic")
+    effective_limit = min(limit, opt[0])
+    return (msg, opt, ecs, client_cookie, server_cookie, address,
+            effective_limit)
+
+
+def _cookie_family(address):
+    """edns_cookie 口径的 IP family 单字节：IPv4 为 0x04、IPv6 为 0x06。"""
+    if isinstance(address, ipaddress.IPv4Address):
+        return bytes((_FAMILY_IPV4,))
+    return bytes((_FAMILY_IPV6,))
+
+
+def _cookie_options(ecs, cookie_data):
+    """应答 OPT 选项表：固定顺序先规范 ECS（若有），末项为 COOKIE。
+
+    ECS 规范化同 _encode_plan_edns（scope=source）；其余查询选项一律不
+    回显。返回的 list 可直接作为 _edns_core 的 options。
+    """
+    options = []
+    if ecs is not None:
+        family, source, addr = ecs
+        options.append({"code": _OPT_CODE_ECS,
+                        "data": _encode_ecs_option(
+                            family, source, source, addr)})
+    options.append({"code": _OPT_CODE_COOKIE, "data": cookie_data})
+    return options
+
+
+def _encode_plan_edns_cookie(query, rcode, an, ns, limit, ecs=None,
+                             ar=None, cookie_data=b"",
+                             authoritative=True, units=None):
+    """按 edns 契约编码权威/转介计划，OPT 仅含规范 ECS（若有）与末项 COOKIE。
+
+    与 _encode_plan_edns 同构，区别仅在应答选项固定为 ECS（若有）后接
+    唯一码 10 COOKIE，其他选项不回显；authoritative 为假时编码非权威
+    转介（QR 置一、AA 清零），供区外上游应答的规范化重编码使用。
+    """
+    model = {
+        "an": [_rr_to_model(rr) for rr in an],
+        "ns": [_rr_to_model(rr) for rr in ns],
+        "ar": [_rr_to_model(rr) for rr in (ar if ar is not None else ())],
+        "limit": limit,
+    }
+    options = _cookie_options(ecs, cookie_data)
+    return _edns_core(query, model, rcode, options,
+                      authoritative=authoritative, units=units)
+
+
+def _forward_query_without_server_cookie(query, qend):
+    """删除查询 COOKIE 中的客户端侧服务端值，返回转发给上游的查询字节。
+
+    qend 为问题段结束偏移（亦为 OPT 记录起点）。仅把 8+16 字节 COOKIE
+    TLV 的 data 截为前 8 字节客户端值（重算 TLV 长度），不转发客户端
+    提供的 16 字节服务端值；本就只有 8 字节客户端值的 COOKIE 与 ECS
+    等其余选项按原序、原字节保留，OPT 记录头（根 owner、TYPE41、
+    CLASS、TTL）不变，RDLENGTH 相应重算。
+    """
+    rdlength_pos = qend + 9
+    rdlength = int.from_bytes(
+        query[rdlength_pos:rdlength_pos + 2], "big")
+    rdata_start = qend + 11
+    rdata_end = rdata_start + rdlength
+    kept = bytearray()
+    pos = rdata_start
+    while pos < rdata_end:
+        code = int.from_bytes(query[pos:pos + 2], "big")
+        opt_len = int.from_bytes(query[pos + 2:pos + 4], "big")
+        item_end = pos + 4 + opt_len
+        if code == _OPT_CODE_COOKIE and opt_len == (
+                _COOKIE_CLIENT_LEN + _COOKIE_SERVER_LEN):
+            client_value = query[item_end - opt_len:
+                                 item_end - _COOKIE_SERVER_LEN]
+            kept += code.to_bytes(2, "big")
+            kept += _COOKIE_CLIENT_LEN.to_bytes(2, "big") + client_value
+        else:
+            kept += query[pos:item_end]
+        pos = item_end
+    return (query[:rdlength_pos]
+            + len(kept).to_bytes(2, "big") + bytes(kept))
+
+
+def _cookie_canonical_rdata(rrtype, response, rstart, rend, boundaries):
+    """把候选应答 RR 的 rdata 中嵌入名解析为未压缩规范名后重编码。
+
+    与 _canonical_rdata 的区别：嵌入名可含后向压缩指针，须在完整报文
+    response 上下文中按 _read_message_name 解析（NS/CNAME/PTR/MX/SOA
+    允许指针；SRV/NAPTR/NSEC/RRSIG 不允许），再以未压缩绝对名重写，
+    名称之外的字节（含 NAPTR 的字符串、NSEC 位图、RRSIG 签名）逐字
+    保留。结构已由 _check_message_rdata 校验，本函数仅重写名称。
+    """
+    if rrtype in (_TYPE_NS, _TYPE_CNAME, _TYPE_PTR):
+        name, _stop = _read_message_name(
+            response, rstart, boundaries, True, rend)
+        return _encode_wire_name(_normalize_name(name))
+    if rrtype == _TYPE_MX:
+        name, _stop = _read_message_name(
+            response, rstart + 2, boundaries, True, rend)
+        return bytes(response[rstart:rstart + 2]) + _encode_wire_name(
+            _normalize_name(name))
+    if rrtype == _TYPE_SOA:
+        name1, pos1 = _read_message_name(
+            response, rstart, boundaries, True, rend)
+        name2, pos2 = _read_message_name(
+            response, pos1, boundaries, True, rend)
+        return (_encode_wire_name(_normalize_name(name1))
+                + _encode_wire_name(_normalize_name(name2))
+                + bytes(response[pos2:rend]))
+    if rrtype == _TYPE_SRV:
+        name, _stop = _read_message_name(
+            response, rstart + 6, boundaries, False, rend)
+        return bytes(response[rstart:rstart + 6]) + _encode_wire_name(
+            _normalize_name(name))
+    if rrtype == _TYPE_NSEC:
+        name, pos = _read_message_name(
+            response, rstart, boundaries, False, rend)
+        return (_encode_wire_name(_normalize_name(name))
+                + bytes(response[pos:rend]))
+    if rrtype == _TYPE_RRSIG:
+        name, pos = _read_message_name(
+            response, rstart + 18, boundaries, False, rend)
+        return (bytes(response[rstart:rstart + 18])
+                + _encode_wire_name(_normalize_name(name))
+                + bytes(response[pos:rend]))
+    # NAPTR：order/preference 4 字节后为三个长度前缀字符串，再为替换名。
+    if rrtype == _TYPE_NAPTR:
+        pos = rstart + 4
+        for _ in range(3):
+            if pos >= rend:
+                raise MessageError("naptr rdata truncated")
+            pos += 1 + response[pos]
+        name, _stop = _read_message_name(
+            response, pos, boundaries, False, rend)
+        return (bytes(response[rstart:pos])
+                + _encode_wire_name(_normalize_name(name)))
+    return bytes(response[rstart:rend])
+
+
+def _cookie_reply_rrs(response, ancount, nscount, arcount, length):
+    """解析候选上游应答的普通 RR（跳过末项 OPT），返回规范化 RR 列表。
+
+    仅用于 resolve_cookie 区外候选（已由 _decode_edns_response 验证问题
+    一致、恰一合法末项 OPT、长度与计数自洽）。owner 名允许后向压缩
+    指针；NS/CNAME/PTR/MX/SOA 的 rdata 嵌入名同样允许压缩，按报文
+    上下文解析为规范绝对名后重编码为未压缩形态，使后续以本次查询
+    重编码不会悬挂指针；SRV/NAPTR/NSEC/RRSIG 的嵌入名按
+    decode_message 契约不得含指针；其余类型 rdata 原样透传。
+    返回 (an, ns, ar) 三个 (labels,type,class,ttl,rdata) 元组列表。
+    """
+    sections = [[], [], []]
+    boundaries = set()
+    index = 0
+    total = ancount + nscount + arcount
+    # 先读问题段以把其标签边界纳入压缩指针合法目标（owner 与 rdata 嵌入
+    # 名均可后向指向问题名，同 decode_message 的 boundaries 口径）。
+    pos = _MIN_MESSAGE_LEN
+    _qname, pos = _read_message_name(
+        response, pos, boundaries, True, length)
+    pos += 4  # QTYPE/QCLASS；pos 此时等于 qend
+    while index < total:
+        name, pos = _read_message_name(
+            response, pos, boundaries, True, length)
+        if pos + 10 > length:
+            raise MessageError("record truncated")
+        rrtype = int.from_bytes(response[pos:pos + 2], "big")
+        rrclass = int.from_bytes(response[pos + 2:pos + 4], "big")
+        ttl = int.from_bytes(response[pos + 4:pos + 8], "big")
+        rdlength = int.from_bytes(response[pos + 8:pos + 10], "big")
+        pos += 10
+        rstart = pos
+        rend = pos + rdlength
+        if rend > length:
+            raise MessageError("record rdata truncated")
+        is_opt = index == total - 1 and rrtype == _TYPE_OPT
+        if not is_opt:
+            if (rrtype in _COMPRESSIBLE_RNAME_TYPES
+                    or rrtype in (_TYPE_SRV, _TYPE_NAPTR, _TYPE_NSEC,
+                                  _TYPE_RRSIG)):
+                _check_message_rdata(rrtype, response, rstart, rend,
+                                     boundaries)
+                rdata = _cookie_canonical_rdata(
+                    rrtype, response, rstart, rend, boundaries)
+            else:
+                rdata = bytes(response[rstart:rend])
+            if index < ancount:
+                target = 0
+            elif index < ancount + nscount:
+                target = 1
+            else:
+                target = 2
+            sections[target].append(
+                (_normalize_name(name), rrtype, rrclass, ttl, rdata))
+        pos = rend
+        index += 1
+    if pos != length:
+        raise MessageError("trailing bytes")
+    return sections[0], sections[1], sections[2]
+
+
+def _encode_badcookie(msg, opt_class, do, cookie_data, limit):
+    """编码 BADCOOKIE（扩展 RCODE 23）应答：an/ns 空，附加段仅一个 OPT。
+
+    flags=0x8400|(查询 flags&0x7910)（AA 置位，头部低 4 位为
+    23&15=7），QDCOUNT=1、ANCOUNT=NSCOUNT=0、ARCOUNT=1；OPT 为未压缩
+    根 owner、TYPE41、回显 CLASS 与 DO，TTL=(23>>4)<<24|DO，版本 0、
+    扩展 RCODE 高字节为 1，RDATA 仅含码 10 的 8+16 字节 COOKIE。上限
+    min(limit, CLASS)（调用方传入），超限抛 EncodeError，不置 TC。
+    """
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    flags = _FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT) | (
+        _RCODE_BADCOOKIE & 0xF)
+    out += flags.to_bytes(2, "big")
+    out += len(msg["questions"]).to_bytes(2, "big")
+    out += (0).to_bytes(4)  # ANCOUNT/NSCOUNT 均为 0
+    out += (1).to_bytes(2)  # ARCOUNT=1（仅 OPT）
+    offsets = {}
+    for question in msg["questions"]:
+        _write_name(out, _normalize_name(question["name"]), offsets)
+        out += question["type"].to_bytes(2, "big")
+        out += question["class"].to_bytes(2, "big")
+    ttl = ((_RCODE_BADCOOKIE >> 4) << 24) | (_FLAG_DO if do else 0)
+    opt_rdata = (_OPT_CODE_COOKIE.to_bytes(2, "big")
+                 + len(cookie_data).to_bytes(2, "big") + cookie_data)
+    out += (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+            + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
+            + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
+    if len(out) > limit:
+        raise EncodeError("header, question and OPT exceed limit")
+    return bytes(out)
+
+
 def _validate_recursive_reply(reply):
     """校验单层 reply，返回 (kind, rcode, an, ns)。
 
@@ -6390,6 +6707,33 @@ class Resolver:
     与上游计划必须产生逐字节相同的应答与统计，单次调用最多检查现有
     上游及其允许的事件数，不新增无界状态。
 
+    resolve_cookie(query, client, secret, now, limit=65535)：处理版本 0、
+    恰含一个 COOKIE（码 10）的单问题 EDNS 查询，返回与 resolve 同形的
+    四元组。COOKIE data 须恰为 8 字节客户端值，或 8 字节客户端值后接
+    16 字节服务端值；secret 长度须 16..64、client 须为合法 IPv4/IPv6
+    文本，OPT 缺失或版本非 0、COOKIE 缺失、重复或长度错误抛
+    CookieError，query/secret/client/now/limit 类型错误抛 TypeError，
+    其余报文、EDNS、ECS、时钟与编码错误沿用 MessageError、EDNSError、
+    CacheError 与 EncodeError。服务端值为
+    HMAC-SHA256(secret, family+packed IP+客户端值) 前 16 字节，family
+    为 0x04（IPv4）/0x06（IPv6）。仅客户端值或服务端值匹配时，解析
+    结果、来源、结束时刻、命中标记与有效长度上限 min(limit,OPT
+    CLASS) 沿用 resolve_edns：区内查询走权威正/负缓存，键仅按 DO 与
+    规范 ECS 分区，COOKIE 不进入缓存键与缓存内容，命中后 TTL 按 now
+    衰减再以本次 client、secret 生成 COOKIE，统计口径同 authority；
+    区外查询转发前把 24 字节 COOKIE 截为 8 字节客户端值（不把客户端侧
+    服务端值转给上游；仅客户端值时 COOKIE 原字节保留），其余选项原序
+    保留，候选应答仍按问题一致、恰含一个合法末项
+    OPT 且不超有效上限校验，最终 OPT 按固定顺序只含规范 ECS（若有）
+    与末项 COOKIE，其他选项不回显，统计口径同 resolve_edns 区外路径。
+    服务端值存在但不匹配时立即返回扩展 RCODE 23 的 BADCOOKIE：回答、
+    授权段为空，附加段只有回写正确 COOKIE 的 OPT，来源 "cookie"、
+    结束时刻 now、命中 False，不访问区域、缓存或上游。完整校验前不
+    改变状态；BADCOOKIE 与任何异常均不改变缓存、FIFO、最后时刻或
+    统计；正常成功与上游耗尽按 resolve_edns 口径原子提交。最终编码
+    把 OPT 视为不可淘汰项，在 min(limit,OPT CLASS) 内沿用 RRset 原子
+    截断与 TC 规则；同状态同输入逐字节一致。
+
     resolve_authorized(query, client, rules, now, limit=512,
     default="deny")：授权匹配、TypeError 与 PolicyError 沿用 authorize，
     其余校验及异常沿用 resolve，全部校验通过后方可改变状态。放行时
@@ -6476,11 +6820,13 @@ class Resolver:
     序号，n 为原上游名，其余为非负整数（a 尝试、s 成功、to 超时、
     e 无应答、bad 应答未通过匹配、ms 模拟耗时累计；每个上游仅取前
     2 个事件，无事件不计）。t 省略 i、n，余键同序并为逐项和。仅经
-    resolve 或 resolve_edns 进入该 plan 的直转计数（权威、缓存与
-    resolve_recursive 的 levels 不计），直转成功或耗尽抛
-    UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
+    resolve、resolve_edns 或 resolve_cookie 进入该 plan 的直转计数
+    （权威、缓存与 resolve_recursive 的 levels 不计），直转成功或耗尽
+    抛 UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
     resolve_edns 的候选除问题一致外还须恰含一个合法末项 OPT 且不超
-    有效上限，否则记 bad；reset 非 bool 抛 TypeError 且无变化；
+    有效上限，否则记 bad；resolve_cookie 的转发查询把 24 字节 COOKIE
+    截为 8 字节客户端值（不转发服务端值），候选校验同 resolve_edns；
+    reset 非 bool 抛 TypeError 且无变化；
     False 只读，True 先返回旧快照再清零上述计数，plan、缓存、时钟
     及其他统计不变。
 
@@ -6796,7 +7142,8 @@ class Resolver:
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
         # upstream_stats 的逐上游计数：与 plan 位置一一对应（重名不合并），
-        # 每项为 [a, s, to, e, bad, ms]，仅经 resolve/resolve_edns 的直转
+        # 每项为 [a, s, to, e, bad, ms]，仅经 resolve/resolve_edns/
+        # resolve_cookie 的直转
         # 在成功返回或耗尽（UpstreamTimeout/UpstreamError）时原子提交。
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
         # recursive_upstream_stats 的按深度计数：固定 16 行，索引对应递归
@@ -6983,6 +7330,136 @@ class Resolver:
         self._sync_stats_c0()
         self._last_end = end
         return reply, name, end, False
+
+    def resolve_cookie(self, query: bytes, client: str, secret: bytes,
+                       now: int, limit: int = 65535
+                       ) -> tuple[bytes, str, int, bool]:
+        """处理版本 0、恰含一个 COOKIE 的 EDNS 查询，返回 resolve 同形四元组。
+
+        查询须带唯一版本 0 的 OPT 且恰含一个 COOKIE（码 10）：data 须恰
+        为 8 字节客户端值，或 8 字节客户端值后接 16 字节服务端值。
+        query/secret/client/now/limit 类型错误抛 TypeError；secret 长度
+        非 16..64、client 非合法 IPv4/IPv6、OPT 缺失或版本非 0、
+        COOKIE 缺失、重复或长度错误抛 CookieError；其余报文、OPT、ECS、
+        时钟与编码错误沿用 MessageError、EDNSError、CacheError 与
+        EncodeError。服务端值算法同 edns_cookie：
+        HMAC-SHA256(secret, family+packed IP+客户端值) 前 16 字节，
+        family 为 0x04/0x06。
+
+        仅有客户端值或服务端值匹配时，解析结果、来源、结束时刻、命中
+        标记与有效长度上限 min(limit, OPT CLASS) 沿用 resolve_edns：
+        区内查询走权威正/负缓存，键仅按 DO 与规范 ECS 分区，COOKIE 不
+        进入缓存键与缓存内容，TTL 按 now 衰减、命中标记与统计口径同
+        resolve_edns；区外查询按当前上游顺序、attempts 与 timeout 转发，
+        但不把客户端侧服务端值转给上游——转发查询把 24 字节 COOKIE 截为
+        8 字节客户端值（本就只有客户端值的 COOKIE 原字节保留），其余
+        选项原序保留。上游候选应答按现有 EDNS 规则校验（问题一致、恰含
+        一个合法末项 OPT 且不超有效上限）；返回前剥离其全部 OPT 选项，
+        仅保留规范 ECS（查询带合法 ECS 时）与以本次 client、secret 新算
+        的末项 COOKIE，其他选项不回显。
+
+        服务端值存在但不匹配时立即返回扩展 RCODE 23 的 BADCOOKIE：
+        回答与授权段为空，附加段只有回写正确 COOKIE（客户端值加新算
+        16 字节服务端值）的 OPT，来源为 "cookie"、结束时刻为 now、
+        命中为 False，且不访问区域、缓存或上游。完整校验前不得改变
+        状态；BADCOOKIE 与任何异常均不改变缓存、FIFO、最后时刻或
+        统计；正常成功与上游耗尽按 resolve_edns 口径原子提交。最终
+        编码把 OPT 视为不可淘汰项，在 min(limit, OPT CLASS) 内沿用
+        RRset 原子截断与 TC 规则；同状态同输入逐字节一致。
+        """
+        (msg, opt, ecs, client_cookie, server_cookie, address,
+         effective_limit) = _check_resolve_cookie_inputs(
+            query, client, secret, now, limit, self._last_end)
+        opt_class, _version, do, _query_opts = opt
+        family = _cookie_family(address)
+        expected = _server_cookie(secret, family, address.packed,
+                                  client_cookie)
+        cookie_data = client_cookie + expected
+        if server_cookie and not hmac.compare_digest(server_cookie, expected):
+            # BADCOOKIE：全部入参与报文校验已完成，不访问区域、缓存、
+            # 统计或上游，不推进最后成功时刻，不改变任何状态。
+            response = _encode_badcookie(
+                msg, opt_class, do, cookie_data, effective_limit)
+            return response, "cookie", now, False
+
+        def encode_cookie(q, rcode, an, ns, lim, ecs_value=None, ar=None,
+                          authoritative=True, units=None):
+            return _encode_plan_edns_cookie(
+                q, rcode, an, ns, lim, ecs_value, ar, cookie_data,
+                authoritative=authoritative, units=units)
+
+        question = msg["questions"][0]
+        origin = self._cache._origin
+        if _name_in_origin(question, origin, self._cache._zone_class):
+            # 区内：缓存键仅按 DO/ECS 分区（与 resolve_edns 同键），
+            # COOKIE 不进入键与内容。直接以 COOKIE 编码器驱动
+            # _resolve_cached：其缓存内容为无 COOKIE 的既有计划，分区、
+            # 查找、TTL 衰减、FIFO、写入与统计完全沿用 resolve_edns。
+            expired = self._authority_miss_expired(
+                question, now, ecs, do=do)
+            response, hit = self._cache._resolve_cached(
+                msg, query, now, limit, encode_cookie, ecs, do=do)
+            self._fold_authority_cleanup()
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
+            self._sync_stats_c0()
+            self._last_end = now
+            return response, "authority", now, hit
+        # 区外：转发查询不携带客户端侧服务端值——24 字节 COOKIE 截为
+        # 8 字节客户端值（仅客户端值时原字节保留），其余选项原序保留。
+        qend = _reply_question_end(query, 1)
+        upstream_query = _forward_query_without_server_cookie(query, qend)
+        plan = self._forward_plan()
+        upstream_counts = _upstream_forward_counts(
+            plan, upstream_query, self._timeout,
+            match=lambda reply: _matching_edns_reply(
+                upstream_query, reply, effective_limit))
+        try:
+            reply, name, end = forward_edns(
+                upstream_query, plan, now, self._timeout, effective_limit)
+        except UpstreamTimeout:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[1] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        except UpstreamError:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[2] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        # 候选已通过现有 EDNS 校验（_matching_edns_reply 已保证问题一致、
+        # 恰一合法末项 OPT、扩展 RCODE 为 0 且不超有效上限）；规范化重
+        # 编码在任何统计提交前完成：以原查询（含 COOKIE）锚定问题段与
+        # 回显 CLASS/DO，an/ns/ar 取上游报文原序（嵌入名压缩指针解析为
+        # 未压缩规范名，避免重编码后悬挂指针），剥离其全部 OPT 选项，
+        # 仅写规范 ECS（若有）与本次新算 COOKIE。报文结构或编码失败
+        # 原样抛 MessageError/EncodeError，不提交逐上游计数与统计。
+        reply_flags = int.from_bytes(reply[2:4], "big")
+        rcode = reply_flags & 0xF
+        ancount = int.from_bytes(reply[6:8], "big")
+        nscount = int.from_bytes(reply[8:10], "big")
+        arcount = int.from_bytes(reply[10:12], "big")
+        an, ns, ar = _cookie_reply_rrs(
+            reply, ancount, nscount, arcount, len(reply))
+        response = encode_cookie(
+            query, rcode, an, ns, limit, ecs, ar=ar,
+            authoritative=bool(reply_flags & 0x0400))
+        self._commit_upstream_counts(upstream_counts)
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._sync_stats_c0()
+        self._last_end = end
+        return response, name, end, False
 
     def resolve_authorized(self, query: bytes, client: str, rules: list,
                            now: int, limit: int = 512,
@@ -8116,11 +8593,12 @@ class Resolver:
         即 a 加 1，delay>timeout 时 to 加 1、ms 加 timeout，否则 ms 加
         delay 后按 reply 为 None/未通过匹配/通过分别计 e/bad/s（通过即
         停），无事件的上游不计。t 省略 i、n，余键同序并为逐项和。
-        仅经 resolve 或 resolve_edns 进入该 plan 的直转计数（权威、
-        缓存与 resolve_recursive 的 levels 不计），直转成功或耗尽抛
-        UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交；
-        resolve_edns 候选须额外通过恰一合法末项 OPT 与有效长度上限
-        校验，否则记 bad。
+        仅经 resolve、resolve_edns 或 resolve_cookie 进入该 plan 的直转
+        计数（权威、缓存与 resolve_recursive 的 levels 不计），直转成功
+        或耗尽抛 UpstreamTimeout/UpstreamError 时原子提交，其他异常不
+        提交；resolve_edns 候选须额外通过恰一合法末项 OPT 与有效长度
+        上限校验，否则记 bad；resolve_cookie 以 COOKIE 截为 8 字节客户端
+        值的查询转发，候选校验同 resolve_edns，成功后重编码不改变计数。
         reset 非 bool 抛 TypeError 且无变化；False 只读，重复调用逐
         字节相同；True 先返回旧快照再清零上述计数，plan、缓存、时钟
         及其他统计不变。同初态同调用序列逐字节一致。
