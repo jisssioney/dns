@@ -172,6 +172,24 @@
   事件延迟、命中恒为 False；区内按 authority 口径、区外成功或耗尽
   按 resolve 口径原子更新统计，BADVERS 与任何错误均不改变缓存、
   FIFO、时钟或统计；
+  resolve_cookie(query, client, secret, now, limit=65535) 处理携带唯一
+  版本 0 OPT 且恰含一个 COOKIE（选项码 10）的 EDNS 查询，返回与
+  resolve_edns 同形的四元组；query、now、limit 的报文/EDNS/时钟/编码
+  校验沿用 resolve_edns，参数类型错抛 TypeError，OPT 版本非 0、
+  COOKIE 缺失/重复/长度错、secret 长度非 16..64、client 非合法
+  IPv4/IPv6 抛 CookieError；COOKIE data 须为 8 字节客户端值或
+  8+16 字节客户端+服务端值，服务端值算法沿用 edns_cookie。仅有客户
+  端值或服务端值匹配时，解析结果、来源、结束时刻、命中标记与有效
+  长度上限沿用 resolve_edns：COOKIE 不进入缓存键与缓存内容，现有
+  ECS 与 DO 分区仍生效，命中后按 now 衰减 TTL 再以本次 client、secret
+  生成 COOKIE；区外转发把 COOKIE 截为仅 8 字节客户端值（客户端侧
+  服务端值不转给上游），候选应答按现有 EDNS 规则校验，最终 OPT 按
+  固定顺序只含规范 ECS（若有）与末项 COOKIE，其他选项不回显。服务端值不匹配时立即返回扩展 RCODE 23 的
+  BADCOOKIE（回答、授权段为空，附加段仅含回写正确 COOKIE 的 OPT，
+  来源 "cookie"、结束时刻 now、命中 False），不访问区域、缓存或上游；
+  BADCOOKIE 与任何异常均不改变缓存、FIFO、最后时刻或统计，正常成功与
+  上游耗尽按 resolve_edns 口径原子提交，最终编码把 OPT 视为不可淘汰项，
+  在 min(limit, OPT CLASS) 内沿用 RRset 原子截断与 TC 规则；
   resolve_authorized(query, client, rules, now, limit=512, default="deny")
   先按授权规则判定再解析，放行行为同 resolve，拒绝返回
   (拒绝应答, "policy", now, False)（flags=0x8400|(flags&0x7910)|5，
@@ -225,8 +243,9 @@
   键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
   i,n,a,s,to,e,bad,ms 的对象（重名不合并，i 为从 0 起的序号，n 为
   原上游名，其余为非负整数），t 省略 i、n 并为逐项和；仅经 resolve
-  或 resolve_edns 的直转在成功或耗尽（UpstreamTimeout/UpstreamError）
-  时原子提交，权威、缓存与 resolve_recursive 的 levels 不计；
+  resolve_edns 或 resolve_cookie 的直转在成功或耗尽（UpstreamTimeout/
+  UpstreamError）时原子提交，权威、缓存与 resolve_recursive 的 levels
+  不计；
   reset=True 先返回旧快照再清零上述计数；
   recursive_upstream_stats(reset=False) 返回 resolve_recursive 逐层
   转发的按深度统计，为顶层键序仅 l,t 的紧凑 ASCII JSON（末尾单换行）：
@@ -2268,6 +2287,193 @@ def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
     return edns(query, model, rcode, options)
 
 
+def _parse_query_cookie(opts):
+    """从版本 0 查询的 OPT 选项表解析唯一 COOKIE（码 10）。
+
+    返回 (8 字节客户端值, 0 或 16 字节服务端值)。COOKIE 缺失、重复或
+    data 长度非 8/24 一律抛 CookieError；其他选项码原样忽略。
+    """
+    parsed = None
+    for code, data in opts:
+        if code != _OPT_CODE_COOKIE:
+            continue
+        if parsed is not None:
+            raise CookieError("duplicate COOKIE option")
+        if len(data) not in (_COOKIE_CLIENT_LEN,
+                             _COOKIE_CLIENT_LEN + _COOKIE_SERVER_LEN):
+            raise CookieError("COOKIE data must be 8 or 24 bytes")
+        parsed = (data[:_COOKIE_CLIENT_LEN],
+                  data[_COOKIE_CLIENT_LEN:])
+    if parsed is None:
+        raise CookieError("query must contain exactly one COOKIE option")
+    return parsed
+
+
+def _cookie_option(secret, client_text, client_cookie):
+    """以本次 client 与 secret 计算应答 COOKIE 选项（edns_cookie 同算法）。
+
+    client_text 已由调用方校验为合法 IPv4/IPv6 文本、secret 已校验长度
+    16..64；返回 {"code","data"} 选项 dict，data 为 8 字节客户端值加
+    16 字节新算服务端值。
+    """
+    address = ipaddress.ip_address(client_text)
+    if isinstance(address, ipaddress.IPv4Address):
+        family = bytes((_FAMILY_IPV4,))
+    else:
+        family = bytes((_FAMILY_IPV6,))
+    expected = _server_cookie(secret, family, address.packed, client_cookie)
+    return {"code": _OPT_CODE_COOKIE,
+            "data": client_cookie + expected}
+
+
+def _encode_badcookie(msg, opt, client_cookie, secret, client_text,
+                      limit):
+    """服务端值不匹配时的 BADCOOKIE 应答（扩展 RCODE 23）。
+
+    回答与授权段为空，附加段只有回写正确 COOKIE 的 OPT：未压缩根
+    owner、TYPE41、回显查询 CLASS 与 DO、版本 0，TTL 高字节为
+    23>>4=1，RDATA 仅含码 10 的 8+16 字节 COOKIE；QDCOUNT=1、
+    ANCOUNT=NSCOUNT=0、ARCOUNT=1。问题段按规范化重编码（同
+    edns_cookie/BADVERS 口径）；上限 min(limit, CLASS) 的头部、问题
+    与 OPT 不可淘汰，超限抛 EncodeError 且不置 TC。
+    """
+    opt_class, _version, do, _opts = opt
+    effective_limit = min(limit, opt_class)
+    # 头部低 4 位为扩展 RCODE 23 的低 4 位（7），高字节由 OPT TTL 承载。
+    flags = (_FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+             | (_RCODE_BADCOOKIE & 0xF))
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    out += flags.to_bytes(2, "big")
+    out += (1).to_bytes(2, "big")
+    out += (0).to_bytes(4)  # ANCOUNT/NSCOUNT 均为 0
+    out += (1).to_bytes(2)  # ARCOUNT=1（仅含 COOKIE 的末项 OPT）
+    offsets = {}
+    for question in msg["questions"]:
+        _write_name(out, _normalize_name(question["name"]), offsets)
+        out += question["type"].to_bytes(2, "big")
+        out += question["class"].to_bytes(2, "big")
+    option = _cookie_option(secret, client_text, client_cookie)
+    opt_rdata = _validate_edns_options([option])
+    ttl = ((_RCODE_BADCOOKIE >> 4) << 24) | (_FLAG_DO if do else 0)
+    out += (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+            + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
+            + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
+    if len(out) > effective_limit:
+        raise EncodeError("header, question and OPT exceed limit")
+    return bytes(out)
+
+
+def _strip_query_cookie(query, msg, opt, client_cookie):
+    """把转发给上游的查询 OPT 中 COOKIE 截为仅 8 字节客户端值后重编码。
+
+    客户端侧服务端值绝不转给上游：COOKIE（码 10）只保留 8 字节客户端
+    值（原本仅有客户端值时与输入同形），其余选项（含规范 ECS）按原序
+    保留；OPT 仍为附加段唯一末项，回显 CLASS、版本 0 与 DO，RDATA
+    按调整后的选项重写。问题段以规范化名称重编码，头部 ID 与 flags
+    逐字节保留。
+    """
+    opt_class, _version, do, opts = opt
+    kept = [{"code": code,
+             "data": (client_cookie if code == _OPT_CODE_COOKIE else data)}
+            for code, data in opts]
+    opt_rdata = _validate_edns_options(kept)
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    out += msg["flags"].to_bytes(2, "big")
+    out += (1).to_bytes(2, "big")
+    out += (0).to_bytes(4)  # ANCOUNT/NSCOUNT 为 0
+    out += (1).to_bytes(2)  # ARCOUNT=1（截断 COOKIE 后仍恰一个 OPT）
+    offsets = {}
+    question = msg["questions"][0]
+    _write_name(out, _normalize_name(question["name"]), offsets)
+    out += question["type"].to_bytes(2, "big")
+    out += question["class"].to_bytes(2, "big")
+    out += (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+            + opt_class.to_bytes(2, "big")
+            + (_FLAG_DO if do else 0).to_bytes(4, "big")
+            + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
+    return bytes(out)
+
+
+def _cookie_reply_sections(reply):
+    """界定已校验可用应答的问题段结尾与末项 OPT 起点，并返回计数。
+
+    reply 已通过 _decode_edns_response 完整校验（单问题、恰一合法末项
+    OPT、无尾随、所有者压缩合法），故此处仅按同一规则界定、不重复报错。
+    返回 (question_end, opt_start, ancount, nscount, arcount)。
+    """
+    end = _reply_question_end(reply, 1)
+    ancount = int.from_bytes(reply[6:8], "big")
+    nscount = int.from_bytes(reply[8:10], "big")
+    arcount = int.from_bytes(reply[10:12], "big")
+    pos = end
+    total = ancount + nscount + arcount
+    for index in range(total):
+        start = pos
+        while True:
+            length = reply[pos]
+            if length & 0xC0 == 0xC0:
+                pos += 2
+                break
+            pos += 1
+            if length == 0:
+                break
+            pos += length
+        pos += 8
+        rdlength = int.from_bytes(reply[pos:pos + 2], "big")
+        pos += 2 + rdlength
+        if index == total - 1:
+            opt_start = start
+    return end, opt_start, ancount, nscount, arcount
+
+
+def _rewrite_cookie_reply(reply, msg, opt, ecs, secret, client_text,
+                          client_cookie, limit):
+    """把可用上游 EDNS 应答重写为回写本次 COOKIE 的最终应答。
+
+    回答、授权段与附加段普通 RR 逐字节取自 reply（所有者允许压缩，仅
+    界定不重编码）；末项 OPT 替换为新编码：CLASS 与 DO 回显本次查询
+    OPT、版本 0、扩展 RCODE 0，选项按固定顺序仅含规范 ECS（查询有
+    ECS 时）与末项 COOKIE，其余选项不回显。重写后总长度须不超
+    min(limit, 查询 OPT CLASS)，否则抛 EncodeError（调用方按不可用
+    应答处理）。头部 ID、flags 与三段计数逐字节取自 reply，问题段以
+    规范化名称重编码。
+    """
+    opt_class, _version, do, _query_opts = opt
+    effective_limit = min(limit, opt_class)
+    end, opt_start, ancount, nscount, arcount = _cookie_reply_sections(reply)
+    body = bytes(reply[end:opt_start])
+    options = []
+    if ecs is not None:
+        family, source, address = ecs
+        options.append({"code": _OPT_CODE_ECS,
+                        "data": _encode_ecs_option(family, source, source,
+                                                   address)})
+    options.append(_cookie_option(secret, client_text, client_cookie))
+    opt_rdata = _validate_edns_options(options)
+    new_opt = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+               + opt_class.to_bytes(2, "big")
+               + (_FLAG_DO if do else 0).to_bytes(4, "big")
+               + len(opt_rdata).to_bytes(2, "big") + opt_rdata)
+    head = bytearray()
+    head += reply[0:2]
+    head += reply[2:4]
+    head += (1).to_bytes(2, "big")
+    head += ancount.to_bytes(2, "big")
+    head += nscount.to_bytes(2, "big")
+    head += arcount.to_bytes(2, "big")
+    question = msg["questions"][0]
+    offsets = {}
+    _write_name(head, _normalize_name(question["name"]), offsets)
+    head += question["type"].to_bytes(2, "big")
+    head += question["class"].to_bytes(2, "big")
+    rewritten = bytes(head) + body + new_opt
+    if len(rewritten) > effective_limit:
+        raise EncodeError("response exceeds effective limit")
+    return rewritten
+
+
 def edns_padded(query: bytes, model: dict, block: int = 128,
                 rcode: int = 0) -> bytes:
     """把（可含 OPT 的）查询报文编码为 EDNS(0) Padding（选项码 12）应答。
@@ -2836,16 +3042,20 @@ def _encode_plan(query, rcode, an, ns, limit, ecs=None, ar=None,
 
 
 def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
-                      authoritative=True, units=None):
+                      authoritative=True, units=None, extra_options=None):
     """把完整应答计划按 edns 契约编码为应答报文（查询含 OPT 时末项回显）。
 
     ar 为权威计划确定性生成的地址附加记录，置于应答 OPT 之前，OPT 仍
     为附加段唯一末项；None 按空附加段处理。ecs 非 None 时应答 OPT 仅
     回写该 ECS（码 8）选项：family、source 不变，scope=source，
-    address 同查询；查询携带的其他选项不回显。authoritative 为假时
-    编码非权威转介（QR 置一、AA 清零）。units 为 (an,ns,ar) 三段各自
-    的自动随附 RRSIG 位置集合（仅 DO=1 权威路径传入）；其余路径恒为
-    None，输出与既有逐字节相同。
+    address 同查询；查询携带的其他选项不回显。extra_options 非 None
+    时（仅供 Resolver.resolve_cookie）追加在规范 ECS 之后，按给定
+    顺序编码（COOKIE 路径下恰为末项 COOKIE）；其元素契约同
+    _validate_edns_options，非法时由 _edns_core 抛 TypeError/
+    EncodeError，不改变缓存状态。authoritative 为假时编码非权威转介
+    （QR 置一、AA 清零）。units 为 (an,ns,ar) 三段各自的自动随附
+    RRSIG 位置集合（仅 DO=1 权威路径传入）；其余路径恒为 None，输出
+    与既有逐字节相同。
     """
     model = {
         "an": [_rr_to_model(rr) for rr in an],
@@ -2854,11 +3064,15 @@ def _encode_plan_edns(query, rcode, an, ns, limit, ecs=None, ar=None,
         "limit": limit,
     }
     options = None
-    if ecs is not None:
-        family, source, address = ecs
-        options = [{"code": _OPT_CODE_ECS,
-                    "data": _encode_ecs_option(family, source, source,
-                                               address)}]
+    if ecs is not None or extra_options is not None:
+        options = []
+        if ecs is not None:
+            family, source, address = ecs
+            options.append({"code": _OPT_CODE_ECS,
+                            "data": _encode_ecs_option(family, source, source,
+                                                       address)})
+        if extra_options is not None:
+            options.extend(extra_options)
     return _edns_core(query, model, rcode, options,
                       authoritative=authoritative, units=units)
 
@@ -4841,7 +5055,8 @@ class PositiveCache:
         return self._resolve_cached(msg, query, now, limit, _encode_plan)
 
     def resolve_edns(self, query: bytes, now: int,
-                     limit: int = 65535) -> tuple[bytes, bool]:
+                     limit: int = 65535, extra_options=None
+                     ) -> tuple[bytes, bool]:
         """处理含一个 OPT 的单问题查询，返回 (应答报文, 是否命中)。
 
         query 非 bytes 抛 TypeError；QDCOUNT 非 1 或 QR 置位抛
@@ -4865,7 +5080,14 @@ class PositiveCache:
         查询含 ECS 时 OPT 仅回写码 8（family、source 不变，
         scope=source，address 同查询，其他选项不回显），ECS 使报文超
         min(limit,OPT CLASS) 抛 EncodeError；异常不改变缓存、统计或
-        最后时刻，成功原子提交；无 ECS 时应答与既有输出逐字节相同。
+        最后时刻，成功原子提交；extra_options 为 None（默认，公开
+        resolve_edns 口径）时应答与既有逐字节相同。
+
+        extra_options 非 None（仅供 Resolver.resolve_cookie 内部传入）
+        时为已校验的应答选项 dict 列表，按原序追加在规范 ECS 之后
+        （COOKIE 路径下恰为末项 COOKIE）；不影响缓存键与缓存内容，
+        仅在命中后以本次 now 衰减 TTL 的重编码中出现；其编码失败抛
+        TypeError/EncodeError 且不改变缓存、统计或最后时刻。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
@@ -4896,10 +5118,11 @@ class PositiveCache:
         if self._last_now is not None and now < self._last_now:
             raise CacheError("now must be non-negative and monotonic")
         return self._resolve_cached(msg, query, now, limit,
-                                    _encode_plan_edns, ecs, do=opt[2])
+                                    _encode_plan_edns, ecs, do=opt[2],
+                                    extra_options=extra_options)
 
     def _resolve_cached(self, msg, query, now, limit, encode_plan,
-                        ecs=None, do=False):
+                        ecs=None, do=False, extra_options=None):
         """resolve/resolve_edns 共用的缓存查找、计划应答与原子提交。
 
         msg 为已解码且通过可应答性检查的单问题报文；encode_plan 为
@@ -4912,12 +5135,16 @@ class PositiveCache:
         类型匹配的区域原序 RRSIG，与 ECS 共同分区，并以位置集合把
         自动随附签名与被覆盖 RRset 标为同一淘汰单元；显式 RRSIG/ANY
         查询保留现有选择与区域顺序，do=False 完全不随附，输出逐字节
-        同基线。
+        同基线。extra_options 非 None（仅 resolve_cookie 的 EDNS 编码
+        路径）时追加在规范 ECS 之后编码，但不进入缓存键与缓存内容。
         """
         question = msg["questions"][0]
         partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
         key = (question["name"], question["type"], question["class"],
                do, partition)
+        # COOKIE 等额外选项只参与本次编码，缓存键与缓存内容均不含之。
+        extra_kwargs = ({"extra_options": extra_options}
+                        if extra_options is not None else {})
 
         def units_for(an_signed=(), ns_signed=()):
             # 自动随附位置 -> 段淘汰单元标记；无随附的段沿用现有口径。
@@ -4944,7 +5171,8 @@ class PositiveCache:
                 # 命中也不改变插入次序。
                 response = encode_plan(query, 0, aged, [], limit, ecs,
                                        ar=aged_ar,
-                                       units=units_for(an_signed, ()))
+                                       units=units_for(an_signed, ()),
+                                       **extra_kwargs)
                 # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                 self._stats_h[0] += 1
                 self._last_now = now
@@ -4976,7 +5204,7 @@ class PositiveCache:
                         and do else frozenset()
                     response = encode_plan(
                         query, rcode, [], aged_ns, limit, ecs,
-                        units=units_for((), ns_signed))
+                        units=units_for((), ns_signed), **extra_kwargs)
                     # 统计、时钟仅在成功返回时原子提交；命中不重排 FIFO。
                     # neg_key 首项区分 NXDOMAIN（h[1]）与 NODATA（h[2]）。
                     self._stats_h[1 if neg_key[0] == "nxdomain" else 2] += 1
@@ -5012,7 +5240,7 @@ class PositiveCache:
         # 先编码成功再落条目，保证编码失败不改变任何状态（含统计与时钟）。
         response = encode_plan(query, rcode, an, ns, limit, ecs,
                                ar=ar_glue, authoritative=authoritative,
-                               units=units)
+                               units=units, **extra_kwargs)
         # 编码已成功：到期清理、新条目、统计与时钟随成功返回原子提交。
         # 分类按未截断完整计划，故截断不改变 m 的分类。
         if expired is not None:
@@ -5326,13 +5554,16 @@ def _matching_edns_reply(query, reply, max_len):
     return True
 
 
-def forward_edns(query, plan, now, timeout, max_len):
+def forward_edns(query, plan, now, timeout, max_len, match=None):
     """按 plan 顺序模拟向上游转发含 OPT 的 query，时序与 forward 一致。
 
     候选 reply 除 forward 的问题一致要求外，还须恰含一个合法末项 OPT
     且总长度不超 max_len，否则按不可用应答继续尝试；全部超时抛
     UpstreamTimeout，存在非超时失败但无可用应答抛 UpstreamError。
-    成功返回 (reply, name, 结束时刻)。
+    成功返回 (reply, name, 结束时刻)。match 非 None 时以
+    match(reply) 替代 _matching_edns_reply 判定（Resolver.resolve_cookie
+    额外要求以本次 COOKIE 重写后不超有效上限），与
+    _upstream_forward_counts 的逐事件计数共用同一判定。
     """
     _check_non_negative_int(now, "now")
     _check_int(timeout, "timeout")
@@ -5341,6 +5572,9 @@ def forward_edns(query, plan, now, timeout, max_len):
     _check_int(max_len, "max_len")
     if max_len < 0:
         raise ValueError("max_len must be non-negative")
+    acceptable = (match if match is not None
+                  else (lambda reply: _matching_edns_reply(
+                      query, reply, max_len)))
     items = _validate_plan(plan)
     clock = now
     saw_timeout = False
@@ -5352,8 +5586,7 @@ def forward_edns(query, plan, now, timeout, max_len):
                 clock += timeout
                 continue
             clock += delay
-            if reply is not None and _matching_edns_reply(
-                    query, reply, max_len):
+            if reply is not None and acceptable(reply):
                 return reply, name, clock
             saw_other = True
     if saw_timeout and not saw_other:
@@ -6390,6 +6623,32 @@ class Resolver:
     与上游计划必须产生逐字节相同的应答与统计，单次调用最多检查现有
     上游及其允许的事件数，不新增无界状态。
 
+    resolve_cookie(query, client, secret, now, limit=65535)：处理携带
+    唯一版本 0 OPT 且恰含一个 COOKIE 的 EDNS 查询，返回与 resolve_edns
+    同形的四元组。query、now、limit 的报文、EDNS、时钟及编码校验沿用
+    resolve_edns；secret 非 bytes、client 非 str、now/limit 类型错抛
+    TypeError；OPT 版本非 0、COOKIE 缺失/重复/data 长度非 8 或 24、
+    secret 长度非 16..64、client 非合法 IPv4/IPv6 抛 CookieError，其余
+    报文/EDNS/时钟/编码错误沿用 MessageError、EDNSError、CacheError 与
+    EncodeError。COOKIE 服务端值算法（IPv4 family 0x04、IPv6 0x06、
+    HMAC-SHA256 前 16 字节）沿用 edns_cookie。仅有客户端值或服务端值
+    匹配时解析结果、来源、结束时刻、命中标记与有效长度上限
+    min(limit, OPT CLASS) 沿用 resolve_edns：COOKIE 不进入缓存键与缓存
+    内容，现有 ECS 与 DO 分区仍生效，区内命中后按 now 衰减 TTL 再以
+    本次 client、secret 生成 COOKIE，追加在规范 ECS（若有）之后；区外
+    查询先剥除 OPT 中的客户端侧服务端值（不转给上游，其余选项含 ECS
+    保留），候选应答按现有 EDNS 规则（问题一致、恰一合法末项 OPT、不
+    超有效上限）校验，且以本次 COOKIE 重写后仍不超有效上限，否则按不
+    可用应答继续尝试；最终 OPT 按固定顺序只含规范 ECS（若有）与末项
+    COOKIE，其他选项不回显。服务端值存在但不匹配时在访问区域、缓存、
+    时钟、统计与上游前直接返回 (BADCOOKIE 应答, "cookie", now,
+    False)：扩展 RCODE 23，回答与授权段为空，附加段仅含回写正确
+    COOKIE 的 OPT（回显 CLASS 与 DO）。完整校验前不改变状态，BADCOOKIE
+    与任何异常都不改变缓存、FIFO、最后时刻或统计；正常成功与上游耗尽
+    按 resolve_edns 口径原子提交，最终编码把 OPT 视为不可淘汰项，在
+    min(limit, OPT CLASS) 内沿用 RRset 原子截断与 TC 规则；同状态同
+    输入逐字节一致。
+
     resolve_authorized(query, client, rules, now, limit=512,
     default="deny")：授权匹配、TypeError 与 PolicyError 沿用 authorize，
     其余校验及异常沿用 resolve，全部校验通过后方可改变状态。放行时
@@ -6476,11 +6735,13 @@ class Resolver:
     序号，n 为原上游名，其余为非负整数（a 尝试、s 成功、to 超时、
     e 无应答、bad 应答未通过匹配、ms 模拟耗时累计；每个上游仅取前
     2 个事件，无事件不计）。t 省略 i、n，余键同序并为逐项和。仅经
-    resolve 或 resolve_edns 进入该 plan 的直转计数（权威、缓存与
-    resolve_recursive 的 levels 不计），直转成功或耗尽抛
-    UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
+    resolve、resolve_edns 或 resolve_cookie 进入该 plan 的直转计数
+    （权威、缓存与 resolve_recursive 的 levels 不计），直转成功或耗尽
+    抛 UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交。
     resolve_edns 的候选除问题一致外还须恰含一个合法末项 OPT 且不超
-    有效上限，否则记 bad；reset 非 bool 抛 TypeError 且无变化；
+    有效上限，否则记 bad；resolve_cookie 的候选在此之外还须以本次
+    COOKIE 重写后不超有效上限，否则同样记 bad；reset 非 bool 抛
+    TypeError 且无变化；
     False 只读，True 先返回旧快照再清零上述计数，plan、缓存、时钟
     及其他统计不变。
 
@@ -6796,7 +7057,8 @@ class Resolver:
         self._rated_e = [0, 0]
         self._rated_l = [0, 0, 0, 0]
         # upstream_stats 的逐上游计数：与 plan 位置一一对应（重名不合并），
-        # 每项为 [a, s, to, e, bad, ms]，仅经 resolve/resolve_edns 的直转
+        # 每项为 [a, s, to, e, bad, ms]，仅经 resolve/resolve_edns/
+        # resolve_cookie 的直转
         # 在成功返回或耗尽（UpstreamTimeout/UpstreamError）时原子提交。
         self._upstream_stats = [[0, 0, 0, 0, 0, 0] for _ in self._plan]
         # recursive_upstream_stats 的按深度计数：固定 16 行，索引对应递归
@@ -6983,6 +7245,158 @@ class Resolver:
         self._sync_stats_c0()
         self._last_end = end
         return reply, name, end, False
+
+    def resolve_cookie(self, query: bytes, client: str, secret: bytes,
+                       now: int, limit: int = 65535
+                       ) -> tuple[bytes, str, int, bool]:
+        """处理携带唯一版本 0 OPT 且恰含一个 COOKIE 的 EDNS 查询。
+
+        返回与 resolve_edns 同形的四元组 (应答报文, 来源, 结束时刻,
+        是否命中)。query、now、limit 的报文/EDNS/时钟/编码校验及异常
+        沿用 resolve_edns（OPT 缺失为 EDNSError）；secret 非 bytes 或
+        client 非 str 抛 TypeError；OPT 版本非 0、COOKIE 缺失、重复或
+        data 长度非 8/24、secret 长度非 16..64、client 非合法
+        IPv4/IPv6 抛 CookieError。COOKIE 只能为 8 字节客户端值，或
+        8 字节客户端值后接 16 字节服务端值；服务端值算法（IPv4
+        family 0x04、IPv6 0x06、HMAC-SHA256 前 16 字节）沿用
+        edns_cookie。
+
+        仅有客户端值或服务端值匹配时，解析结果、来源、结束时刻、命中
+        标记与有效长度上限 min(limit, OPT CLASS) 沿用 resolve_edns：
+        区内查询走权威正/负缓存，现有 ECS 与 DO 分区仍生效，COOKIE 不
+        进入缓存键和缓存内容，命中后按 now 衰减 TTL，再以本次 client
+        和 secret 生成 COOKIE 追加在规范 ECS（若有）之后；区外查询不
+        得把客户端侧服务端值转给上游（转发查询的 OPT 剥除 COOKIE、
+        保留其余选项与 ECS），候选应答按现有 EDNS 规则校验（问题一致、
+        恰一合法末项 OPT、不超有效上限），最终 OPT 以查询 CLASS 与 DO
+        按固定顺序只含规范 ECS（若有）和末项 COOKIE，其他选项不回显，
+        重写后超有效上限的候选按不可用应答继续尝试。
+
+        服务端值存在但不匹配时立即返回 (BADCOOKIE 应答, "cookie",
+        now, False)：扩展 RCODE 23，回答与授权段为空，附加段只有回写
+        正确 COOKIE 的 OPT，且不访问区域、缓存或上游。完整校验前不
+        改变状态；BADCOOKIE 与任何异常都不改变缓存、FIFO、最后时刻或
+        统计；正常成功与上游耗尽按 resolve_edns 口径原子提交。最终
+        编码把 OPT 视为不可淘汰项，在 min(limit, OPT CLASS) 内沿用
+        RRset 原子截断与 TC 规则；同状态同输入逐字节一致。
+        """
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if now < 0:
+            raise CacheError("now must be non-negative and monotonic")
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        # 参数类型错误（secret/client）先于报文与值域校验，与 edns_cookie
+        # 的类型优先口径一致。
+        if not isinstance(secret, bytes):
+            raise TypeError("secret must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        _check_int(limit, "limit")
+        if (int.from_bytes(query[2:4], "big") & 0x8000
+                or int.from_bytes(query[4:6], "big") != 1
+                or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+            raise EncodeError("query or limit not answerable")
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
+        if opt[1] != 0:
+            # COOKIE 仅定义于 EDNS 版本 0：版本非 0 为非法 COOKIE 查询，
+            # 不走 BADVERS，先于一切状态访问抛 CookieError。
+            raise CookieError("OPT version must be 0")
+        # ECS 与 COOKIE 校验均先于区域、缓存、时钟与上游访问。
+        ecs = _parse_query_ecs(opt[3])
+        client_cookie, server_cookie = _parse_query_cookie(opt[3])
+        if not _MIN_COOKIE_SECRET_LEN <= len(secret) <= _MAX_COOKIE_SECRET_LEN:
+            raise CookieError("secret length must be 16..64 bytes")
+        try:
+            ipaddress.ip_address(client)
+        except ValueError:
+            raise CookieError(
+                "client must be a valid IPv4/IPv6 address") from None
+        cookie_option = _cookie_option(secret, client, client_cookie)
+        if server_cookie:
+            expected = cookie_option["data"][_COOKIE_CLIENT_LEN:]
+            if not hmac.compare_digest(server_cookie, expected):
+                # 不匹配：不访问区域、缓存、时钟、统计与上游，立即以
+                # BADCOOKIE 应答；编码失败抛 EncodeError，状态不变。
+                response = _encode_badcookie(msg, opt, client_cookie,
+                                             secret, client, limit)
+                return response, "cookie", now, False
+        # 服务端值缺失或匹配：时钟单调性沿用 resolve_edns。
+        if self._last_end is not None and now < self._last_end:
+            raise CacheError("now must be non-negative and monotonic")
+        question = msg["questions"][0]
+        origin = self._cache._origin
+        effective_limit = min(limit, opt[0])
+        if _name_in_origin(question, origin, self._cache._zone_class):
+            # 区内：缓存查找、TTL 衰减、ECS/DO 分区与统计提交完全沿用
+            # resolve_edns；COOKIE 仅作为额外选项参与本次编码，不入键、
+            # 不入缓存内容。
+            expired = self._authority_miss_expired(
+                question, now, ecs, do=opt[2])
+            response, hit = self._cache.resolve_edns(
+                query, now, limit, extra_options=[cookie_option])
+            self._fold_authority_cleanup()
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
+            self._sync_stats_c0()
+            self._last_end = now
+            return response, "authority", now, hit
+        # 区外：COOKIE 截为仅 8 字节客户端值（客户端侧服务端值绝不离开
+        # 本解析器），其余选项（含 ECS）原样保留后再转发。候选除现有
+        # EDNS 规则外，重写回写 COOKIE 后还须不超有效上限。
+        forward_query = _strip_query_cookie(query, msg, opt, client_cookie)
+
+        def acceptable(reply):
+            if not _matching_edns_reply(forward_query, reply,
+                                       effective_limit):
+                return False
+            try:
+                _rewrite_cookie_reply(reply, msg, opt, ecs, secret, client,
+                                      client_cookie, limit)
+            except EncodeError:
+                return False
+            return True
+
+        plan = self._forward_plan()
+        upstream_counts = _upstream_forward_counts(
+            plan, forward_query, self._timeout, match=acceptable)
+        try:
+            reply, name, end = forward_edns(
+                forward_query, plan, now, self._timeout, effective_limit,
+                match=acceptable)
+        except UpstreamTimeout:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[1] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        except UpstreamError:
+            self._commit_upstream_counts(upstream_counts)
+            self._stats_u[2] += 1
+            self._stats_l[_duration_bucket(
+                _plan_total_elapsed(plan, self._timeout),
+                self._timeout)] += 1
+            self._sync_stats_c0()
+            raise
+        # 已在候选匹配时验证可重写；此处重写不改变逐字节结果。
+        response = _rewrite_cookie_reply(reply, msg, opt, ecs, secret,
+                                         client, client_cookie, limit)
+        self._commit_upstream_counts(upstream_counts)
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._sync_stats_c0()
+        self._last_end = end
+        return response, name, end, False
 
     def resolve_authorized(self, query: bytes, client: str, rules: list,
                            now: int, limit: int = 512,
@@ -8116,11 +8530,12 @@ class Resolver:
         即 a 加 1，delay>timeout 时 to 加 1、ms 加 timeout，否则 ms 加
         delay 后按 reply 为 None/未通过匹配/通过分别计 e/bad/s（通过即
         停），无事件的上游不计。t 省略 i、n，余键同序并为逐项和。
-        仅经 resolve 或 resolve_edns 进入该 plan 的直转计数（权威、
-        缓存与 resolve_recursive 的 levels 不计），直转成功或耗尽抛
-        UpstreamTimeout/UpstreamError 时原子提交，其他异常不提交；
-        resolve_edns 候选须额外通过恰一合法末项 OPT 与有效长度上限
-        校验，否则记 bad。
+        仅经 resolve、resolve_edns 或 resolve_cookie 进入该 plan 的直转
+        计数（权威、缓存与 resolve_recursive 的 levels 不计），直转成功
+        或耗尽抛 UpstreamTimeout/UpstreamError 时原子提交，其他异常不
+        提交；resolve_edns 候选须额外通过恰一合法末项 OPT 与有效长度
+        上限校验，否则记 bad；resolve_cookie 候选在此之外还须以本次
+        COOKIE 重写后不超有效上限，否则同样记 bad。
         reset 非 bool 抛 TypeError 且无变化；False 只读，重复调用逐
         字节相同；True 先返回旧快照再清零上述计数，plan、缓存、时钟
         及其他统计不变。同初态同调用序列逐字节一致。
