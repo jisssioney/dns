@@ -211,7 +211,28 @@
   TypeError，解析成功后以应答与结束时刻调用一次 limiter.respond：
   放行保留原来源并返回两维余量，拒绝时来源为 "response-rate"、
   响应余量 0，truncate 真返回 TC 截断报文、假返回 None；
-  rated_stats(reset=False) 返回 resolve_rated 的确定性统计，为
+  resolve_rated_edns(query, client, policy, limiter, now,
+  limit=65535, default="deny", truncate=True) 是 resolve_rated 的
+  EDNS 变体：仅接受单问题且附加段末项恰有一个合法 OPT 的查询，
+  校验与有效上限 min(limit,OPT CLASS) 沿用 resolve_edns（类型错误
+  TypeError，client/策略错误 PolicyError，报文、选项或尾随字节错误
+  EDNSError，时钟回退 CacheError，上限内无法编码 EncodeError）；
+  OPT 版本非零时在访问策略、限流器、区域、缓存与上游前返回同
+  resolve_edns 的 BADVERS，后五值 "edns",now,false,-1,-1，状态
+  不变且不计数。版本 0 查询剥去 OPT 后匹配 ACL 与查询配额，使仅
+  UDP 大小、DO、ECS 或其他选项不同的同一问题共用键；两类拒绝均
+  返回确定性 EDNS REFUSED（保留 ID 与问题，回答与授权为空，附加
+  段仅一个末项 OPT，CLASS 取查询 UDP 大小，扩展返回码与版本为零、
+  仅 DO 位、RDATA 为空），ACL 拒绝后五值 "policy",now,false,-1,-1，
+  配额拒绝为 "rate",now,false,0,-1，均不解析，拒绝报文超有效上限
+  在扣减配额前抛 EncodeError；放行后仅一次 resolve_edns、成功后仅
+  一次 limiter.respond_edns，响应放行保留来源/结束时刻/命中并返回
+  两维余量，拒绝来源 "response-rate"、保留结束时刻/命中/查询余量、
+  响应余量 0，truncate 真为含问题与 OPT 的 TC 报文、假为 None；
+  解析异常耗查询配额但不计响应配额，响应限流异常不回滚解析与查询
+  计数；
+  rated_stats(reset=False) 返回 resolve_rated 与 resolve_rated_edns
+  共用的确定性统计，为
   仅含键序 o,e,l 的紧凑 ASCII JSON（末尾单换行），值为非负十进制
   整数数组：o 四项依次计 policy 拒绝、query-rate 拒绝、
   response-rate 拒绝与响应放行；e 两项依次计查询放行后 resolve
@@ -2907,6 +2928,38 @@ def _encode_policy_refusal(query, limit):
     out += question["class"].to_bytes(2, "big")
     if len(out) > limit:
         raise EncodeError("header and question exceed limit")
+    return bytes(out)
+
+
+def _encode_edns_policy_refusal(msg, opt_class, do, effective_limit):
+    """把已解码的版本 0 EDNS 查询编码为确定性 REFUSED 拒绝应答。
+
+    保留 ID 并按规范化重编码问题段；flags 为
+    0x8400|(查询 flags&0x7910)|5，QDCOUNT=1，ANCOUNT=NSCOUNT=0、
+    ARCOUNT=1；附加段仅一个末项 OPT：未压缩根 owner、TYPE41、CLASS
+    取查询 UDP 大小（OPT CLASS），TTL 为扩展返回码 0、版本 0、仅 DO
+    位，RDLENGTH=0（不回显任何查询选项）。总长超 effective_limit 抛
+    EncodeError。
+    """
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    flags = (_FLAGS_RESPONSE | (msg["flags"] & _FLAGS_KEPT)
+             | _RCODE_REFUSED)
+    out += flags.to_bytes(2, "big")
+    out += (1).to_bytes(2, "big")
+    out += (0).to_bytes(4)  # ANCOUNT/NSCOUNT 均为 0
+    out += (1).to_bytes(2, "big")
+    offsets = {}
+    for question in msg["questions"]:
+        _write_name(out, _normalize_name(question["name"]), offsets)
+        out += question["type"].to_bytes(2, "big")
+        out += question["class"].to_bytes(2, "big")
+    ttl = _FLAG_DO if do else 0
+    out += (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+            + opt_class.to_bytes(2, "big") + ttl.to_bytes(4, "big")
+            + (0).to_bytes(2, "big"))
+    if len(out) > effective_limit:
+        raise EncodeError("header, question and OPT exceed limit")
     return bytes(out)
 
 
@@ -6770,18 +6823,41 @@ class Resolver:
     "response-rate"，end/hit 保留，truncate 真返回 TC、假返回
     None，响应余量 0。两维各计数；同初态同序列逐字节一致。
 
-    rated_stats(reset=False)：resolve_rated 的确定性统计，返回仅含
+    resolve_rated_edns(query, client, policy, limiter, now,
+    limit=65535, default="deny", truncate=True)：resolve_rated 的 EDNS
+    变体，参数与六元组同 resolve_rated。仅接受单问题且附加段末项恰有
+    一个合法 OPT 的 EDNS 查询，校验、有效上限 min(limit,OPT CLASS)
+    与异常类型（TypeError/PolicyError/EDNSError/CacheError/EncodeError）
+    同 resolve_edns；OPT 版本非零时在访问策略、限流器、区域、缓存与
+    上游前返回与 resolve_edns 相同的 BADVERS，后五值
+    "edns",now,False,-1,-1，状态不变且不计数。版本 0 查询剥去 OPT
+    后匹配 ACL 与查询配额，使仅 UDP 大小/DO/ECS/其他选项不同的同一
+    问题共用键；ACL 与查询配额拒绝均返回确定性 EDNS REFUSED（ID 与
+    问题保留，回答授权为空，附加段仅末项 OPT，CLASS 取查询 UDP 大小，
+    扩展返回码与版本零、仅 DO 位、RDATA 空），ACL 拒绝后五值
+    "policy",now,False,-1,-1、配额拒绝 "rate",now,False,0,-1，均不
+    解析；拒绝报文超有效上限在扣减配额前抛 EncodeError。放行后仅一次
+    resolve_edns、成功后仅一次 respond_edns：响应放行保留来源/结束
+    时刻/命中并返回两维余量，拒绝来源 "response-rate"、保留结束时刻/
+    命中/查询余量、响应余量 0，truncate 真为含问题与 OPT 的 TC 报文、
+    假为 None。解析异常耗查询配额但不计响应配额，响应限流异常不回滚
+    解析与查询计数；出口、异常与上游耗时并入 resolve_rated 共用的
+    rated_stats o/e/l 计数，BADVERS 与前置/编码异常不计；现有公开入口
+    与逐字节行为不变。
+
+    rated_stats(reset=False)：resolve_rated 与 resolve_rated_edns
+    共用的确定性统计，返回仅含
     键序 o,e,l 的紧凑 ASCII JSON（末尾单换行），值为非负十进制整数
     数组。o 四项依次计 policy 拒绝、query-rate 拒绝、response-rate
-    拒绝与响应放行；e 两项依次计查询放行后 resolve 异常、解析成功
-    后 limiter.respond 异常（异常仍传播，原子计一次，既有双方状态
-    语义不变）；l 四项按实际上游耗时 0、1..timeout、
+    拒绝与响应放行；e 两项依次计查询放行后 resolve/resolve_edns 异常、
+    解析成功后 limiter.respond/respond_edns 异常（异常仍传播，原子计
+    一次，既有双方状态语义不变）；l 四项按实际上游耗时 0、1..timeout、
     timeout+1..2*timeout、>2*timeout 分桶，仅实际上游成功或耗尽时
-    各记一桶，权威、缓存及未访问上游不计。每次 resolve_rated 调用
-    只增加一个 o 或 e；前置参数、授权、查询限流或拒绝报文编码异常
-    不计。reset 非 bool 抛 TypeError 且状态不变；False 只读，重复
-    调用逐字节相同；True 先返回旧快照再清零十项计数，其余状态与
-    stats() 不变。
+    各记一桶，权威、缓存及未访问上游不计。每次 resolve_rated 或
+    resolve_rated_edns 调用只增加一个 o 或 e；前置参数、授权、查询
+    限流、BADVERS 或拒绝报文编码异常不计。reset 非 bool 抛
+    TypeError 且状态不变；False 只读，重复调用逐字节相同；True 先
+    返回旧快照再清零十项计数，其余状态与 stats() 不变。
 
     resolve_recursive(query, levels, now, limit=512, stale_window=0)：
     域内查询沿用 resolve（stale_window 不参与校验、行为不变）；域外线
@@ -7636,6 +7712,122 @@ class Resolver:
         # 响应配额拒绝：解析器已提交，不回滚、不重算、不再访上游；来源
         # 改为 "response-rate"，end/hit 保留，truncate 真为 TC 报文、
         # 假为 None，响应余量为 0。
+        self._rated_o[2] += 1
+        return wire, "response-rate", end, hit, qleft, 0
+
+    def resolve_rated_edns(self, query: bytes, client: str, policy: list,
+                           limiter, now: int, limit: int = 65535,
+                           default: str = "deny", truncate: bool = True
+                           ) -> tuple[bytes | None, str, int, bool, int, int]:
+        """EDNS 版组合入口：ACL、查询/响应双维限流与 resolve_edns。
+
+        参数与六元组返回值沿用 resolve_rated：
+        (应答报文或 None, 来源, 结束时刻, 是否命中, 查询余量, 响应余量)，
+        limit 默认 65535。仅接受单问题且附加段末项恰有一个合法 OPT 的
+        EDNS 查询，报文、OPT、ECS、now、limit 的范围及异常类型与
+        resolve_edns 一致，有效长度上限为 min(limit, OPT CLASS)。
+        类型错误抛 TypeError，client 或策略错误抛 PolicyError，报文、
+        选项或尾随字节非法抛 EDNSError，时钟回退抛 CacheError，应答无法
+        在有效上限内编码抛 EncodeError。
+
+        OPT 版本非零时，在访问策略、限流器、区域、缓存与上游前直接返回
+        与 resolve_edns 相同的 BADVERS 应答，后五值为 "edns",now,
+        False,-1,-1；BADVERS 不访问任何状态、不计 rated_stats。
+
+        版本 0 查询先剥去末项 OPT（仅留头部与问题段）再匹配 ACL 与查询
+        配额，使仅 UDP 大小、DO、ECS 或其他选项不同的同一问题共用键。
+        ACL 或查询配额拒绝均返回确定性 EDNS REFUSED：保留 ID 与问题，
+        回答与授权段为空，附加段仅一个末项 OPT，其 CLASS 取查询 UDP
+        大小，扩展返回码与版本为零、仅保留 DO 位、RDATA 为空，受有效
+        上限约束。ACL 拒绝不调用 limiter、不解析，后五值为
+        "policy",now,False,-1,-1；查询配额拒绝不解析，后五值为
+        "rate",now,False,0,-1；拒绝报文在扣减配额前编码，超有效上限抛
+        EncodeError，解析器与 limiter 均不变。
+
+        放行后仅调用一次 resolve_edns，成功后仅调用一次
+        respond_edns（以解析结束时刻为时钟）。响应放行保留解析来源、
+        结束时刻与命中标记并返回查询、响应两种余量；响应拒绝不回滚
+        解析与查询计数，来源改为 "response-rate"，结束时刻与命中标记
+        及查询余量保留，响应余量为 0，truncate 为真返回 respond_edns
+        规定的含问题与末项 OPT 的 TC 报文，为假返回 None。解析异常
+        消耗查询配额但不计响应配额，响应限流异常不回滚解析与查询
+        计数。出口、异常及上游耗时与 resolve_rated 共用 rated_stats
+        的 o/e/l 十项计数；BADVERS、前置参数与拒绝报文编码异常不计。
+        """
+        # limiter 与 truncate 的类型最先判定。
+        if not isinstance(limiter, RateLimiter):
+            raise TypeError("limiter must be a RateLimiter")
+        if not isinstance(truncate, bool):
+            raise TypeError("truncate must be bool")
+        # EDNS 入参/报文/OPT/ECS 校验须先于策略、限流器、区域、缓存与
+        # 上游访问：版本非 0 在此即返回 BADVERS（不校验 ECS、不判时钟
+        # 回退），与 resolve_edns 逐字节一致，且不计任何统计。
+        msg, opt, _ecs, badvers = _check_resolve_edns_inputs(
+            query, now, limit, self._last_end)
+        if badvers is not None:
+            return badvers, "edns", now, False, -1, -1
+        opt_class, _version, do, _query_opts = opt
+        effective_limit = min(limit, opt_class)
+        # 剥去末项 OPT 后的纯报文：ACL 与查询/响应配额仅以头部与问题段
+        # 为键，UDP 大小、DO、ECS 或其他选项不同的同一问题共用键
+        # （respond_edns 内部按同一方式剥除 OPT 计响应配额）。
+        query_end = _reply_question_end(query, 1)
+        plain = (query[0:10] + b"\x00\x00"
+                 + query[_MIN_MESSAGE_LEN:query_end])
+        # 授权优先：其 TypeError、PolicyError 与报文异常原样传播，此时
+        # 不触碰 limiter。
+        allowed = authorize(plain, client, policy, default)
+        if not allowed:
+            # ACL 拒绝：确定性 EDNS REFUSED 先编码成功（超有效上限抛
+            # EncodeError），不调用 limiter、不解析，双方状态均不变。
+            response = _encode_edns_policy_refusal(
+                msg, opt_class, do, effective_limit)
+            self._rated_o[0] += 1
+            return response, "policy", now, False, -1, -1
+        # 查询配额可能返回的 REFUSED 只取决于查询、OPT CLASS/DO 与有效
+        # 上限：先编码成功再调用 allow，保证超限时 limiter 未被调用、
+        # 解析器未改变（双方不变）。
+        refusal = _encode_edns_policy_refusal(
+            msg, opt_class, do, effective_limit)
+        # 授权后仅此一次查询限流调用；其 deny、过期清理、淘汰、时钟与
+        # 统计随返回原子提交。
+        qpermitted, qleft = limiter.allow(plain, client, now, "query")
+        if not qpermitted:
+            # 查询配额拒绝：不解析、不转发；仅 limiter 提交，解析器不变。
+            self._rated_o[1] += 1
+            return refusal, "rate", now, False, 0, -1
+        # 查询放行：仅此一次 resolve_edns；其异常仍耗查询额度（limiter
+        # 提交不回滚），响应维度不计数。resolve_edns 仅在实际访问上游
+        # （成功或耗尽）时推进 _stats_l，故其增量即本次应记的实际上游
+        # 耗时桶；权威、缓存及未访问上游时增量为零。
+        before_l = list(self._stats_l)
+        try:
+            response, source, end, hit = self.resolve_edns(query, now, limit)
+        except Exception:
+            # resolve_edns 异常原子计一次 e[0] 后原样传播；上游耗尽的
+            # 耗时桶一并补记。
+            for i in range(4):
+                self._rated_l[i] += self._stats_l[i] - before_l[i]
+            self._rated_e[0] += 1
+            raise
+        for i in range(4):
+            self._rated_l[i] += self._stats_l[i] - before_l[i]
+        # 解析成功：仅此一次 EDNS 响应限流调用，时钟取解析结束时刻；
+        # 其校验异常保留查询计数、响应不计数，原样传播。
+        try:
+            wire, rleft = limiter.respond_edns(
+                query, response, client, end, truncate)
+        except Exception:
+            # respond_edns 异常原子计一次 e[1] 后原样传播。
+            self._rated_e[1] += 1
+            raise
+        if wire is response:
+            # 响应配额放行：来源、结束时刻与命中标记均保留，返回两维余量。
+            self._rated_o[3] += 1
+            return response, source, end, hit, qleft, rleft
+        # 响应配额拒绝：解析器已提交，不回滚、不重算、不再访上游；来源
+        # 改为 "response-rate"，end/hit 与查询余量保留，truncate 真为
+        # 含问题与 OPT 的 TC 报文、假为 None，响应余量为 0。
         self._rated_o[2] += 1
         return wire, "response-rate", end, hit, qleft, 0
 
@@ -10046,16 +10238,18 @@ class Resolver:
         return self._tx_report(self._revision, "applied")
 
     def rated_stats(self, reset: bool = False) -> str:
-        """返回 resolve_rated 的确定性统计（键序 o,e,l，末尾单换行）。
+        """返回 resolve_rated 与 resolve_rated_edns 共用的确定性统计
+        （键序 o,e,l，末尾单换行）。
 
         输出为仅含键序 o,e,l 的紧凑 ASCII JSON，值为非负十进制整数
         数组。o 四项依次计 policy 拒绝、query-rate 拒绝、response-rate
-        拒绝与响应放行；e 两项依次计查询放行后 resolve 异常、解析成功
-        后 limiter.respond 异常；l 四项按实际上游耗时 0、1..timeout、
-        timeout+1..2*timeout、>2*timeout 分桶（权威、缓存及未访问上游
-        不计）。reset 非 bool 抛 TypeError 且状态不变；False 只读，
-        重复调用逐字节相同；True 先返回旧快照再清零十项计数，其余
-        状态与 stats() 不变。
+        拒绝与响应放行；e 两项依次计查询放行后 resolve/resolve_edns
+        异常、解析成功后 limiter.respond/respond_edns 异常；l 四项按
+        实际上游耗时 0、1..timeout、timeout+1..2*timeout、>2*timeout
+        分桶（权威、缓存、未访问上游及 BADVERS 不计）。两个入口的
+        出口与异常共用同一组计数；reset 非 bool 抛 TypeError 且状态
+        不变；False 只读，重复调用逐字节相同；True 先返回旧快照再
+        清零十项计数，其余状态与 stats() 不变。
         """
         if not isinstance(reset, bool):
             raise TypeError("reset must be bool")
