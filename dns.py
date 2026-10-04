@@ -8,7 +8,7 @@
 根名仍为 "."。解码后首标签恰为单字节 0x2A 的 owner 沿用通配语义；
 线格式等价（仅 ASCII 字母大小写或合法转义拼写不同）的名称在 answer、
 缓存、解析器、授权与限流器中视为同一键。主文件与区域配置的导入/导出/
-迁移覆盖 owner 及 NS、CNAME、MX、SOA、SRV、NAPTR、NSEC、RRSIG 中
+迁移覆盖 owner 及 NS、CNAME、PTR、MX、SOA、SRV、NAPTR、NSEC、RRSIG 中
 嵌入的名称，导出取唯一规范拼写。
 
 公开接口：
@@ -99,12 +99,12 @@
 - export_zone(zone: dict) -> str: 把 zone 导出为 v1 配置文本。
 - import_master(text: str) -> dict: 导入确定性主文件文本（首行
   "$ORIGIN 绝对名"，其后 1..65535 行 "owner ttl IN TYPE rdata"，
-  TYPE 为 A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/
+  TYPE 为 A/NS/CNAME/PTR/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/
   CDNSKEY/CAA/SOA、
   class=1、rdata 为 bytes；
   末尾允许无换行或一个换行）为规范化 zone。
 - export_master(zone: dict) -> str: 把仅含
-  A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/
+  A/NS/CNAME/PTR/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/
   CAA/SOA、
   class=1 记录的 zone 按原序导出为确定性主文件文本（单空格、
   规范域名/IP/整数/Base64/十六进制摘要、末尾换行）。
@@ -850,6 +850,7 @@ _FLAG_TC = 0x0200
 _TYPE_A = 1
 _TYPE_NS = 2
 _TYPE_CNAME = 5
+_TYPE_PTR = 12
 _TYPE_SOA = 6
 _TYPE_MX = 15
 _TYPE_TXT = 16
@@ -1070,7 +1071,6 @@ def decode_query(data: bytes) -> dict:
 
 # decode_message 的压缩指针跳转上限（含）：第 129 次跳转抛 MessageError。
 _MAX_MESSAGE_POINTER_JUMPS = 128
-_TYPE_PTR = 12
 # RDATA 中嵌入名允许压缩的类型（NS、CNAME、PTR、MX、SOA）；SRV、NAPTR、
 # NSEC、RRSIG 的嵌入名按协议不得出现压缩指针。
 _COMPRESSIBLE_RNAME_TYPES = frozenset(
@@ -1521,6 +1521,21 @@ def _encode_cname_target(labels):
     return _encode_wire_name(labels)
 
 
+def _decode_ptr_target(rdata):
+    """把 PTR rdata 按未压缩绝对名线格式解码为 bytes 标签列表。
+
+    与 _decode_cname_target 同一严格契约：标签接受任意八位组（大写折
+    小写），1–63 字节、0 结尾、总长 ≤255；根名（仅一个 0 字节）合法；
+    禁止压缩指针、截断、名后尾随字节，违者抛 RecordError。
+    """
+    if len(rdata) > _MAX_NAME_WIRE_LEN:
+        raise RecordError("ptr rdata too long")
+    labels, end = _decode_wire_name(rdata, RecordError)
+    if end != len(rdata):
+        raise RecordError("ptr rdata trailing bytes")
+    return labels
+
+
 def _read_soa_name(rdata, pos):
     """按 CNAME 目标规范解码 rdata pos 处的未压缩绝对名，返回下一偏移。
 
@@ -1584,15 +1599,19 @@ def _negative_cache_entry(key, rcode, an, ns, now):
 def _canonical_rdata(rrtype, rdata):
     """把含嵌入名的 rdata 中名称按线格式规范化（大写折小写）后重编码。
 
-    覆盖 NS、CNAME、MX、SOA、SRV、NAPTR、NSEC、RRSIG：名称均为未压缩、
-    0 结尾的绝对名，标签接受任意八位组。CNAME 沿用既有严格契约（结构
-    非法抛 RecordError）；其余类型保持 zone 层历史宽松度——能完整解析
+    覆盖 NS、CNAME、PTR、MX、SOA、SRV、NAPTR、NSEC、RRSIG：名称均为未压缩、
+    0 结尾的绝对名，标签接受任意八位组。CNAME、PTR 沿用既有严格契约
+    （结构非法抛 RecordError）；其余类型保持 zone 层历史宽松度——能完整解析
     嵌入名结构才折小写重编码，结构无法解析时 rdata 原样透传（与仅
     CNAME 规范化的历史行为一致，避免拒绝既有区域已接受的 rdata）。
     """
     if rrtype == _TYPE_CNAME:
         # CNAME 沿用既有严格契约：非法 rdata 在 zone 校验阶段即拒绝。
         return _encode_wire_name(_decode_cname_target(rdata))
+    if rrtype == _TYPE_PTR:
+        # PTR 与 CNAME 同一严格契约：rdata 须恰为一个完整未压缩绝对名
+        # （根名合法），任何结构不符在 zone 校验阶段即抛 RecordError。
+        return _encode_wire_name(_decode_ptr_target(rdata))
     try:
         if rrtype == _TYPE_NS:
             return _encode_wire_name(_decode_cname_target(rdata))
@@ -1640,7 +1659,8 @@ def _canonical_rdata(rrtype, rdata):
     return rdata
 
 
-_NAME_BEARING_TYPES = frozenset((_TYPE_NS, _TYPE_CNAME, _TYPE_MX,
+_NAME_BEARING_TYPES = frozenset((_TYPE_NS, _TYPE_CNAME, _TYPE_PTR,
+                                 _TYPE_MX,
                                  _TYPE_SOA, _TYPE_SRV, _TYPE_NAPTR,
                                  _TYPE_NSEC, _TYPE_RRSIG))
 
@@ -3248,8 +3268,9 @@ def migrate_zone(text: str) -> str:
     顶层键序 version,origin,class,records，version 为整数 2，class 为
     0..65535 的非 bool 整数且各记录统一沿用；记录键序
     name,type,ttl,rdata，rdata 为偶数长小写十六进制。输出为紧凑 ASCII
-    JSON，整数十进制，末尾单换行；记录保持原序，名称与 CNAME rdata 按
-    zone 规则规范化。等价区域输出逐字节相同，对迁移结果再次迁移不变。
+    JSON，整数十进制，末尾单换行；记录保持原序，名称与 CNAME、PTR 等
+    名称型 rdata 按 zone 规则规范化。等价区域输出逐字节相同，对迁移
+    结果再次迁移不变。
     text 非 str 抛 TypeError；JSON 解析、重复键、版本、键序、字段类型
     或十六进制错误抛 ConfigError；zone 语义错误沿用 RecordError、
     ZoneError。
@@ -3310,7 +3331,8 @@ def import_zone(text: str) -> dict:
     name,type,ttl,rdata。各版本 rdata/data 均为偶数长小写十六进制。
     JSON 解析、重复键、键序、版本、类型、布尔整数与十六进制错误抛
     ConfigError；zone 语义错误沿用 RecordError、ZoneError。返回 zone
-    的 rdata 为 bytes，名称与 CNAME rdata 已按 zone 规则规范化。
+    的 rdata 为 bytes，名称与 CNAME、PTR 等名称型 rdata 已按 zone 规则
+    规范化。
     """
     zone, _version = _parse_zone_config(text)
     origin_labels, rrs, _zone_class = _validate_zone(zone)
@@ -3342,6 +3364,7 @@ def export_zone(zone: dict) -> str:
 _MASTER_DIRECTIVE = "$ORIGIN"
 _MASTER_CLASS = "IN"
 _MASTER_TYPES = {"A": _TYPE_A, "NS": _TYPE_NS, "CNAME": _TYPE_CNAME,
+                 "PTR": _TYPE_PTR,
                  "MX": _TYPE_MX, "TXT": _TYPE_TXT,
                  "AAAA": _TYPE_AAAA, "SRV": _TYPE_SRV,
                  "NAPTR": _TYPE_NAPTR, "DS": _TYPE_DS,
@@ -4017,8 +4040,9 @@ def import_master(text: str) -> dict:
     （TXT 的引号串内允许空白）；末尾允许无换行或恰一个换行，其余任何
     空行（含连续换行）均非法。owner 可为 "@"（代表 origin）、小写绝对
     名或最左标签恰为 "*" 且后缀在 origin 内的通配绝对名；SOA 的
-    mname/rname、CNAME/NS/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
-    的小写绝对名；TYPE 为 "A"（1）、"NS"（2）、"CNAME"（5）、"MX"（15）、
+    mname/rname、CNAME/NS/PTR/SRV 目标与 MX 交换名仅可为 "@" 或不含通配
+    的小写绝对名（根名 "." 合法）；TYPE 为 "A"（1）、"NS"（2）、
+    "CNAME"（5）、"PTR"（12）、"MX"（15）、
     "TXT"（16）、"AAAA"（28）、"SRV"（33）、"NAPTR"（35）、
     "DS"（43）、"RRSIG"（46）、"NSEC"（47）、"DNSKEY"（48）、
     "CDS"（59）、
@@ -4027,9 +4051,11 @@ def import_master(text: str) -> dict:
     及 SOA 的 serial/refresh/retry/expire/minimum 为允许前导零的十进制
     整数（uint32 为 0..4294967295，uint16 为 0..65535）；A 的 rdata
     为点分十进制 IPv4（导入为 4 字节），AAAA 的 rdata 为一个 IPv6
-    文本（导入为 16 字节），NS/CNAME/SRV 目标与 MX 交换名写入未压缩、
-    0 结尾且无尾随的线格式（MX 前加网络序 uint16 preference，SRV 前加
-    三个网络序 uint16 priority/weight/port），SOA 的两个域名以未压缩
+    文本（导入为 16 字节），NS/CNAME/PTR/SRV 目标与 MX 交换名写入未压缩、
+    0 结尾且无尾随的线格式（PTR rdata 恰含一个绝对目标名，字段数错误、
+    相对名、非法转义或非法目标名统一抛 ConfigError；MX 前加网络序
+    uint16 preference，SRV 前加三个网络序 uint16 priority/weight/port），
+    SOA 的两个域名以未压缩
     线格式写入 rdata、后接五个网络序 uint32；TXT rdata 为 1..255 个
     双引号串，CAA rdata 为「flags tag "value"」：flags 为允许前导零的
     uint8，tag 为 1..15 字节小写 [a-z0-9-]，value 为单个双引号串
@@ -4078,8 +4104,9 @@ def import_master(text: str) -> dict:
     不与同 owner 其他类型并存等）。text 非 str 抛 TypeError；超长、
     非 ASCII、语法、未知 TYPE、非 IN、字段数/引号/转义、整数、Base64、
     删除标记、digesttype、十六进制字符或摘要长度、tag、NSEC 助记符/
-    重复类型、RRSIG 助记符/日期/总长或 IP 错误抛
-    ConfigError；名称及 rdata 错误抛 RecordError；zone 约束
+    重复类型、RRSIG 助记符/日期/总长、IP 或 PTR 目标名（字段数、
+    相对名、非法转义、非法目标名）错误抛
+    ConfigError；其余名称及 rdata 错误抛 RecordError；zone 约束
     错误抛 ZoneError。时空复杂度为 O(字符数+记录数+类型数)。
     """
     if not isinstance(text, str):
@@ -4116,7 +4143,7 @@ def import_master(text: str) -> dict:
             raise ConfigError("class must be IN")
         if type_token not in _MASTER_TYPES:
             raise ConfigError(
-                "type must be A, NS, CNAME, MX, TXT, AAAA, SRV, NAPTR, "
+                "type must be A, NS, CNAME, PTR, MX, TXT, AAAA, SRV, NAPTR, "
                 "DS, RRSIG, NSEC, DNSKEY, CDS, CDNSKEY, CAA or SOA")
         rrtype = _MASTER_TYPES[type_token]
         if owner_token == "@":
@@ -4160,6 +4187,20 @@ def import_master(text: str) -> dict:
                 target_labels = origin_labels
             else:
                 target_labels = _master_parse_name(target_token)
+            rdata = _master_wire_name(target_labels)
+        elif rrtype == _TYPE_PTR:
+            if len(rdata_tokens) != 1:
+                raise ConfigError("PTR rdata must be one name")
+            target_token = rdata_tokens[0]
+            if target_token == "@":
+                target_labels = origin_labels
+            else:
+                # 相对名、非法转义或非法目标名（标签/总线长）在主文件
+                # 导入路径统一抛 ConfigError，不泄漏 RecordError。
+                try:
+                    target_labels = _master_parse_name(target_token)
+                except RecordError as exc:
+                    raise ConfigError(str(exc)) from None
             rdata = _master_wire_name(target_labels)
         elif rrtype == _TYPE_MX:
             if len(rdata_tokens) != 2:
@@ -4445,21 +4486,22 @@ def export_master(zone: dict) -> str:
     """把 zone dict 导出为确定性主文件文本（单空格分隔，末尾换行）。
 
     zone 先按 zone 规则校验并规范化；仅接受 class 为 1（IN）、类型为
-    A/NS/CNAME/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/
+    A/NS/CNAME/PTR/MX/TXT/AAAA/SRV/NAPTR/DS/RRSIG/NSEC/DNSKEY/CDS/CDNSKEY/
     CAA/SOA
     的记录。输出首行
     "$ORIGIN 绝对名"，
     字段以单空格分隔、末尾恰一个换行，记录保序；owner、SOA 域名、
-    NS/CNAME/SRV 目标、NAPTR replacement 与 MX 交换名等于 origin 时输出
-    "@"，否则输出小写
+    NS/CNAME/PTR/SRV 目标、NAPTR replacement 与 MX 交换名等于 origin 时输出
+    "@"（PTR 目标为根名时输出 "."），否则输出小写
     绝对名（owner 允许最左标签恰为 "*" 的通配名，其余名称不压缩亦
     不含通配；NAPTR replacement 线标签含大写 ASCII 时直接抛
     RecordError，不得小写化）；A 地址、AAAA 地址（IPv6Address 的小写
     压缩形式）、TTL、
     SOA、MX preference、SRV priority/weight/port、NAPTR order/preference
     与 CAA flags、DNSKEY/CDNSKEY flags/algorithm 整数均
-    按规范形式输出（无前导零）；NS/CNAME rdata 须为未压缩、0 结尾且
-    无尾随的线格式，MX rdata 须恰为网络序 uint16 preference 加该线
+    按规范形式输出（无前导零）；NS/CNAME/PTR rdata 须为未压缩、0 结尾且
+    无尾随的线格式（根名合法，仅写 "."；压缩指针、截断或名后多余数据
+    抛 RecordError），MX rdata 须恰为网络序 uint16 preference 加该线
     格式名，SRV rdata 须恰为三个网络序 uint16 加该线格式名，AAAA
     rdata 须恰为 16 字节；TXT rdata 依次为一字节长度及内容，逐段加
     双引号输出（1..255 段），空段写 ""，段间单空格；NAPTR rdata 须恰为
@@ -4538,6 +4580,11 @@ def export_master(zone: dict) -> str:
             target_text = ("@" if target == origin_labels
                            else _labels_to_name(target, wildcard=False))
             lines.append(prefix + "CNAME " + target_text)
+        elif rrtype == _TYPE_PTR:
+            target = _decode_ptr_target(rdata)
+            target_text = ("@" if target == origin_labels
+                           else _labels_to_name(target, wildcard=False))
+            lines.append(prefix + "PTR " + target_text)
         elif rrtype == _TYPE_MX:
             preference, exchange = _master_decode_mx_rdata(rdata)
             exchange_text = ("@" if exchange == origin_labels
@@ -4627,7 +4674,7 @@ def export_master(zone: dict) -> str:
             lines.append(prefix + "SOA " + fields)
         else:
             raise ConfigError(
-                "master export only supports A, NS, CNAME, MX, TXT, "
+                "master export only supports A, NS, CNAME, PTR, MX, TXT, "
                 "AAAA, SRV, NAPTR, DS, RRSIG, NSEC, DNSKEY, CDS, CDNSKEY, "
                 "CAA and SOA")
     text = "\n".join(lines) + "\n"
@@ -9854,6 +9901,13 @@ def _validate_ops(ops):
                 if candidate["type"] == _TYPE_CNAME:
                     try:
                         _decode_cname_target(candidate["rdata"])
+                    except RecordError as exc:
+                        raise ReplayError(str(exc)) from None
+                elif candidate["type"] == _TYPE_PTR:
+                    # PTR 与 CNAME 同一严格名称型 rdata 契约，非法记录在
+                    # 创建 Resolver 前即使整份回放非法。
+                    try:
+                        _decode_ptr_target(candidate["rdata"])
                     except RecordError as exc:
                         raise ReplayError(str(exc)) from None
                 converted.append({"op": change_op, "record": candidate})
