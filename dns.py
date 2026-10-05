@@ -258,7 +258,27 @@
   类别与耗时计数并提交 recursive_upstream_stats、推进最后成功时刻，
   不增加新鲜命中；陈旧应答编码失败抛 EncodeError 且缓存、FIFO、
   最后时刻与全部统计不变；默认与显式 0 与历史行为逐字节一致；
-  stats() 返回只读统计的紧凑 ASCII JSON（键序 h,m,x,u,c,l,r，末尾换行）；
+  resolve_recursive_edns(query, levels, now, limit=65535,
+  stale_window=0) 是 resolve_recursive 的 EDNS 变体，返回同形四元组：
+  仅接受单问题且附加段末项恰有一个合法 OPT 的查询，校验顺序与异常
+  类型沿用 resolve_edns；OPT 版本非零时在访问区域、缓存、统计或
+  上游前返回 (BADVERS 应答, "edns", now, False)，不校验
+  levels/stale_window、状态不变；版本 0 的有效上限取 min(limit,
+  查询 UDP 大小)，ECS 仍只允许一个规范选项；域内沿用权威 EDNS 行为
+  （不校验 levels/stale_window），域外按 levels 既有层数、事件、
+  超时与转介规则推进，终态答案、NXDOMAIN、NODATA 均以 EDNS 报文
+  返回——附加段恰含一个位于末项的 OPT，回显 DO，仅在查询含 ECS 时
+  回写规范 ECS、其他选项不回显；DO 与规范 ECS 均纳入递归正/负缓存
+  分区（do=False 无 ECS 与普通递归共用分区，DO=1 或不同客户端子网
+  各自独立），来源、结束时刻、命中含义与新鲜条目 TTL 衰减同普通
+  递归；存在 stale_window 内过期条目时返回保留同一 OPT 契约的
+  EDNS 陈旧应答（正答案 RR TTL 置 0、负答案仅 SOA RR TTL 置 0），
+  来源 "stale"、命中 True；报文无法装入有效上限抛 EncodeError 且
+  不提交缓存、FIFO、时钟或统计，成功、陈旧返回与上游耗尽按现有
+  原子口径提交统计；递归最多 16 层、每层 1–16 个上游且每个只观察
+  前 2 个事件，容量 256；同初态同输入产生逐字节相同的报文与状态
+  文本；
+  stats() 返回只读统计的紧凑 JSON（键序 h,m,x,u,c,l,r，末尾换行）；
   upstream_stats(reset=False) 返回构造 plan 直转的逐上游统计，为顶层
   键序仅 p,t 的紧凑 ASCII JSON（末尾单换行）：p 按 plan 位置列键序
   i,n,a,s,to,e,bad,ms 的对象（重名不合并，i 为从 0 起的序号，n 为
@@ -323,12 +343,14 @@
   为 -1），x、v 为 [权威,递归] 的成功解析到期删除数与 FIFO 淘汰数；
   reset=True 先返回旧快照再清零 x、v，保留缓存、FIFO、时钟及统计；
   dump_rec(now) 把此刻仍有效的递归缓存按 FIFO 插入次序导出为
-  确定性配置文本（顶层键序 v,clock,items，v=1、clock=now；项键序
-  k,q,t,c,rr，rr 元素键序 n,t,c,ttl,d；紧凑 ASCII JSON、整数十进制、
-  末尾单换行），只读且同状态同参逐字节相同；
-  load_rec(text, now) 校验递归缓存配置文本，按 now-clock 衰减并
-  丢弃到期项后原子替换递归正负缓存与 FIFO、置成功时刻为 now，
-  返回保留条目数，任何失败均无副作用；
+  确定性配置文本（顶层键 v,clock,items，v=2、clock=now；项键序
+  k,q,t,c,do,e,rr，do 为 DO 分区布尔、e 为 null 或 fam,src,addr
+  ECS 分区对象，rr 元素键序 n,t,c,ttl,d；紧凑 ASCII JSON、整数十
+  进制、末尾单换行），只读且同状态同参逐字节相同；
+  load_rec(text, now) 校验 v=1 或 v=2 递归缓存配置文本（v=1 旧格
+  式项键序 k,q,t,c,rr，按 do=false、无 ECS 的普通分区载入），按
+  now-clock 衰减并丢弃到期项后原子替换递归正负缓存与 FIFO、置成
+  功时刻为 now，返回保留条目数，任何失败均无副作用；
   reload_zone(text) 原子换区并返回从 0 递增的修订号（stats() 不变，
   c[0] 于下次解析提交时同步）；
   reload_zone_tx(text, expected) 带修订号检查的原子换区事务，返回
@@ -993,13 +1015,21 @@ _RECURSIVE_RCODES = {0: 0, 1: 0, 2: _RCODE_NXDOMAIN, 3: 0}
 _MAX_STALE_WINDOW = 86400
 # 递归缓存命中类别 -> stats 的 h 下标（正/NXDOMAIN/NODATA）
 _RECURSIVE_HIT_KINDS = {"pos": 1, "nxdomain": 2, "nodata": 3}
-# dump_rec/load_rec 递归缓存配置：顶层键序仅 v,clock,items（v 恒为 1，
-# clock 为导出时刻），items 限 256 项（与递归缓存容量一致），项键序
-# 仅 k,q,t,c,rr，rr 元素键序仅 n,t,c,ttl,d；文本限 1048576 码点。
+# dump_rec/load_rec 递归缓存配置：顶层键序仅 v,clock,items（v=1 为
+# 历史普通递归条目；v=2 另含 do,e 两个分区字段，见下），clock 为导出
+# 时刻，items 限 256 项（与递归缓存容量一致），项键序
+# v=1：仅 k,q,t,c,rr；v=2：仅 k,q,t,c,do,e,rr，rr 元素键序仅
+# n,t,c,ttl,d；文本限 1048576 码点。v=1 文本仍可载入，do/e 按
+# False/null 恢复为普通 resolve_recursive 分区。
 _REC_DUMP_KEYS = ["v", "clock", "items"]
 _REC_ITEM_KEYS = ["k", "q", "t", "c", "rr"]
+_REC_ITEM_KEYS_V2 = ["k", "q", "t", "c", "do", "e", "rr"]
 _REC_RR_KEYS = ["n", "t", "c", "ttl", "d"]
 _REC_ITEM_KINDS = frozenset(("p", "nx", "nd"))
+_REC_DUMP_VERSION_V2 = 2
+# ECS 分区导出字段 e：v2 项键序中恰为 [fam,src,addr]（fam/src 为非负
+# 非 bool 整数，addr 为偶长小写十六进制），无 ECS 分区时为 null。
+_REC_ECS_KEYS = ["fam", "src", "addr"]
 _MAX_REC_TEXT_LEN = 1048576
 # dump_state/load_state 整解析器快照：顶层键序仅 v,zones,rec,stats,ru
 # （v 恒为 2，后四者分别为 dump_zones()、dump_rec(now)、stats() 与
@@ -1610,6 +1640,12 @@ def _negative_cache_entry(key, rcode, an, ns, now):
 
     规则与 PositiveCache 相同，但 ns 中唯一 SOA 的 owner 不受本地 origin
     约束（递归终态的 SOA 可能属于域外权威区）；键仍按本次查询构造。
+    key 为三元组 (qname, qtype, qclass)（普通 resolve_recursive 分区，
+    do=False、无 ECS）或五元组 (qname, qtype, qclass, do, partition)
+    （resolve_recursive_edns 分区）；负键在正键基础上按同一形状派生，
+    普通分区保持 (前缀, qname, ...) 历史形状，分区形状以
+    (前缀, qname, qtype, qclass, do, partition) 另起命名空间，二者不
+    会碰撞。
     """
     if an or rcode not in (0, _RCODE_NXDOMAIN):
         return None
@@ -1622,10 +1658,18 @@ def _negative_cache_entry(key, rcode, an, ns, now):
     neg_ttl = min(soa[3], minimum)
     if neg_ttl == 0:
         return None
-    if rcode == _RCODE_NXDOMAIN:
-        neg_key = ("nxdomain", key[0], key[2])  # 匹配任意 qtype
+    if len(key) == 3:
+        if rcode == _RCODE_NXDOMAIN:
+            neg_key = ("nxdomain", key[0], key[2])  # 匹配任意 qtype
+        else:
+            neg_key = ("nodata",) + key
     else:
-        neg_key = ("nodata",) + key
+        qname, _qtype, qclass, do, partition = key
+        if rcode == _RCODE_NXDOMAIN:
+            # 保留 DO 与 ECS 分区；NXDOMAIN 匹配任意 qtype。
+            neg_key = ("nxdomain-e", qname, qclass, do, partition)
+        else:
+            neg_key = ("nodata-e", qname, key[1], qclass, do, partition)
     return neg_key, (now, rcode, soa, neg_ttl)
 
 
@@ -6212,12 +6256,14 @@ def _cache_watermark(pos_entries, neg_entries, order, now, glue=False):
     前三项为正缓存、NXDOMAIN、NODATA 条目数，total 为合计，capacity
     固定 256；ttl 为同顺序三整数，各取该类最小剩余 TTL，无条目为 -1。
     glue 为真时正条目为权威正缓存三元组，其最小 TTL 同时计入地址
-    附加段；递归正条目为二元组，恒传 False。
+    附加段；递归正条目为二元组，恒传 False。负键首项为 "nxdomain"
+    （普通递归分区）或 "nxdomain-e"（DO/ECS 分区），其余归 NODATA。
     """
-    nx_keys = [key for key in neg_entries if key[0] == "nxdomain"]
+    nx_keys = [key for key in neg_entries
+               if key[0] in ("nxdomain", "nxdomain-e")]
     nx_entries = {key: neg_entries[key] for key in nx_keys}
     nd_entries = {key: neg_entries[key] for key in neg_entries
-                  if key[0] != "nxdomain"}
+                  if key[0] not in ("nxdomain", "nxdomain-e")}
     nx_count = len(nx_entries)
     nd_count = len(nd_entries)
     pos_count = len(pos_entries)
@@ -6235,13 +6281,67 @@ def _cache_watermark(pos_entries, neg_entries, order, now, glue=False):
     )
 
 
+def _check_rec_ecs_partition(obj):
+    """校验 v2 递归缓存项的 ECS 分区字段 e，返回 None 或 (fam,src,addr)。
+
+    e 为 null（无 ECS 分区）或键序仅 fam,src,addr 的对象：fam 仅 1/2、
+    src 分别限 0..32/0..128（非 bool 整数），addr 为偶长小写十六进制、
+    长度恰为 (src+7)//8，末字节未用低位须为 0；形态错误统一抛
+    ConfigError。
+    """
+    if obj is None:
+        return None
+    if not isinstance(obj, dict) or list(obj.keys()) != _REC_ECS_KEYS:
+        raise ConfigError("ecs partition keys must be fam,src,addr")
+    family = obj["fam"]
+    source = obj["src"]
+    addr_text = obj["addr"]
+    if not isinstance(family, int) or isinstance(family, bool):
+        raise ConfigError("fam must be int")
+    if family not in _ECS_MAX_SOURCE:
+        raise ConfigError("fam must be 1 or 2")
+    if not isinstance(source, int) or isinstance(source, bool):
+        raise ConfigError("src must be int")
+    if not 0 <= source <= _ECS_MAX_SOURCE[family]:
+        raise ConfigError("src out of range")
+    if not isinstance(addr_text, str):
+        raise ConfigError("addr must be str")
+    if (len(addr_text) % 2
+            or any(c not in _LOWER_HEXDIGITS for c in addr_text)):
+        raise ConfigError("addr must be even-length lowercase hex")
+    address = bytes.fromhex(addr_text)
+    if len(address) != (source + 7) // 8:
+        raise ConfigError("addr length mismatch")
+    if source & 7 and address[-1] & (0xFF >> (source & 7)):
+        raise ConfigError("addr has non-zero padding bits")
+    return family, source, address
+
+
+def _rec_ecs_obj(partition):
+    """把缓存键中的 ECS 分区序列化为 dump_rec v2 的 e 对象。
+
+    无 ECS 分区为 None（导出 null）；否则为键序 fam,src,addr 的 dict，
+    addr 为偶长小写十六进制。
+    """
+    if partition is None:
+        return None
+    family, source, address = partition
+    return {"fam": family, "src": source, "addr": address.hex()}
+
+
 def _check_rec_config(config):
     """结构层校验递归缓存配置对象，返回 (clock, [(kind, 缓存键, 原始rr列表)])。
 
-    仅做结构校验：顶层/项/rr 键序、v、clock、items 数量、k/q/t/c 字段、
-    rr 数组形态（p 非空、nx/nd 恰一条）与重复缓存键；错误统一抛
-    ConfigError。rr 元素字段值与 SOA 语义不在此校验
-    （见 _validate_rec_item）。
+    仅做结构校验：顶层/项/rr 键序、v（1 或 2）、clock、items 数量、
+    k/q/t/c 字段（v=2 另有 do,e 分区字段）、rr 数组形态（p 非空、
+    nx/nd 恰一条）与重复缓存键；错误统一抛 ConfigError。rr 元素字段值
+    与 SOA 语义不在此校验（见 _validate_rec_item）。
+
+    v=1 为历史格式（项键序 k,q,t,c,rr），全部条目按 do=False、无 ECS
+    的普通 resolve_recursive 分区恢复，与历史键逐字节同形；v=2 项键序
+    k,q,t,c,do,e,rr，do 为 bool，e 见 _check_rec_ecs_partition，键按
+    DO 与规范 ECS 共同分区（resolve_recursive_edns），与普通分区形状
+    不同、互不碰撞。
     """
     if not isinstance(config, dict):
         raise ConfigError("config must be an object")
@@ -6250,7 +6350,7 @@ def _check_rec_config(config):
     version = config["v"]
     if not isinstance(version, int) or isinstance(version, bool):
         raise ConfigError("v must be int")
-    if version != 1:
+    if version not in (1, _REC_DUMP_VERSION_V2):
         raise ConfigError("unsupported v")
     clock = config["clock"]
     if not isinstance(clock, int) or isinstance(clock, bool):
@@ -6267,8 +6367,11 @@ def _check_rec_config(config):
     for item in items:
         if not isinstance(item, dict):
             raise ConfigError("item must be an object")
-        if list(item.keys()) != _REC_ITEM_KEYS:
-            raise ConfigError("item keys must be k,q,t,c,rr")
+        if version == 1:
+            if list(item.keys()) != _REC_ITEM_KEYS:
+                raise ConfigError("item keys must be k,q,t,c,rr")
+        elif list(item.keys()) != _REC_ITEM_KEYS_V2:
+            raise ConfigError("item keys must be k,q,t,c,do,e,rr")
         kind = item["k"]
         if not isinstance(kind, str):
             raise ConfigError("k must be str")
@@ -6298,22 +6401,45 @@ def _check_rec_config(config):
             raise ConfigError("c must be int")
         if not 0 <= qclass <= 0xFFFF:
             raise ConfigError("c out of range")
+        if version == 1:
+            do, partition = False, None
+        else:
+            do = item["do"]
+            if not isinstance(do, bool):
+                raise ConfigError("do must be bool")
+            partition_obj = item["e"]
+            ecs = _check_rec_ecs_partition(partition_obj)
+            partition = (None if ecs is None
+                         else (ecs[0], ecs[1], ecs[2]))
         rrs = item["rr"]
         if not isinstance(rrs, list):
             raise ConfigError("rr must be list")
+        # 运行时键形状（与 _recursive_cache_key 一致）：do=False 且无
+        # ECS 分区恒为历史三键（普通与 do=0/无 ECS 的 EDNS 递归共享），
+        # v=1 文本同样如此；仅 DO=1 或携带 ECS 的条目使用五元组及
+        # -e 负键命名空间，与三键形状天然不碰撞。
+        plain_shape = version == 1 or (not do and partition is None)
         if kind == "p":
             if not rrs:
                 raise ConfigError("p item requires non-empty rr")
             tag = "pos"
-            key = (qname, qtype, qclass)
+            if plain_shape:
+                key = (qname, qtype, qclass)
+            else:
+                key = (qname, qtype, qclass, do, partition)
         else:
             if len(rrs) != 1:
                 raise ConfigError("nx/nd item requires exactly one SOA")
             tag = "neg"
-            if kind == "nx":
-                key = ("nxdomain", qname, qclass)
+            if plain_shape:
+                if kind == "nx":
+                    key = ("nxdomain", qname, qclass)
+                else:
+                    key = ("nodata", qname, qtype, qclass)
+            elif kind == "nx":
+                key = ("nxdomain-e", qname, qclass, do, partition)
             else:
-                key = ("nodata", qname, qtype, qclass)
+                key = ("nodata-e", qname, qtype, qclass, do, partition)
         for rr in rrs:
             if not isinstance(rr, dict):
                 raise ConfigError("rr element must be an object")
@@ -6976,6 +7102,31 @@ class Resolver:
     默认调用与显式 stale_window=0 的报文、异常、统计及状态变化与历史
     行为逐字节一致。
 
+    resolve_recursive_edns(query, levels, now, limit=65535,
+    stale_window=0)：resolve_recursive 的 EDNS 变体，返回同形四元组。
+    仅接受单问题且附加段末项恰有一个合法 OPT 的查询，query/now/limit、
+    报文、OPT 与 ECS 的校验顺序及异常类型沿用 resolve_edns；OPT 版本
+    非零时在访问区域、缓存、统计或上游前返回 (BADVERS 应答, "edns",
+    now, False)，不校验 levels/stale_window、状态不变。版本 0 的有效
+    上限取 min(limit, 查询 UDP 大小)；ECS 仍只允许一个规范选项。域内
+    查询完全沿用权威 EDNS 行为（resolve_edns 区内路径，来源
+    "authority"，DO 随附 RRSIG 与分区不变，不校验 levels/stale_window）；
+    域外查询在 query/now/limit 之后、查递归缓存之前完整校验 levels 与
+    stale_window，随后按 levels 既有层数、事件、前 2 事件、超时与转介
+    规则逐层推进（时钟、UpstreamTimeout/UpstreamError 区分同
+    resolve_recursive）。DO 与规范 ECS 均纳入递归正/负缓存分区：
+    do=False 且无 ECS 时与普通递归共用同一分区，DO=1 或携带 ECS 各
+    独立分区，不同签名需求或客户端子网不互相命中。终态答案、
+    NXDOMAIN 与 NODATA 均以 EDNS 报文返回：附加段恰含一个位于末项的
+    OPT，回显 CLASS 与 DO，仅在查询含 ECS 时回写规范 ECS，其他选项
+    不回显；来源、结束时刻、命中含义与新鲜条目 TTL 衰减同普通递归。
+    存在 stale_window 内的过期条目时返回 EDNS 陈旧应答（正答案 RR TTL
+    置 0、负答案仅授权段 SOA RR TTL 置 0，保留同一 OPT 契约），来源
+    "stale"、命中 True，过期条目不删除、不重写、FIFO 不变。报文无法
+    装入有效上限时抛 EncodeError，且不提交缓存、FIFO、时钟或统计；
+    成功、陈旧返回与上游耗尽按现有原子口径提交 m/x/u/l 与
+    recursive_upstream_stats。同初态同输入逐字节相同。
+
     除陈旧返回外，任何失败都原样传播且不改变缓存与上次成功结束时刻；
     成功后时钟单调性以该结束时刻为准。
 
@@ -7098,28 +7249,33 @@ class Resolver:
     缓存、FIFO、时钟及统计；同参逐字节一致。
 
     dump_rec(now)：把此刻仍有效的递归缓存条目按 FIFO 插入次序导出为
-    确定性配置文本，只读。顶层键序仅 v,clock,items：v 恒为 1，clock
-    为入参 now；items 不超过 256 项，项键序仅 k,q,t,c,rr：k 为
+    确定性配置文本，只读。顶层键序仅 v,clock,items：v 恒为 2，clock
+    为入参 now；items 不超过 256 项，项键序仅 k,q,t,c,do,e,rr：k 为
     "p"（正缓存）、"nx"（NXDOMAIN）或 "nd"（NODATA），q 为小写绝对
-    qname，t、c 为 qtype、qclass（nx 匹配任意 qtype，t 为 null）；
-    rr 元素键序 n,t,c,ttl,d，沿用 RR 值域，d 为偶长小写十六进制。
-    p 的 rr 非空，ttl 为各 RR 的剩余正整数；nx/nd 恰一条 SOA，ttl
-    为负缓存剩余值。到期项跳过但不删除。输出为紧凑 ASCII JSON、
-    整数十进制、末尾单换行。now 非 int 或为 bool 抛 TypeError；
-    now<0 或早于上次成功结束时刻抛 CacheError，均无副作用；同状态
-    同参逐字节相同。
+    qname，t、c 为 qtype、qclass（nx 匹配任意 qtype，t 为 null），
+    do 为 DO 分区布尔（普通 resolve_recursive 与无 DO/ECS 的
+    resolve_recursive_edns 条目恒为 false），e 为 ECS 分区（无 ECS 为
+    null，否则为 fam/src/addr 对象）；rr 元素键序 n,t,c,ttl,d，沿用
+    RR 值域，d 为偶长小写十六进制。p 的 rr 非空，ttl 为各 RR 的剩余
+    正整数；nx/nd 恰一条 SOA，ttl 为负缓存剩余值。到期项跳过但不删
+    除。输出为紧凑 ASCII JSON、整数十进制、末尾单换行。now 非 int
+    或为 bool 抛 TypeError；now<0 或早于上次成功结束时刻抛
+    CacheError，均无副作用；同状态同参逐字节相同。
 
     load_rec(text, now)：校验递归缓存配置文本并原子替换递归缓存，
-    返回保留的条目数。text 非 str 或 now 非 int（含 bool）抛
-    TypeError；text 超 1048576 码点、JSON 解析、重复键、键序、非
-    RR 字段（v/clock/items/k/q/t/c 与 rr 数组形态）或重复缓存键
-    错误抛 ConfigError；now 为负、回退（早于上次成功结束时刻）或
-    小于 clock 抛 CacheError；RR 字段值或 SOA 错误抛 RecordError，
-    p 项 RR 的 ttl<=0 在衰减前即抛 RecordError。全部结构校验先于
-    时钟校验，时钟校验先于 RR 值域校验。全部通过后按 now-clock
-    衰减各 ttl、丢弃到期项，原子替换递归正负缓存与 FIFO 并置成功
-    时刻为 now；权威缓存、统计与清理计数不变。任何失败都无副
-    作用；同初态同参逐字节一致。
+    返回保留的条目数。接受 dump_rec 的 v=2 文本（项键序
+    k,q,t,c,do,e,rr）与历史 v=1 文本（项键序 k,q,t,c,rr，按
+    do=false、无 ECS 的普通分区载入，键形状与历史逐字节同形，不与新
+    分区碰撞）。text 非 str 或 now 非 int（含 bool）抛 TypeError；
+    text 超 1048576 码点、JSON 解析、重复键、键序、非 RR 字段
+    （v/clock/items/k/q/t/c/do/e 与 rr 数组形态）或重复缓存键错误
+    抛 ConfigError；now 为负、回退（早于上次成功结束时刻）或小于
+    clock 抛 CacheError；RR 字段值或 SOA 错误抛 RecordError，p 项
+    RR 的 ttl<=0 在衰减前即抛 RecordError。全部结构校验先于时钟校
+    验，时钟校验先于 RR 值域校验。全部通过后按 now-clock 衰减各
+    ttl、丢弃到期项，原子替换递归正负缓存与 FIFO 并置成功时刻为
+    now；权威缓存、统计与清理计数不变。任何失败都无副作用；同初态
+    同参逐字节一致。
 
     reload_zone(text)：导入 v0/v1/v2 配置文本并原子换区，返回从 0 递增的
     修订号。先 import_zone 再以新 zone 构造 PositiveCache，全部成功后
@@ -7976,18 +8132,61 @@ class Resolver:
             return False
         return now - neg[0] >= neg[3]
 
-    def _recursive_cache_lookup(self, query, question, now, limit):
+    def _recursive_cache_partition(self, do=False, ecs=None):
+        """递归缓存分区：普通路径恒 (False, None)；EDNS 路径取 (DO,
+        (family,source,address) 或 None)。do=False 且无 ECS 时与普通
+        resolve_recursive 共用同一三键分区（与权威缓存 resolve/
+        resolve_edns 的共享口径一致）。
+        """
+        partition = None if ecs is None else (ecs[0], ecs[1], ecs[2])
+        return do, partition
+
+    def _recursive_cache_key(self, question, do=False, partition=None):
+        """按分区构造递归正缓存键。
+
+        do=False 且无 ECS 分区时为历史三键 (qname,qtype,qclass)，普通
+        resolve_recursive 与无 DO/ECS 的 EDNS 递归共用；否则为五元组
+        (qname,qtype,qclass,do,partition)，形状与三键不同，天然不碰撞。
+        """
+        base = (question["name"], question["type"], question["class"])
+        if not do and partition is None:
+            return base
+        return base + (do, partition)
+
+    def _recursive_neg_keys(self, key):
+        """由正缓存键派生 (NODATA 负键, NXDOMAIN 负键)，形状随分区。"""
+        if len(key) == 3:
+            return (("nodata",) + key,
+                    ("nxdomain", key[0], key[2]))
+        qname, qtype, qclass, do, partition = key
+        return (("nodata-e", qname, qtype, qclass, do, partition),
+                ("nxdomain-e", qname, qclass, do, partition))
+
+    def _recursive_cache_lookup(self, query, question, now, limit,
+                                do=False, ecs=None, edns=False):
         """域外递归结果查找，返回 (应答报文或 None, 到期描述或 None, 命中类别或 None)。
 
         键、正/负 TTL、查找顺序同 PositiveCache；到期条目不立即删除，由
-        调用方在新终态编码成功后清理，保证失败不改状态。命中类别为
+        调用方在新终态编码成功后清理，保证失败不改状态。do/ecs 非默认
+        （resolve_recursive_edns）时正/负键均按 DO 与规范 ECS 共同分区，
+        do=False 且无 ECS 时与普通 resolve_recursive 共用同一三键分区；
+        edns 为真时命中应答以 EDNS 契约编码（附加段仅末项 OPT、回显
+        DO、仅回写规范 ECS），即使共用三键分区也与普通路径区分编码，
+        有效上限取调用方传入的 min(limit, 查询 UDP 大小)。命中类别为
         "pos"、"nxdomain"、"nodata"，供统计细分。到期描述为
         ("pos", 键, 到期时刻, 原始 an) 或 ("neg", 负键, 到期时刻,
         (rcode, 规范化 SOA, 类别))：到期时刻正条目为插入时刻+ANSWER
         最小 TTL、负条目为插入时刻+负 TTL，供 stale_window 判定；条目
         内容仅供只读重编码，调用方不得改写。
         """
-        key = (question["name"], question["type"], question["class"])
+        do, partition = self._recursive_cache_partition(do, ecs)
+        key = self._recursive_cache_key(question, do, partition)
+
+        def encode(rcode, an, ns):
+            if edns:
+                return _encode_plan_edns(query, rcode, an, ns, limit, ecs)
+            return _encode_plan(query, rcode, an, ns, limit)
+
         entry = self._rec_pos.get(key)
         if entry is not None:
             inserted, an = entry
@@ -7996,14 +8195,15 @@ class Resolver:
             if elapsed < min_ttl:
                 aged = [(labels, rrtype, rrclass, ttl - elapsed, rdata)
                         for labels, rrtype, rrclass, ttl, rdata in an]
-                return _encode_plan(query, 0, aged, [], limit), None, "pos"
+                return encode(0, aged, []), None, "pos"
             return None, ("pos", key, inserted + min_ttl, an), None
-        neg_key = ("nodata",) + key
-        neg = self._rec_neg.get(neg_key)
+        nodata_key, nxdomain_key = self._recursive_neg_keys(key)
+        neg = self._rec_neg.get(nodata_key)
+        neg_key = nodata_key
         kind = "nodata"
         if neg is None:
-            neg_key = ("nxdomain", key[0], key[2])
-            neg = self._rec_neg.get(neg_key)
+            neg = self._rec_neg.get(nxdomain_key)
+            neg_key = nxdomain_key
             kind = "nxdomain"
         if neg is None:
             return None, None, None
@@ -8013,13 +8213,15 @@ class Resolver:
             return None, ("neg", neg_key, inserted + neg_ttl,
                           (rcode, soa, kind)), None
         aged_soa = (soa[0], soa[1], soa[2], neg_ttl - elapsed, soa[4])
-        return _encode_plan(query, rcode, [], [aged_soa], limit), None, kind
+        return encode(rcode, [], [aged_soa]), None, kind
 
-    def _store_recursive_terminal(self, question, now, rcode, an, ns, expired):
+    def _store_recursive_terminal(self, question, now, rcode, an, ns, expired,
+                                  do=False, ecs=None):
         """终态按 PositiveCache 规则写入递归缓存（容量 256、FIFO）。
 
-        先清理到期旧条目（编码已成功），再按正/负规则写入并按需淘汰；
-        到期删除与 FIFO 淘汰各累计入递归清理事件计数。
+        do/ecs 非默认（resolve_recursive_edns）时正/负键按 DO 与规范
+        ECS 共同分区；先清理到期旧条目（编码已成功），再按正/负规则写入
+        并按需淘汰；到期删除与 FIFO 淘汰各累计入递归清理事件计数。
         """
         if expired is not None:
             tag = expired[0]
@@ -8027,7 +8229,8 @@ class Resolver:
             del (self._rec_pos if tag == "pos" else self._rec_neg)[ekey]
             self._rec_order.remove((tag, ekey))
             self._clean_expired[1] += 1  # 成功解析实际删除的到期条目
-        key = (question["name"], question["type"], question["class"])
+        _do, partition = self._recursive_cache_partition(do, ecs)
+        key = self._recursive_cache_key(question, _do, partition)
         if rcode == 0 and not ns and an and all(rr[3] > 0 for rr in an):
             self._rec_pos[key] = (now, an)
             self._rec_order.append(("pos", key))
@@ -8043,23 +8246,31 @@ class Resolver:
             del (self._rec_pos if tag == "pos" else self._rec_neg)[oldest]
             self._clean_evicted[1] += 1  # 容量 FIFO 淘汰
 
-    def _encode_stale_recursive(self, query, expired, limit):
+    def _encode_stale_recursive(self, query, expired, limit,
+                                edns=False, ecs=None):
         """把过期递归条目按本次 query、limit 重编码为陈旧应答（只读条目）。
 
         正陈旧：保留原 ANSWER 记录顺序，所有 RR TTL 置 0，授权段为空；
         负陈旧：保留原 RCODE、问题段与唯一 SOA（owner/type/class/rdata
         不变），仅把授权段 SOA 的 RR TTL 置 0。编码继续遵守现有名字压缩、
-        记录顺序、长度上限与 RRset 原子截断规则；编码失败原样抛
-        EncodeError，调用方不得据此提交任何状态。
+        记录顺序、长度上限与 RRset 原子截断规则；edns 为真时（EDNS
+        递归）按 EDNS 契约编码：附加段仅末项 OPT、回显 DO、仅在 ecs 非
+        None 时回写规范 ECS，其他选项不回显。编码失败原样抛 EncodeError，
+        调用方不得据此提交任何状态。
         """
         tag = expired[0]
         if tag == "pos":
             an = expired[3]
             stale_an = [(labels, rrtype, rrclass, 0, rdata)
                         for labels, rrtype, rrclass, _ttl, rdata in an]
+            if edns:
+                return _encode_plan_edns(query, 0, stale_an, [], limit, ecs)
             return _encode_plan(query, 0, stale_an, [], limit)
         rcode, soa, _kind = expired[3]
         stale_soa = (soa[0], soa[1], soa[2], 0, soa[4])
+        if edns:
+            return _encode_plan_edns(query, rcode, [], [stale_soa],
+                                     limit, ecs)
         return _encode_plan(query, rcode, [], [stale_soa], limit)
 
     def resolve_recursive(self, query: bytes, levels, now: int,
@@ -8185,6 +8396,138 @@ class Resolver:
         response = _encode_plan(query, rcode, an, ns, limit)
         self._store_recursive_terminal(
             question, end, rcode, an, ns, expired)
+        self._stats_m += m_inc
+        self._stats_x += x_inc
+        self._stats_u[0] += 1
+        self._stats_l[_duration_bucket(end - now, self._timeout)] += 1
+        self._commit_recursive_up(staged)
+        self._sync_stats_c0()
+        self._last_end = end
+        return response, name, end, False
+
+    def resolve_recursive_edns(self, query: bytes, levels, now: int,
+                               limit: int = 65535, stale_window: int = 0
+                               ) -> tuple[bytes, str, int, bool]:
+        """resolve_recursive 的 EDNS 变体，返回同形四元组。
+
+        仅接受单问题且附加段末项恰有一个合法 OPT 的查询；query、now、
+        limit、报文、OPT 与 ECS 的校验顺序及异常类型完全沿用
+        resolve_edns（_check_resolve_edns_inputs）。OPT 版本非零时在
+        访问区域、缓存、统计或上游前返回 (BADVERS 应答, "edns", now,
+        False)，不校验 levels/stale_window，状态不变。版本 0 的有效
+        长度上限取 min(limit, 查询 UDP 大小即 OPT CLASS)；ECS 仍只
+        允许一个规范选项。
+
+        域内查询完全沿用权威 EDNS 行为（resolve_edns 区内路径）：权威
+        正/负缓存、DO 随附 RRSIG、ECS/DO 分区与统计口径不变，来源为
+        "authority"，不校验 levels/stale_window。域外查询在 query/now/
+        limit 之后、查递归缓存之前完整校验 levels 与 stale_window（同
+        resolve_recursive），随后按 levels 的既有层数、事件顺序、前 2
+        事件、超时与转介规则逐层模拟（与 resolve_recursive 同一时钟与
+        耗尽口径，全超时 UpstreamTimeout、末层转介等其余失败
+        UpstreamError）。递归正/负缓存按 DO 与规范 ECS 共同分区：
+        do=False 且无 ECS 时与普通 resolve_recursive 共用同一分区，
+        DO=1 或携带 ECS 的查询各自独立分区，不同签名需求或客户端子网
+        不互相命中。终态答案、NXDOMAIN 与 NODATA 均以 EDNS 报文返回：
+        附加段恰含一个位于末项的 OPT，回显 CLASS 与 DO，仅在查询含
+        ECS 时回写规范 ECS（scope=source），其他选项不回显；报文无法
+        装入有效上限时抛 EncodeError，且不提交缓存、FIFO、时钟或统计。
+        新鲜命中返回 (应答, "cache", now, True)，来源、结束时刻、命中
+        含义与新鲜条目 TTL 衰减同普通递归；过期条目的陈旧应答规则同
+        resolve_recursive（正答案 RR TTL 置 0、负答案仅 SOA RR TTL 置
+        0，保留上述 OPT 契约），陈旧来源为 "stale"、命中为 True。成功、
+        陈旧返回与上游耗尽按现有原子口径提交 m/x/u/l 统计、
+        recursive_upstream_stats 与 c[0] 同步；BADVERS、参数/报文错误
+        与编码失败不改变任何状态。同初态同输入逐字节相同。
+        """
+        msg, opt, ecs, badvers = _check_resolve_edns_inputs(
+            query, now, limit, self._last_end)
+        if badvers is not None:
+            # 版本协商：不访问区域、缓存、时钟、统计与上游，命中为 False。
+            return badvers, "edns", now, False
+        question = msg["questions"][0]
+        origin = self._cache._origin
+        do = opt[2]
+        effective_limit = min(limit, opt[0])
+        if _name_in_origin(question, origin, self._cache._zone_class):
+            # 域内沿用 resolve_edns 的权威 EDNS 路径：权威正/负缓存、
+            # DO/ECS 分区、随附 RRSIG 与统计口径完全一致。levels 与
+            # stale_window 不校验（同 resolve_recursive 域内契约）。
+            expired = self._authority_miss_expired(
+                question, now, ecs, do=do)
+            response, hit = self._cache.resolve_edns(query, now, limit)
+            self._fold_authority_cleanup()
+            if hit:
+                self._stats_h[0] += 1
+            else:
+                self._stats_m += 1
+                if expired:
+                    self._stats_x += 1
+            self._sync_stats_c0()
+            self._last_end = now
+            return response, "authority", now, hit
+        # 域外：levels/stale_window 的校验顺序与 resolve_recursive 相同，
+        # 先于递归缓存查找；非法不查缓存、不改变任何状态。
+        plans = _validate_levels(levels)
+        _check_stale_window(stale_window)
+        cached, expired, kind = self._recursive_cache_lookup(
+            query, question, now, effective_limit,
+            do=do, ecs=ecs, edns=True)
+        if cached is not None:
+            self._stats_h[_RECURSIVE_HIT_KINDS[kind]] += 1
+            self._sync_stats_c0()
+            self._last_end = now
+            return cached, "cache", now, True
+        # 未命中：m 与（到期时）x 暂记，待成功或耗尽时与 u、l 一并原子
+        # 提交；逐深度事件暂存于 staged（口径同 resolve_recursive）。
+        m_inc = 1
+        x_inc = 1 if expired is not None else 0
+        staged = [[0, 0, 0, 0, 0, 0, 0]
+                  for _ in range(_MAX_RECURSION_LEVELS)]
+        clock = now
+        result = None
+        for depth, plan in enumerate(plans):
+            result, clock, saw_timeout, saw_other = self._attempt_recursive_level(
+                plan, clock, depth == len(plans) - 1, staged[depth])
+            if result is None:
+                # 该层所有上游均未给出可用应答：耗尽时刻为 clock。
+                end = clock
+                stale_response = None
+                if (stale_window > 0 and expired is not None
+                        and end - expired[2] <= stale_window):
+                    # 陈旧应答在任何统计、时钟与缓存提交前先编码；编码
+                    # 失败抛 EncodeError，全部状态保持不变。
+                    stale_response = self._encode_stale_recursive(
+                        query, expired, effective_limit,
+                        edns=True, ecs=ecs)
+                self._stats_m += m_inc
+                self._stats_x += x_inc
+                self._commit_recursive_up(staged)
+                self._sync_stats_c0()
+                self._stats_l[_duration_bucket(
+                    end - now, self._timeout)] += 1
+                if saw_timeout and not saw_other:
+                    self._stats_u[1] += 1
+                    if stale_response is None:
+                        raise UpstreamTimeout(
+                            "all upstream attempts timed out")
+                else:
+                    self._stats_u[2] += 1
+                    if stale_response is None:
+                        raise UpstreamError("no usable upstream reply")
+                self._last_end = end
+                return stale_response, "stale", end, True
+            if result[0] == "referral":
+                continue  # 转介：clock 已推进，进入下一层
+            _tag, rcode, an, ns, name, end = result
+            break
+        # 终态先以 EDNS 契约编码成功再写缓存（有效上限取 min(limit,
+        # OPT CLASS)）：编码失败抛 EncodeError，不改变缓存、FIFO、时钟
+        # 与统计；DO 由查询 OPT 回显，ECS 仅在查询携带时回写。
+        response = _encode_plan_edns(
+            query, rcode, an, ns, effective_limit, ecs)
+        self._store_recursive_terminal(
+            question, end, rcode, an, ns, expired, do=do, ecs=ecs)
         self._stats_m += m_inc
         self._stats_x += x_inc
         self._stats_u[0] += 1
@@ -9353,17 +9696,21 @@ class Resolver:
     def dump_rec(self, now: int) -> str:
         """把有效递归缓存按 FIFO 次序导出为确定性配置文本（只读）。
 
-        顶层键序仅 v,clock,items：v 恒为 1，clock 为入参 now；items
+        顶层键序仅 v,clock,items：v 恒为 2，clock 为入参 now；items
         按递归缓存 FIFO 插入次序列出此刻仍有效的条目（到期项跳过但
-        不删除），不超过 256 项。项键序仅 k,q,t,c,rr：k 为 "p"（正
-        缓存）、"nx"（NXDOMAIN）或 "nd"（NODATA）；q 为小写绝对
+        不删除），不超过 256 项。项键序仅 k,q,t,c,do,e,rr：k 为 "p"
+        （正缓存）、"nx"（NXDOMAIN）或 "nd"（NODATA）；q 为小写绝对
         qname；t、c 为 qtype、qclass（nx 匹配任意 qtype，t 为
-        null）；rr 元素键序 n,t,c,ttl,d，沿用 RR 值域，d 为偶长小写
-        十六进制。p 的 rr 非空，ttl 为各 RR 的剩余正整数；nx/nd 恰
-        一条 SOA，ttl 为负缓存剩余值。输出为紧凑 ASCII JSON、整数
-        十进制、末尾单换行。now 非 int 或为 bool 抛 TypeError；
-        now<0 或早于上次成功结束时刻抛 CacheError，均无副作用。
-        只读：不改变任何状态，同状态同参逐字节相同。
+        null）；do 为 DO 分区布尔值，e 为 ECS 分区——无 ECS 时为
+        null，否则为键序 fam,src,addr 的对象（fam 1/2、src 前缀长度、
+        addr 偶长小写十六进制）；普通 resolve_recursive 条目与无
+        DO/ECS 的 EDNS 递归条目共用 do=false、e=null 分区。rr 元素
+        键序 n,t,c,ttl,d，沿用 RR 值域，d 为偶长小写十六进制。p 的
+        rr 非空，ttl 为各 RR 的剩余正整数；nx/nd 恰一条 SOA，ttl 为
+        负缓存剩余值。输出为紧凑 ASCII JSON、整数十进制、末尾单换
+        行。now 非 int 或为 bool 抛 TypeError；now<0 或早于上次成功
+        结束时刻抛 CacheError，均无副作用。只读：不改变任何状态，同
+        状态同参逐字节相同。
         """
         if not isinstance(now, int) or isinstance(now, bool):
             raise TypeError("now must be int")
@@ -9376,8 +9723,14 @@ class Resolver:
                 elapsed = now - inserted
                 if elapsed >= min(rr[3] for rr in an):
                     continue  # 到期项不导出（只读，不删除）
+                if len(key) == 3:
+                    qname, qtype, qclass = key
+                    do, partition = False, None
+                else:
+                    qname, qtype, qclass, do, partition = key
                 items.append({
-                    "k": "p", "q": key[0], "t": key[1], "c": key[2],
+                    "k": "p", "q": qname, "t": qtype, "c": qclass,
+                    "do": do, "e": _rec_ecs_obj(partition),
                     "rr": [{"n": _labels_to_name(labels), "t": rrtype,
                             "c": rrclass, "ttl": ttl - elapsed,
                             "d": rdata.hex()}
@@ -9390,32 +9743,45 @@ class Resolver:
                     continue  # 到期项不导出（只读，不删除）
                 if key[0] == "nxdomain":
                     kind, qname, qtype, qclass = "nx", key[1], None, key[2]
+                    do, partition = False, None
+                elif key[0] == "nxdomain-e":
+                    kind = "nx"
+                    _tag0, qname, qclass, do, partition = key
+                    qtype = None
+                elif len(key) == 4:
+                    kind = "nd"
+                    _tag0, qname, qtype, qclass = key
+                    do, partition = False, None
                 else:
                     kind = "nd"
-                    qname, qtype, qclass = key[1], key[2], key[3]
+                    _tag0, qname, qtype, qclass, do, partition = key
                 items.append({
                     "k": kind, "q": qname, "t": qtype, "c": qclass,
+                    "do": do, "e": _rec_ecs_obj(partition),
                     "rr": [{"n": _labels_to_name(soa[0]), "t": soa[1],
                             "c": soa[2], "ttl": remaining,
                             "d": soa[4].hex()}],
                 })
-        config = {"v": 1, "clock": now, "items": items}
+        config = {"v": _REC_DUMP_VERSION_V2, "clock": now, "items": items}
         return json.dumps(config, ensure_ascii=True,
                           separators=(",", ":")) + "\n"
 
     def load_rec(self, text: str, now: int) -> int:
         """校验递归缓存配置文本并原子替换递归缓存，返回保留的条目数。
 
-        文本须为 dump_rec 的 v=1 配置：顶层键序 v,clock,items，项键序
-        k,q,t,c,rr，rr 元素键序 n,t,c,ttl,d。校验顺序为：text/now 类型
-        （TypeError）；文本长度、JSON 解析、重复键、键序、非 RR 字段与
-        重复缓存键（ConfigError）；now 为负、回退或小于 clock
-        （CacheError）；RR 字段值与 SOA（RecordError）。p 项 RR 的
-        ttl 必须为正，ttl<=0 在按 now-clock 衰减之前即抛 RecordError；
-        nx/nd 的负 TTL 允许衰减后为零，到期丢弃。全部通过后按
-        now-clock 衰减各 ttl、丢弃到期项，原子替换递归正负缓存与
-        FIFO 并置成功时刻为 now；权威缓存、统计与清理计数不变。任何
-        失败都无副作用；同初态同参逐字节一致。
+        文本须为 dump_rec 的 v=1 或 v=2 配置：顶层键序 v,clock,items，
+        v=1 项键序 k,q,t,c,rr（历史格式，条目按 do=false、无 ECS 的普通
+        分区恢复），v=2 项键序 k,q,t,c,do,e,rr（do 为 bool、e 为 null
+        或 fam/src/addr 分区对象，resolve_recursive_edns 条目按 DO 与
+        规范 ECS 分区恢复）。校验顺序为：text/now 类型（TypeError）；
+        文本长度、JSON 解析、重复键、键序、非 RR 字段与重复缓存键
+        （ConfigError）；now 为负、回退或小于 clock（CacheError）；
+        RR 字段值与 SOA（RecordError）。p 项 RR 的 ttl 必须为正，
+        ttl<=0 在按 now-clock 衰减之前即抛 RecordError；nx/nd 的负
+        TTL 允许衰减后为零，到期丢弃。全部通过后按 now-clock 衰减各
+        ttl、丢弃到期项，原子替换递归正负缓存与 FIFO 并置成功时刻为
+        now；权威缓存、统计与清理计数不变。任何失败都无副作用；同初
+        态同参逐字节一致。
         """
         if not isinstance(text, str):
             raise TypeError("text must be str")
