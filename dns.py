@@ -489,10 +489,14 @@
   校验与异常沿用 RateLimiter.respond，未超 limit 返回
   (response, "pass", 余量)，超额按 slip 周期返回既有格式截断应答
   (tc, "slip", 0) 或 (None, "drop", 0)；状态至多 4096 项，插入第
-  4097 键前淘汰 (窗截止, 创建序) 最小项；stats(reset=False) 返回键序
-  pass,drop,slip,expired,evicted,keys,capacity 的紧凑 ASCII JSON
-  （末尾换行），capacity 恒为 4096，reset=True 返回重置前快照并清零
-  五个累计计数。
+  4097 键前淘汰 (窗截止, 创建序) 最小项；apply_edns 为 EDNS 变体
+  （查询与应答均须恰含一个合法 OPT，应答 OPT 为附加段末项），与
+  apply 共用计数表与统计，键取头低 4 位与 OPT TTL 高 8 位组成的扩展
+  RCODE（为零时与同普通返回码共享额度），slip 截断报文附加段仅保留
+  一个根名 OPT、CLASS 与 TTL 逐字节沿用应答 OPT、RDLENGTH=0；
+  stats(reset=False) 返回键序 pass,drop,slip,expired,evicted,keys,
+  capacity 的紧凑 ASCII JSON（末尾换行），capacity 恒为 4096，
+  reset=True 返回重置前快照并清零五个累计计数。
 - replay_rate(rules, ops, expected=None, policy=None, default="deny")
   -> str: 在 RateLimiter 上依次回放 allow/authorize/reload/rollback
   操作并记录为紧凑 ASCII JSON（末尾单换行）；ops 限 0..4096 项，
@@ -5341,7 +5345,8 @@ def _matching_reply(query, reply):
     return reply[_MIN_MESSAGE_LEN:end] == query[_MIN_MESSAGE_LEN:]
 
 
-def _decode_edns_response(query, response, max_len=None):
+def _decode_edns_response(query, response, max_len=None,
+                          extended_rcode=False):
     """校验 EDNS 应答并返回其 OPT 的 (CLASS, TTL)；任何不符抛 EncodeError。
 
     response 须 QR=1、ID 与 QDCOUNT 同 query、问题字节与 query 的问题段
@@ -5349,8 +5354,10 @@ def _decode_edns_response(query, response, max_len=None):
     owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags 仅
     DO、RDLENGTH 内选项 TLV 完整（同 _decode_edns_query 的 OPT 契约，
     此处违例一律 EncodeError）。max_len 非 None 时总长度还须不超该
-    有效上限，否则抛 EncodeError。query 须已通过 _decode_edns_query
-    校验（单问题）。
+    有效上限，否则抛 EncodeError。extended_rcode 为 True 时 OPT TTL
+    高 8 位扩展 RCODE 允许 0..255（TTL 仍原样返回，供调用方组合 12
+    位扩展 RCODE），默认 False 保持扩展码必须为 0 的既有契约。query
+    须已通过 _decode_edns_query 校验（单问题）。
     """
     if not _MIN_MESSAGE_LEN <= len(response) <= _MAX_REPLY_LEN:
         raise EncodeError("bad response length")
@@ -5412,7 +5419,7 @@ def _decode_edns_response(query, response, max_len=None):
             raise EncodeError("opt owner must be uncompressed root")
         if rrclass < _MIN_OPT_CLASS:
             raise EncodeError("opt class out of range")
-        if ttl >> 24:
+        if not extended_rcode and ttl >> 24:
             raise EncodeError("opt extended rcode must be 0")
         if ttl & 0xFFFF & ~_FLAG_DO:
             raise EncodeError("opt flags must be DO only")
@@ -11675,6 +11682,24 @@ class ResponseRateLimiter:
     (窗截止时刻, 创建序) 最小项，单次调用开销为 O(4096)。相同初态与
     相同调用序列逐字节相同。
 
+    apply_edns(query, response, client, now) 是 apply 的 EDNS 变体，与
+    apply 共用同一张至多 4096 键的计数表、同一创建序与同一组累计统计：
+    query 须 QR=0、恰一个问题且附加段末项是唯一合法 OPT（OPT 缺失、
+    OPT 或选项 TLV 非法、尾随字节抛 EDNSError，QR 或问题数错抛
+    EncodeError，长度非法抛 EDNSError），response 须 QR=1、ID 与问题
+    段同 query 逐字节相同且仅在附加段末项含一个合法 OPT（OPT TTL 高
+    8 位扩展 RCODE 允许 0..255；应答不匹配或 OPT 布局非法抛
+    EncodeError）；参数类型错抛 TypeError，client 非法抛 PolicyError，
+    now 为负或相对已接受时钟回退抛 CacheError；全部校验先于过期项删除、
+    计数与统计，异常不改变表、时钟、创建序及统计。计数键的网段、
+    qname、qtype、窗号口径同 apply，RCODE 取头低 4 位与 OPT TTL 高 8
+    位组成的扩展 RCODE；OPT 的 UDP 大小、版本、DO 位与选项不入键，故
+    扩展 RCODE 为零时与 apply 同普通返回码共享额度，非零值分别计数。
+    返回三元组与动作语义同 apply；slip 截断报文保留 query 的 ID 与原
+    问题字节，flags 沿用 response 并置 TC，清空回答与授权段，附加段仅
+    保留一个未压缩根名 OPT（TYPE41，CLASS、TTL 逐字节沿用 response 的
+    OPT，RDLENGTH=0）。
+
     stats(reset=False) 返回固定键序 pass,drop,slip,expired,evicted,
     keys,capacity 的紧凑 ASCII JSON（末尾一个换行）：值均为非负十进制
     整数，capacity 恒为 4096；pass/drop/slip 按成功 apply 的返回动作
@@ -11790,6 +11815,134 @@ class ResponseRateLimiter:
             tc = (query[0:2] + flags.to_bytes(2, "big")
                   + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
                   + query[12:])
+            return tc, "slip", 0
+        self._stat["drop"] += 1
+        self._last_now = now
+        return None, "drop", 0
+
+    def apply_edns(self, query: bytes, response: bytes, client: str,
+                   now: int) -> tuple[bytes | None, str, int]:
+        """按 (网段, qname, qtype, 扩展 RCODE, 窗号) 固定窗限流 EDNS 应答。
+
+        校验与异常顺序同 RateLimiter.respond_edns：query、response 须为
+        bytes，client 须为 str，now 须为非 bool int，否则 TypeError；
+        now 为负或相对上次成功调用回退抛 CacheError；client 非字面 IP
+        地址抛 PolicyError。query 须 QR=0、恰一个问题且附加段末项是唯一
+        合法 OPT：长度非法抛 EDNSError，QR 置位或问题数非 1 抛
+        EncodeError，OPT 缺失、OPT 或选项 TLV 非法、存在尾随字节抛
+        EDNSError。response 须 QR=1、ID 与问题段同 query 逐字节相同，且
+        全报文恰有一个合法 OPT 并为附加段末项（OPT 高 8 位扩展 RCODE
+        允许 0..255，版本 0..255、flags 仅 DO、选项 TLV 完整），应答不
+        匹配、OPT 布局非法或存在尾随字节抛 EncodeError。全部校验先于
+        过期项删除、计数与统计变更，任何异常都不改变计数表、创建序、
+        最后时钟与统计。
+
+        校验通过后与 apply 共用同一张计数表（至多 4096 键）、同一组
+        pass/drop/slip/expired/evicted 统计与同一个创建序：先清过期窗，
+        插入新键前按 (窗截止, 创建序) 淘汰，随后计数加一。键的网段、
+        qname、qtype、窗号口径同 apply；RCODE 取应答 flags 低 4 位与
+        OPT TTL 高 8 位组合的 12 位扩展 RCODE，因此扩展 RCODE 为零时与
+        apply 的同普通返回码共享计数额度，非零值各自分别计数；OPT 的
+        UDP 大小、版本、DO 位与选项均不入键。未超 limit 返回
+        (response, "pass", 剩余)；超额序号 n=计数-limit，slip>0 且
+        n%slip==0 时返回 (tc, "slip", 0)，否则返回 (None, "drop", 0)，
+        每次成功调用仅累计一种动作。tc 保留 query 的 ID 与原问题字节，
+        flags 取 response 并置 TC，QDCOUNT=1、ANCOUNT=NSCOUNT=0、
+        ARCOUNT=1，回答与授权段清空，附加段仅含一个 owner 为未压缩根
+        名的 OPT：TYPE41，CLASS 与 TTL 逐字节沿用 response 的 OPT，
+        RDLENGTH=0。单次调用时间 O(4096)、额外空间 O(1)；相同初态与
+        调用序列逐字节一致。
+        """
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # client 与 query 的校验顺序同 respond_edns：先地址、后解码。
+        try:
+            addr = ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        if int.from_bytes(query[2:4], "big") & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if int.from_bytes(query[4:6], "big") != 1:
+            raise EncodeError("query must contain exactly one question")
+        # EDNS 查询须恰含一个合法 OPT：OPT 缺失、非法或尾随字节均为
+        # EDNSError（_decode_edns_query 的 OPT 契约）。
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
+        # 应答 OPT 高 8 位为扩展 RCODE：入键需要，允许 0..255；其余布局
+        # 契约（QR、ID、问题、唯一末项合法 OPT、尾随字节）违例一律
+        # EncodeError。
+        opt_class, opt_ttl = _decode_edns_response(
+            query, response, extended_rcode=True)
+        # 客户端归入 IPv4 /24 或 IPv6 /56 网段，取规范网段文本作为键。
+        prefix = 24 if addr.version == 4 else 56
+        subnet = str(ipaddress.ip_network(client).supernet(
+            new_prefix=prefix))
+        qname = msg["questions"][0]["name"]
+        qtype = msg["questions"][0]["type"]
+        # 12 位扩展 RCODE = 头低 4 位 | OPT TTL 高 8 位 << 4；为零时与
+        # apply 的普通返回码键完全相同，共享额度；OPT 其余字段不入键。
+        rcode = ((int.from_bytes(response[2:4], "big") & 0x000F)
+                 | ((opt_ttl >> 24) << 4))
+        # 计数表、创建序、固定窗、slip、容量淘汰与统计完全沿用 apply：
+        # 先删除当前已过期窗（截止时刻 <= now），再处理当前键。
+        expired = 0
+        for dead in [key for key, value in self._counts.items()
+                     if value[1] <= now]:
+            del self._counts[dead]
+            expired += 1
+        bucket = now // self._window
+        key = (subnet, qname, qtype, rcode, bucket)
+        entry = self._counts.get(key)
+        evicted = 0
+        if entry is None:
+            # 插入第 4097 个键前淘汰 (截止, 创建序) 最小项。
+            if len(self._counts) >= _RATE_TABLE_CAPACITY:
+                oldest = min(self._counts,
+                             key=lambda k: (self._counts[k][1],
+                                            self._counts[k][3]))
+                del self._counts[oldest]
+                evicted += 1
+            self._counts[key] = [bucket * self._window,
+                                 (bucket + 1) * self._window,
+                                 0, self._serial]
+            self._serial += 1
+            entry = self._counts[key]
+        # 成功调用：计数加一，统计原子提交，时钟随之推进。
+        entry[2] += 1
+        count = entry[2]
+        self._stat["expired"] += expired
+        self._stat["evicted"] += evicted
+        if count <= self._limit:
+            self._stat["pass"] += 1
+            self._last_now = now
+            return response, "pass", self._limit - count
+        excess = count - self._limit
+        if self._slip > 0 and excess % self._slip == 0:
+            self._stat["slip"] += 1
+            self._last_now = now
+            # 截断应答格式同 RateLimiter.respond_edns 的 TC 应答：ID 与
+            # 问题字节取 query，flags 取 response 并置 TC，附加段仅保留
+            # 一个根 owner OPT，CLASS/TTL 逐字节沿用 response 的 OPT。
+            query_end = _reply_question_end(query, 1)
+            flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
+            tc = (query[0:2] + flags.to_bytes(2, "big")
+                  + (1).to_bytes(2, "big") + (0).to_bytes(2, "big")
+                  + (0).to_bytes(2, "big") + (1).to_bytes(2, "big")
+                  + query[_MIN_MESSAGE_LEN:query_end]
+                  + b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+                  + opt_class.to_bytes(2, "big") + opt_ttl.to_bytes(4, "big")
+                  + (0).to_bytes(2, "big"))
             return tc, "slip", 0
         self._stat["drop"] += 1
         self._last_now = now
