@@ -882,6 +882,10 @@ _MAX_LIMIT = 65535
 # answer 子命令区域文件读取上限（字节）；多读一字节即可判定超限，
 # 避免把超限文件整体读入内存。
 _MAX_ANSWER_ZONE_BYTES = 1048576
+# answer_catalog 的目录区域数量范围（含两端）：接收一至二百五十六个
+# 现有格式区域（{"origin", "records"}）。
+_CATALOG_MIN_ZONES = 1
+_CATALOG_MAX_ZONES = 256
 _MAX_POINTER_TARGET = 0x3FFF
 _MAX_SECTION_RECORDS = 65535
 _FLAGS_RESPONSE = 0x8400  # QR | AA
@@ -2977,6 +2981,88 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
         raise EncodeError("query or limit not answerable")
     origin, records, zone_class = _validate_zone(zone)
+    rcode, an, ns, ar, authoritative = _answer_plan(
+        msg, origin, records, zone_class)
+    return _encode_plan(query, rcode, an, ns, limit, ar=ar,
+                        authoritative=authoritative)
+
+
+def _validate_catalog(zones):
+    """校验 answer_catalog 的区域目录，按输入顺序返回每项的
+    (origin 标签列表, 规范化记录, 统一 class)。
+
+    目录为一至二百五十六个现有格式区域：zones 非 list 抛 TypeError；
+    数量越界、元素非 dict、或同一 class 下规范化 origin 重复抛
+    ZoneError。每个区域按 _validate_zone 现契约完整校验，owner、SOA、
+    记录与 rdata 错误仍抛 ZoneError/RecordError（records/rr 的容器
+    类型错误仍抛 TypeError）。所有区域逐项校验完毕，不因已存在候选
+    区域而跳过后续项；线格式等价的 origin（大小写、合法 \\DDD/\\. 转义
+    写法不同）规范化后视为同一 origin。
+    """
+    if not isinstance(zones, list):
+        raise TypeError("zones must be list")
+    if not _CATALOG_MIN_ZONES <= len(zones) <= _CATALOG_MAX_ZONES:
+        raise ZoneError("catalog zone count out of range")
+    validated = []
+    seen = set()
+    for zone in zones:
+        # 目录层契约：元素非 dict 为 ZoneError（_validate_zone 自身对
+        # 非 dict 的 TypeError 仅用于单区域入口）。
+        if not isinstance(zone, dict):
+            raise ZoneError("zone must be dict")
+        origin, records, zone_class = _validate_zone(zone)
+        key = (zone_class, tuple(origin))
+        if key in seen:
+            raise ZoneError("duplicate zone origin and class in catalog")
+        seen.add(key)
+        validated.append((origin, records, zone_class))
+    return validated
+
+
+def answer_catalog(query: bytes, zones: list, limit: int = 512) -> bytes:
+    """按多区域目录对单问题查询给出确定性权威应答。
+
+    先严格沿用 answer 的 query/limit 校验顺序（decode_query、limit 整数
+    与范围、QR=0 且恰一个问题），再按输入顺序完整校验全部区域。选区仅
+    依据问题 class 与规范化名称后缀：在 class 相同且 origin 为查询名
+    后缀的区域中选 origin 标签最多者；根区域可兜底，父区与子区并存时
+    恒选子区（父区委派切点不影响目录选区）。同 class 下重复的线格式
+    等价 origin 在校验阶段即拒绝；区域排列不改变选区与应答字节。
+
+    选中后仅读取被选区域，完整沿用 answer 的精确匹配、通配优先级、
+    ANY、CNAME 环与跳数限制、切点 DS 例外、胶水、负应答 SOA、压缩与
+    RRset 原子截断语义；CNAME 目标即使落在目录内另一子区也不跨区继续
+    解析，区域记录顺序与重复项原样保留。无匹配区域时返回确定性
+    REFUSED：保留 ID 与问题、保留既有查询标志位，QR 置一，AA、TC 清零，
+    RCODE=5，三段为空；头部加问题超过 limit 时抛 EncodeError。
+    """
+    msg = decode_query(query)  # MessageError/TypeError 原样传播
+    _check_int(limit, "limit")
+    questions = msg["questions"]
+    if (msg["flags"] & 0x8000 or len(questions) != 1
+            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+        raise EncodeError("query or limit not answerable")
+    validated = _validate_catalog(zones)
+    question = questions[0]
+    qlabels = _normalize_name(question["name"])
+    qclass = question["class"]
+    chosen = None
+    for origin, records, zone_class in validated:
+        if zone_class != qclass:
+            continue
+        if (len(qlabels) < len(origin)
+                or qlabels[len(qlabels) - len(origin):] != origin):
+            continue
+        # 同一查询名至多有一个给定标签数的后缀；同 class 等长且等价的
+        # origin 已在目录校验时按重复拒绝，故严格比较即可与排列无关。
+        if chosen is None or len(origin) > len(chosen[0]):
+            chosen = (origin, records, zone_class)
+    if chosen is None:
+        # 非权威 REFUSED：authoritative=False 使 AA 清零，三段为空故不置
+        # TC；仅头部加问题超限时由编码计划抛 EncodeError。
+        return _encode_plan(query, _RCODE_REFUSED, [], [], limit,
+                            authoritative=False)
+    origin, records, zone_class = chosen
     rcode, an, ns, ar, authoritative = _answer_plan(
         msg, origin, records, zone_class)
     return _encode_plan(query, rcode, an, ns, limit, ar=ar,
