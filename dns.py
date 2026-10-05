@@ -943,6 +943,9 @@ _MAX_EDE_TEXT_LEN = 65529
 _MAX_CNAME_CHAIN = 16
 _RCODE_REFUSED = 5
 _RCODE_NXDOMAIN = 3
+# answer_catalog 目录区域数量上下限（含端点）。
+_CATALOG_MIN_ZONES = 1
+_CATALOG_MAX_ZONES = 256
 _RCODE_BADVERS = 16
 _CACHE_CAPACITY = 256
 # 区域修订历史容量：每个成功换区修订保存一份规范化区域深拷贝，
@@ -2977,6 +2980,93 @@ def answer(query: bytes, zone: dict, limit: int = 512) -> bytes:
             or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
         raise EncodeError("query or limit not answerable")
     origin, records, zone_class = _validate_zone(zone)
+    rcode, an, ns, ar, authoritative = _answer_plan(
+        msg, origin, records, zone_class)
+    return _encode_plan(query, rcode, an, ns, limit, ar=ar,
+                        authoritative=authoritative)
+
+
+def _encode_catalog_refusal(msg, limit):
+    """目录中无同 class 且 origin 为查询名后缀的区域时的确定性 REFUSED。
+
+    与 _encode_policy_refusal 的差别：AA 同样清零（不置权威位）。ID 保留，
+    问题按规范化 qname/qtype/qclass 重编码；flags 为
+    QR|(查询 flags 的 opcode/RD/CD 位)|REFUSED，TC 清零，QDCOUNT=1，
+    三个资源记录段计数均为 0。仅头部与问题超 limit 抛 EncodeError。
+    """
+    out = bytearray()
+    out += msg["id"].to_bytes(2, "big")
+    flags = _FLAG_QR | (msg["flags"] & _FLAGS_KEPT) | _RCODE_REFUSED
+    out += flags.to_bytes(2, "big")
+    out += (1).to_bytes(2, "big")
+    out += (0).to_bytes(6)  # ANCOUNT/NSCOUNT/ARCOUNT 均为 0
+    question = msg["questions"][0]
+    _write_name(out, _normalize_name(question["name"]), {})
+    out += question["type"].to_bytes(2, "big")
+    out += question["class"].to_bytes(2, "big")
+    if len(out) > limit:
+        raise EncodeError("header and question exceed limit")
+    return bytes(out)
+
+
+def answer_catalog(query: bytes, zones: list, limit: int = 512) -> bytes:
+    """在一至二百五十六个区域组成的目录中给出确定性权威应答。
+
+    先按 answer 的既有顺序校验 query 与 limit（报文/长度/编码错误沿用
+    MessageError、TypeError、EncodeError），再按输入顺序完整校验全部
+    区域：元素不是 dict、数量越界或规范化后 (origin, class) 重复抛
+    ZoneError，区域自身的 owner、SOA、记录与 rdata 错误沿用
+    _validate_zone 的既有 ZoneError/RecordError/TypeError；不因已找到
+    候选而跳过后续区域。
+
+    选区只在问题 class 相同、规范化 origin 为规范化查询名后缀的区域中
+    进行，取 origin 标签数最多者（根区域兜底，父子并存恒选子区，不受
+    父区委派记录影响）；大小写或合法转义的线格式等价 origin 视为同一
+    origin，排列次序不改变选区与应答字节。选中后完整沿用 answer 的
+    解析、切点、胶水、负应答、压缩与截断语义，且只读取被选区域；
+    CNAME 目标不跨目录中的另一子区继续解析。无匹配区域时返回 AA、TC
+    清零、三段为空的确定性 REFUSED（头部与问题超 limit 抛 EncodeError）。
+    """
+    msg = decode_query(query)  # MessageError/TypeError 原样传播
+    _check_int(limit, "limit")
+    questions = msg["questions"]
+    if (msg["flags"] & 0x8000 or len(questions) != 1
+            or not _MIN_LIMIT <= limit <= _MAX_LIMIT):
+        raise EncodeError("query or limit not answerable")
+    if not isinstance(zones, list):
+        raise TypeError("zones must be list")
+    if not _CATALOG_MIN_ZONES <= len(zones) <= _CATALOG_MAX_ZONES:
+        raise ZoneError("catalog must contain 1..256 zones")
+    # 全部区域先按输入顺序完整校验并规范化，再做选区：后续非法项不得被
+    # 前面的候选掩盖。(origin 标签元组, class) 唯一：线格式等价的大小写
+    # 或转义写法在此折叠为同一键。
+    validated = []
+    seen = set()
+    for zone in zones:
+        if not isinstance(zone, dict):
+            raise ZoneError("catalog zone must be dict")
+        origin, records, zone_class = _validate_zone(zone)
+        key = (tuple(origin), zone_class)
+        if key in seen:
+            raise ZoneError("duplicate catalog zone origin and class")
+        seen.add(key)
+        validated.append((origin, records, zone_class))
+    question = questions[0]
+    qlabels = _normalize_name(question["name"])
+    qclass = question["class"]
+    chosen = None  # (origin, records, zone_class)，仅存标签最长者
+    for origin, records, zone_class in validated:
+        if zone_class != qclass:
+            continue
+        if (len(qlabels) < len(origin)
+                or qlabels[len(qlabels) - len(origin):] != origin):
+            continue
+        if chosen is None or len(origin) > len(chosen[0]):
+            chosen = (origin, records, zone_class)
+    if chosen is None:
+        # 无同 class 后缀区域（含仅有异 class 区域）：非权威 REFUSED。
+        return _encode_catalog_refusal(msg, limit)
+    origin, records, zone_class = chosen
     rcode, an, ns, ar, authoritative = _answer_plan(
         msg, origin, records, zone_class)
     return _encode_plan(query, rcode, an, ns, limit, ar=ar,
