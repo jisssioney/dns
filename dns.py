@@ -1310,14 +1310,15 @@ def decode_message(data: bytes) -> dict:
 def _decode_edns_query(data):
     """解码可含单个 OPT 的查询报文。
 
-    返回 (msg, (opt_class, version, do, opts) 或 None)。问题段解码契约
-    同 decode_query，但查询截断（问题区越界）、非法名字（含压缩问题）、
-    AN/NS 非空、非法 AR/OPT 与尾随字节一律抛 EDNSError；报文长度与
-    问题数等其余错误仍抛 MessageError。AR 限 0 或 1 条，有则须为未压缩
-    根 owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags
-    仅 DO 的 OPT。OPT 的 RDATA 按选项 TLV 解析：每项为网络序
-    uint16 code、uint16 length、length 字节 data，重复项保序；头或
-    数据截断、RDLENGTH 内残缺抛 EDNSError。
+    返回 (msg, (opt_class, version, do, ext_rcode, opts) 或 None)。
+    问题段解码契约同 decode_query，但查询截断（问题区越界）、非法名字
+    （含压缩问题）、AN/NS 非空、非法 AR/OPT 与尾随字节一律抛
+    EDNSError；报文长度与问题数等其余错误仍抛 MessageError。AR 限 0 或
+    1 条，有则须为未压缩根 owner、TYPE41、CLASS512..65535、扩展码 0、
+    版本 0..255、flags 仅 DO 的 OPT；ext_rcode 恒为 0（TTL 首字节，
+    逐字节保留以便应答构造方沿用）。OPT 的 RDATA 按选项 TLV 解析：每项
+    为网络序 uint16 code、uint16 length、length 字节 data，重复项保序；
+    头或数据截断、RDLENGTH 内残缺抛 EDNSError。
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -1386,7 +1387,8 @@ def _decode_edns_query(data):
                 raise EDNSError("opt option data truncated")
             opts.append((code, bytes(data[pos:pos + opt_len])))
             pos += opt_len
-        opt = (rrclass, (ttl >> 16) & 0xFF, bool(ttl & _FLAG_DO), opts)
+        opt = (rrclass, (ttl >> 16) & 0xFF, bool(ttl & _FLAG_DO),
+               (ttl >> 24) & 0xFF, opts)
     if pos != len(data):
         raise EDNSError("trailing bytes")
     return {"id": msg_id, "flags": flags, "questions": questions}, opt
@@ -2115,7 +2117,7 @@ def _encode_badvers(msg, opt, limit):
     DO?0x01008000:0x01000000（扩展码取 BADVERS>>4、版本 0），
     RDLENGTH=0。上限 min(limit, CLASS)，超限抛 EncodeError 且不置 TC。
     """
-    opt_class, _version, do, _opts = opt
+    opt_class, _version, do, _ext_rcode, _opts = opt
     limit = min(limit, opt_class)
     out = bytearray()
     out += msg["id"].to_bytes(2, "big")
@@ -2202,7 +2204,7 @@ def _edns_core(query: bytes, model: dict, rcode: int = 0,
         if not 0 <= rcode <= _MAX_EDNS_RCODE:
             raise EncodeError("rcode out of range")
         opt_rdata = _validate_edns_options(options)
-        opt_class, _opt_version, do, _query_opts = opt
+        opt_class, _opt_version, do, _ext_rcode, _query_opts = opt
         limit = min(limit, opt_class)
         ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
         opt_wire = (b"\x00" + _TYPE_OPT.to_bytes(2, "big")
@@ -2270,7 +2272,7 @@ def edns_cookie(query: bytes, model: dict, secret: bytes, client: str,
     if opt[1] != 0:
         raise CookieError("OPT version must be 0")
     client_cookie = None
-    for code, data in opt[3]:
+    for code, data in opt[4]:
         if code != _OPT_CODE_COOKIE:
             continue
         if client_cookie is not None:
@@ -2360,7 +2362,7 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
         return _encode_badvers(msg, opt, limit)
     # 版本 0：查询 Padding 至多一项且 data 全零，其余选项不回显。
     seen_padding = False
-    for code, data in opt[3]:
+    for code, data in opt[4]:
         if code != _OPT_CODE_PADDING:
             continue
         if seen_padding:
@@ -2368,7 +2370,7 @@ def edns_padded(query: bytes, model: dict, block: int = 128,
         if any(data):
             raise EDNSError("PADDING data must be all zeros")
         seen_padding = True
-    opt_class, _opt_version, do, _query_opts = opt
+    opt_class, _opt_version, do, _ext_rcode, _query_opts = opt
     limit = min(limit, opt_class)
     ttl = ((rcode >> 4) << 24) | (_FLAG_DO if do else 0)
     # OPT 占 ar 一席且固定为末项；计数超限时先做 RRset 原子预修剪。
@@ -5050,7 +5052,7 @@ class PositiveCache:
             return _encode_badvers(msg, opt, limit), False
         # 版本 0：ECS 校验先于缓存访问（含时钟回退判断），任何非法均
         # 不改变缓存、统计或最后时刻；其他选项码原样忽略。
-        ecs = _parse_query_ecs(opt[3])
+        ecs = _parse_query_ecs(opt[4])
         if self._last_now is not None and now < self._last_now:
             raise CacheError("now must be non-negative and monotonic")
         return self._resolve_cached(msg, query, now, limit,
@@ -5341,16 +5343,19 @@ def _matching_reply(query, reply):
     return reply[_MIN_MESSAGE_LEN:end] == query[_MIN_MESSAGE_LEN:]
 
 
-def _decode_edns_response(query, response, max_len=None):
-    """校验 EDNS 应答并返回其 OPT 的 (CLASS, TTL)；任何不符抛 EncodeError。
+def _decode_edns_response(query, response, max_len=None,
+                          extended_rcode=False):
+    """校验 EDNS 应答并返回其 OPT 的 (CLASS, TTL 原值, 扩展 RCODE)；不符抛 EncodeError。
 
     response 须 QR=1、ID 与 QDCOUNT 同 query、问题字节与 query 的问题段
     逐字节相同，且全报文恰有一个合法 OPT 并为附加段末项：未压缩根
-    owner、TYPE41、CLASS512..65535、扩展码 0、版本 0..255、flags 仅
-    DO、RDLENGTH 内选项 TLV 完整（同 _decode_edns_query 的 OPT 契约，
-    此处违例一律 EncodeError）。max_len 非 None 时总长度还须不超该
-    有效上限，否则抛 EncodeError。query 须已通过 _decode_edns_query
-    校验（单问题）。
+    owner、TYPE41、CLASS512..65535、版本 0..255、flags 仅 DO、
+    RDLENGTH 内选项 TLV 完整（同 _decode_edns_query 的 OPT 契约，
+    此处违例一律 EncodeError）。extended_rcode 为 False（既有契约）时
+    OPT TTL 首字节的扩展 RCODE 须为 0，否则抛 EncodeError；为 True 时
+    允许 0..255 并作为第三返回值（TTL 原值同时逐字节保留为第二返回
+    值）。max_len 非 None 时总长度还须不超该有效上限，否则抛
+    EncodeError。query 须已通过 _decode_edns_query 校验（单问题）。
     """
     if not _MIN_MESSAGE_LEN <= len(response) <= _MAX_REPLY_LEN:
         raise EncodeError("bad response length")
@@ -5407,12 +5412,15 @@ def _decode_edns_response(query, response, max_len=None):
             continue
         if opt is not None or index != total - 1 or index < ancount + nscount:
             raise EncodeError("OPT must be the last additional record")
-        # OPT 字段契约同 _decode_edns_query，违例一律 EncodeError。
+        # OPT 字段契约同 _decode_edns_query，违例一律 EncodeError；
+        # extended_rcode=False 时扩展 RCODE 须为 0（既有契约），True 时
+        # 允许任意值并随第三返回值返回。
         if response[start] != 0:
             raise EncodeError("opt owner must be uncompressed root")
         if rrclass < _MIN_OPT_CLASS:
             raise EncodeError("opt class out of range")
-        if ttl >> 24:
+        ext_rcode = ttl >> 24
+        if not extended_rcode and ext_rcode:
             raise EncodeError("opt extended rcode must be 0")
         if ttl & 0xFFFF & ~_FLAG_DO:
             raise EncodeError("opt flags must be DO only")
@@ -5425,7 +5433,7 @@ def _decode_edns_response(query, response, max_len=None):
             if rdata + opt_len > opt_end:
                 raise EncodeError("opt option data truncated")
             rdata += opt_len
-        opt = (rrclass, ttl)
+        opt = (rrclass, ttl, ext_rcode)
     if pos != len(response):
         raise EncodeError("trailing bytes")
     if opt is None:
@@ -5709,7 +5717,7 @@ def _check_resolve_edns_inputs(query, now, limit, last_end):
         # 区域、缓存、时钟、统计或上游。
         return msg, opt, None, _encode_badvers(msg, opt, limit)
     # 版本 0：ECS 校验先于缓存访问（含时钟回退判断）。
-    ecs = _parse_query_ecs(opt[3])
+    ecs = _parse_query_ecs(opt[4])
     if last_end is not None and now < last_end:
         raise CacheError("now must be non-negative and monotonic")
     return msg, opt, ecs, None
@@ -5758,7 +5766,7 @@ def _check_resolve_cookie_inputs(query, client, secret, now, limit,
         raise CookieError("OPT version must be 0")
     client_cookie = None
     server_cookie = b""
-    for code, data in opt[3]:
+    for code, data in opt[4]:
         if code != _OPT_CODE_COOKIE:
             continue
         if client_cookie is not None:
@@ -5779,7 +5787,7 @@ def _check_resolve_cookie_inputs(query, client, secret, now, limit,
             "client must be a valid IPv4/IPv6 address") from None
     # ECS 分区沿用 resolve_edns：版本 0 查询至多一个合法 ECS，其他选项
     # （含 COOKIE 之外的选项码）原样忽略、不回显。
-    ecs = _parse_query_ecs(opt[3])
+    ecs = _parse_query_ecs(opt[4])
     if last_end is not None and now < last_end:
         raise CacheError("now must be non-negative and monotonic")
     effective_limit = min(limit, opt[0])
@@ -7532,7 +7540,7 @@ class Resolver:
         (msg, opt, ecs, client_cookie, server_cookie, address,
          effective_limit) = _check_resolve_cookie_inputs(
             query, client, secret, now, limit, self._last_end)
-        opt_class, _version, do, _query_opts = opt
+        opt_class, _version, do, _ext_rcode, _query_opts = opt
         family = _cookie_family(address)
         expected = _server_cookie(secret, family, address.packed,
                                   client_cookie)
@@ -7852,7 +7860,7 @@ class Resolver:
             query, now, limit, self._last_end)
         if badvers is not None:
             return badvers, "edns", now, False, -1, -1
-        opt_class, _version, do, _query_opts = opt
+        opt_class, _version, do, _ext_rcode, _query_opts = opt
         effective_limit = min(limit, opt_class)
         # 剥去末项 OPT 后的纯报文：ACL 与查询/响应配额仅以头部与问题段
         # 为键，UDP 大小、DO、ECS 或其他选项不同的同一问题共用键
@@ -11352,7 +11360,8 @@ class RateLimiter:
         _msg, opt = _decode_edns_query(query)
         if opt is None:
             raise EDNSError("query must contain exactly one OPT")
-        opt_class, opt_ttl = _decode_edns_response(query, response)
+        opt_class, opt_ttl, _ext_rcode = _decode_edns_response(
+            query, response)
         # 计数键只取问题段的 qname/qtype，与 OPT 无关：剥去 OPT 后沿用
         # allow 的匹配、固定窗、容量淘汰与统计，一次调用仅计一次
         # response。
@@ -11675,6 +11684,21 @@ class ResponseRateLimiter:
     (窗截止时刻, 创建序) 最小项，单次调用开销为 O(4096)。相同初态与
     相同调用序列逐字节相同。
 
+    apply_edns(query, response, client, now) 是 apply 的 EDNS 变体：
+    query 须 QR=0、恰一个问题且附加段末项是唯一合法 OPT（缺 OPT、
+    OPT 或选项 TLV 非法、尾随字节抛 EDNSError，QR 置位或问题数非 1
+    抛 EncodeError）；response 须 QR=1、事务 ID 与问题段同 query
+    逐字节一致，且附加段末项恰含一个合法 OPT，否则抛 EncodeError；
+    类型、client、now 的异常同 apply。全部校验先于过期删除、计数与
+    统计，异常不改变任何状态。计数键仅 RCODE 换为响应头低 4 位与
+    OPT TTL 高 8 位组成的 12 位扩展 RCODE（OPT 的 UDP 大小、版本、
+    DO 位、选项不入键）：扩展 RCODE 为 0 时与普通 RCODE 共享额度，
+    非零值分别计数。其余固定窗、slip、容量淘汰与统计语义完全沿用
+    apply，两个入口共享计数表与统计；slip 报文保留 query 的 ID 与
+    问题字节、沿用 response 的 flags 并置 TC，回答与授权段清空，
+    附加段仅一个未压缩根名 OPT（CLASS、TTL 逐字节取 response 的
+    OPT，RDLENGTH=0）。
+
     stats(reset=False) 返回固定键序 pass,drop,slip,expired,evicted,
     keys,capacity 的紧凑 ASCII JSON（末尾一个换行）：值均为非负十进制
     整数，capacity 恒为 4096；pass/drop/slip 按成功 apply 的返回动作
@@ -11790,6 +11814,125 @@ class ResponseRateLimiter:
             tc = (query[0:2] + flags.to_bytes(2, "big")
                   + (1).to_bytes(2, "big") + b"\x00\x00\x00\x00\x00\x00"
                   + query[12:])
+            return tc, "slip", 0
+        self._stat["drop"] += 1
+        self._last_now = now
+        return None, "drop", 0
+
+    def apply_edns(self, query: bytes, response: bytes, client: str,
+                   now: int) -> tuple[bytes | None, str, int]:
+        """按 (网段, qname, qtype, 扩展 RCODE, 窗号) 固定窗限流 EDNS 应答。
+
+        apply 的 EDNS 变体：入参类型、now 单调、client 字面地址校验与
+        异常顺序同 apply。query 须 QR=0、恰一个问题且附加段末项是唯一
+        合法 OPT：缺少 OPT、OPT 或选项 TLV 非法、存在尾随字节抛
+        EDNSError（同 _decode_edns_query 契约），QR 置位或问题数非 1
+        抛 EncodeError；response 须 QR=1、事务 ID 与问题段同 query
+        逐字节一致，且附加段末项恰含一个合法 OPT（OPT 布局契约同
+        _decode_edns_response，但允许非 0 扩展 RCODE），否则抛
+        EncodeError。全部校验先于过期项删除、计数与统计提交，任何异常
+        都不改变计数表、时钟、创建序与统计。
+
+        计数键沿用 apply 的网段（IPv4 /24、IPv6 /56）、规范 qname、
+        qtype 与窗号，仅 RCODE 换为 response 头低 4 位与 OPT TTL
+        高 8 位组成的 12 位扩展 RCODE；OPT 的 UDP 大小、版本、DO 位
+        与选项不入键。扩展 RCODE 为 0 时与相同普通 RCODE 共享额度，
+        非零值分别计数。固定窗、slip 周期与容量淘汰语义同 apply：
+        未超限返回 (response, "pass", 剩余)；超额在 slip 周期返回
+        (tc, "slip", 0)，否则 (None, "drop", 0)，每次调用仅累计一种
+        动作、与 apply 共享同一计数表（至多 4096 个活动键）与同一组
+        统计。tc 保留 query 的 ID 与原问题字节，flags 沿用 response
+        并置 TC，QDCOUNT=1、ANCOUNT=NSCOUNT=0、ARCOUNT=1，附加段仅
+        一个 owner 为未压缩根名的 OPT，其 CLASS 与 TTL 逐字节沿用
+        response 的 OPT，RDLENGTH=0。相同初态与调用序列逐字节相同。
+        """
+        if not isinstance(query, bytes):
+            raise TypeError("query must be bytes")
+        if not isinstance(client, str):
+            raise TypeError("client must be str")
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be int")
+        if not isinstance(response, bytes):
+            raise TypeError("response must be bytes")
+        if now < 0 or (self._last_now is not None and now < self._last_now):
+            raise CacheError("now must be non-negative and monotonic")
+        # client 与 query 的校验顺序同 apply/respond_edns：先地址、后解码。
+        try:
+            addr = ipaddress.ip_address(client)
+        except (ValueError, TypeError):
+            raise PolicyError("client must be an IP address") from None
+        if not _MIN_MESSAGE_LEN <= len(query) <= _MAX_MESSAGE_LEN:
+            raise EDNSError("bad message length")
+        if int.from_bytes(query[2:4], "big") & _FLAG_QR:
+            raise EncodeError("query has QR set")
+        if int.from_bytes(query[4:6], "big") != 1:
+            raise EncodeError("query must contain exactly one question")
+        # EDNS 查询须末项恰含一个合法 OPT：缺失、非法或尾随字节均为
+        # EDNSError（_decode_edns_query 的 OPT 契约）。
+        msg, opt = _decode_edns_query(query)
+        if opt is None:
+            raise EDNSError("query must contain exactly one OPT")
+        # 应答契约同 _decode_edns_response（任何不符为 EncodeError），
+        # 但扩展 RCODE 允许非 0：取头低 4 位与 OPT TTL 高 8 位组成 12 位
+        # 扩展 RCODE 作为键的一部分；CLASS、TTL 原值留待 slip 报文沿用。
+        opt_class, opt_ttl, ext_high = _decode_edns_response(
+            query, response, extended_rcode=True)
+        # 客户端归入 IPv4 /24 或 IPv6 /56 网段，取规范网段文本作为键。
+        prefix = 24 if addr.version == 4 else 56
+        subnet = str(ipaddress.ip_network(client).supernet(
+            new_prefix=prefix))
+        qname = msg["questions"][0]["name"]
+        qtype = msg["questions"][0]["type"]
+        rcode = (int.from_bytes(response[2:4], "big") & 0x000F
+                 | (ext_high << 4))
+        # 先删除当前已过期窗（截止时刻 <= now），再处理当前键。
+        expired = 0
+        for dead in [key for key, value in self._counts.items()
+                     if value[1] <= now]:
+            del self._counts[dead]
+            expired += 1
+        bucket = now // self._window
+        key = (subnet, qname, qtype, rcode, bucket)
+        entry = self._counts.get(key)
+        evicted = 0
+        if entry is None:
+            # 插入第 4097 个键前淘汰 (截止, 创建序) 最小项。
+            if len(self._counts) >= _RATE_TABLE_CAPACITY:
+                oldest = min(self._counts,
+                             key=lambda k: (self._counts[k][1],
+                                            self._counts[k][3]))
+                del self._counts[oldest]
+                evicted += 1
+            self._counts[key] = [bucket * self._window,
+                                 (bucket + 1) * self._window,
+                                 0, self._serial]
+            self._serial += 1
+            entry = self._counts[key]
+        # 成功调用：计数加一，统计原子提交，时钟随之推进。
+        entry[2] += 1
+        count = entry[2]
+        self._stat["expired"] += expired
+        self._stat["evicted"] += evicted
+        if count <= self._limit:
+            self._stat["pass"] += 1
+            self._last_now = now
+            return response, "pass", self._limit - count
+        excess = count - self._limit
+        if self._slip > 0 and excess % self._slip == 0:
+            self._stat["slip"] += 1
+            self._last_now = now
+            # TC 应答：ID 与问题字节取 query，flags 取 response 并置 TC，
+            # 附加段仅保留一个未压缩根名 OPT，CLASS 与 TTL 逐字节沿用
+            # response 的 OPT，RDLENGTH=0。
+            query_end = _reply_question_end(query, 1)
+            flags = int.from_bytes(response[2:4], "big") | _FLAG_TC
+            tc = (query[0:2] + flags.to_bytes(2, "big")
+                  + (1).to_bytes(2, "big") + (0).to_bytes(2, "big")
+                  + (0).to_bytes(2, "big") + (1).to_bytes(2, "big")
+                  + query[_MIN_MESSAGE_LEN:query_end]
+                  + b"\x00" + _TYPE_OPT.to_bytes(2, "big")
+                  + opt_class.to_bytes(2, "big") + opt_ttl.to_bytes(4, "big")
+                  + (0).to_bytes(2, "big"))
             return tc, "slip", 0
         self._stat["drop"] += 1
         self._last_now = now
